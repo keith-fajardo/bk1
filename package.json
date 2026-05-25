@@ -1,0 +1,19 @@
+{
+  "name": "dbt-agent",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "bun src/app.tsx",
+    "build": "bun build --compile src/app.tsx --outfile dbt-agent"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.54.0",
+    "@gridland/bun": "latest",
+    "react": "^18.3.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/react": "^18.3.0",
+    "typescript": "^5.0.0"
+  }
+}
