@@ -1,5 +1,5 @@
 import { useState, useRef, useCallback, useMemo, useEffect } from 'react';
-import { render, Box, Text, useInput } from 'ink';
+import { render, Box, Text, useInput, measureElement, type DOMElement } from 'ink';
 import Spinner from 'ink-spinner';
 import type Anthropic from '@anthropic-ai/sdk';
 import { runAgent, AgentAbortedError, resetAnthropicClient, type TokenUsage } from './agent';
@@ -10,10 +10,10 @@ import { estimateCostUsd, formatUsd } from './pricing';
 import { createUsageState, recordUsage, buildReport, renderReport, classifyTurnLabel } from './usage';
 import {
   loadPet, savePet, newPet, tickPet, petFace,
-  petSprite, petSpriteBlink,
+  petSprite, petSpriteBlink, petSpriteSleep,
   petSpriteLookLeft, petSpriteLookRight, petSpriteLookUp, petSpriteLookDown,
   petSpriteLookUL, petSpriteLookUR, petSpriteLookDL, petSpriteLookDR,
-  renderPetView,
+  renderPetView, isSleeping,
   feed, play, petSleep, rename, autoFeedFromActivity,
   type PetState,
 } from './pet';
@@ -251,20 +251,37 @@ function InputBar({ input, isRunning, mode, modelLabel }: {
 // Blink overrides eye direction briefly (~180ms) on a jittered ~3–6s schedule so the
 // pet feels alive even when the cursor is parked.
 type PetFrame =
-  | 'normal' | 'blink'
+  | 'normal' | 'blink' | 'sleep'
   | 'lookL' | 'lookR' | 'lookU' | 'lookD'
   | 'lookUL' | 'lookUR' | 'lookDL' | 'lookDR';
+
+// Snore animation frames — rendered as a vertical column to the right of the sprite
+// while the pet is sleeping. Tuple order is [top, middle, bottom]. Each frame is a
+// single Z rising from the bottom (near the pet's head) toward the top, fading out
+// once it reaches the top row. Cycles every ~500ms.
+const SNORE_FRAMES: ReadonlyArray<readonly [string, string, string]> = [
+  [' ', ' ', 'z'],
+  [' ', 'z', ' '],
+  ['Z', ' ', ' '],
+  [' ', ' ', ' '],
+];
 
 const PET_CENTER_COL  = 7;
 const PET_DEAD_ZONE_X = 1;
 const PET_DEAD_ZONE_Y = 1;
 
-function PetSpritePanel({ pet, mouseCol, mouseRow }: {
+function PetSpritePanel({ pet, mouseCol, mouseRow, renderHeight }: {
   pet: PetState;
   mouseCol: number | null;
   mouseRow: number | null;
+  renderHeight: number;
 }) {
   const [blinking, setBlinking] = useState(false);
+  // Snore frame cycler. Also doubles as a re-render tick while sleeping so the panel
+  // naturally drops out of the sleep frame when sleeping_until elapses (isSleeping
+  // re-evaluates on each tick and flips to false).
+  const [snoreFrame, setSnoreFrame] = useState(0);
+  const sleeping = isSleeping(pet);
 
   useEffect(() => {
     let pending: ReturnType<typeof setTimeout>;
@@ -282,14 +299,35 @@ function PetSpritePanel({ pet, mouseCol, mouseRow }: {
     return () => clearTimeout(pending);
   }, []);
 
-  // Pet vertical center: terminal_height - 4. Sprite is now 4 terminal rows tall
-  // (3 body + 1 legs), plus 1 HRule below, plus ~1 row for HintBar — center sits
-  // around 4 rows up from the bottom edge. Approximate is fine — the deadzone
-  // absorbs layout drift, and the legs row biases the center upward into the body.
-  const petCenterRow = (process.stdout.rows ?? 24) - 4;
+  useEffect(() => {
+    if (!sleeping) return;
+    const id = setInterval(() => {
+      setSnoreFrame(f => (f + 1) % SNORE_FRAMES.length);
+    }, 500);
+    return () => clearInterval(id);
+  }, [sleeping]);
+
+  // Pet eye row, in absolute 1-indexed terminal coords (matches mouse Y from xterm).
+  // Counting from the bottom of the rendered output: HintBar paddingBottom(1) +
+  // HintBar text(1) + HRule(1) + legs(1) + body bottom(1) + eye(1) = the 6th row up.
+  // So eye row = rendered_bottom - 5.
+  //
+  // rendered_bottom = min(renderHeight, terminal_rows): when content is shorter than
+  // the terminal, the output occupies rows 1..renderHeight (top-anchored) so the
+  // visible bottom is at renderHeight. When content fills/scrolls, the visible
+  // bottom is at terminal_rows. The earlier version used `terminal_rows` unconditionally,
+  // which broke vertical tracking on the intro screen and short conversations because
+  // the eye row was computed as if the footer were pinned to the terminal bottom.
+  const terminalRows = process.stdout.rows ?? 24;
+  const renderedBottom = Math.min(renderHeight, terminalRows);
+  const petCenterRow = renderedBottom - 5;
 
   let frame: PetFrame = 'normal';
-  if (blinking) {
+  if (sleeping) {
+    // Sleep wins over blink and mouse-tracking — the pet is OUT, not napping with one
+    // eye open.
+    frame = 'sleep';
+  } else if (blinking) {
     frame = 'blink';
   } else if (mouseCol !== null && mouseRow !== null) {
     const dx = mouseCol - PET_CENTER_COL;
@@ -313,6 +351,7 @@ function PetSpritePanel({ pet, mouseCol, mouseRow }: {
   }
 
   const sprite =
+    frame === 'sleep'  ? petSpriteSleep(pet) :
     frame === 'blink'  ? petSpriteBlink(pet) :
     frame === 'lookR'  ? petSpriteLookRight(pet) :
     frame === 'lookL'  ? petSpriteLookLeft(pet) :
@@ -324,24 +363,36 @@ function PetSpritePanel({ pet, mouseCol, mouseRow }: {
     frame === 'lookDR' ? petSpriteLookDR(pet) :
                          petSprite(pet);
 
+  // Snore column: 3 cells tall (matches the 3 body rows of the sprite — legs row gets
+  // a blank pad so the Z's hover next to the head, not the feet).
+  const snore = SNORE_FRAMES[snoreFrame];
   return (
-    <Box flexDirection="column">
-      {sprite.map((line, i) => <PetSpriteLine key={i} line={line} />)}
+    <Box flexDirection="row">
+      <Box flexDirection="column">
+        {sprite.map((line, i) => <PetSpriteLine key={i} line={line} />)}
+      </Box>
+      {sleeping && (
+        <Box flexDirection="column" marginLeft={1}>
+          {snore.map((ch, i) => <Text key={i} color="gray">{ch}</Text>)}
+          <Text> </Text>
+        </Box>
+      )}
     </Box>
   );
 }
 
-function StatusFooter({ sessionUsd, pet, mouseCol, mouseRow }: {
+function StatusFooter({ sessionUsd, pet, mouseCol, mouseRow, renderHeight }: {
   sessionUsd: number;
   pet: PetState;
   mouseCol: number | null;
   mouseRow: number | null;
+  renderHeight: number;
 }) {
   const face = petFace(pet);
   const petLabel = pet.name ?? 'pet';
   return (
-    <Box paddingX={2} gap={2}>
-      <PetSpritePanel pet={pet} mouseCol={mouseCol} mouseRow={mouseRow} />
+    <Box paddingX={2} gap={2} marginTop={1}>
+      <PetSpritePanel pet={pet} mouseCol={mouseCol} mouseRow={mouseRow} renderHeight={renderHeight} />
       {/* Info column sits to the right of the animated sprite. Bottom-aligned so the
           existing single-line readout lines up with the bottom edge of the sprite
           panel rather than floating mid-air. */}
@@ -498,6 +549,7 @@ const PET_CELLS: Record<string, CellSpec> = {
   B: { glyph: ' ', bg: PET_BODY },                 // body | body
   V: { glyph: '▀', fg: PET_EYE,   bg: PET_BODY },  // eye-open (top) | body
   M: { glyph: '▄', fg: PET_EYE,   bg: PET_BODY },  // body | eye-open (bottom)
+  H: { glyph: '─', fg: PET_EYE,   bg: PET_BODY },  // thin horizontal line — closed-eye dash
   Y: { glyph: '▀', fg: PET_BLINK, bg: PET_BODY },  // eye-blink | body
   U: { glyph: '▀', fg: PET_BODY },                 // body | empty (legacy: legs / sprite top)
   L: { glyph: '▄', fg: PET_BODY },                 // empty | body  (leg hanging below body)
@@ -940,6 +992,22 @@ function App({ onLogout }: { onLogout: () => void }) {
   const inputRef = useRef('');
   const isRunningRef = useRef(false);
   const historyRef = useRef<Anthropic.MessageParam[]>([]);
+  // Prompt-history navigation (shell-style): every submitted prompt is pushed, and
+  // the up/down arrows scrub through it. promptHistoryIdx === -1 means "not currently
+  // scrubbing" — first up-arrow press jumps to the most recent entry; typing any
+  // printable char resets it.
+  const promptHistoryRef = useRef<string[]>([]);
+  const promptHistoryIdxRef = useRef<number>(-1);
+  // Measured rendered height of the App's outer Box. Used by PetSpritePanel to map
+  // mouse-Y onto pet sprite coordinates correctly even when content doesn't fill the
+  // terminal (intro screen, short conversations).
+  const containerRef = useRef<DOMElement>(null);
+  const [renderHeight, setRenderHeight] = useState(process.stdout.rows ?? 24);
+  useEffect(() => {
+    if (!containerRef.current) return;
+    const { height } = measureElement(containerRef.current);
+    if (height > 0) setRenderHeight(prev => (prev === height ? prev : height));
+  });
   // Refs so submit() (useCallback []) always reads the latest values
   const modelIdxRef = useRef(DEFAULT_MODEL_IDX);
   const modeRef = useRef<Mode>('plan');
@@ -1043,6 +1111,12 @@ function App({ onLogout }: { onLogout: () => void }) {
     const raw = inputRef.current.trim();
     if (!raw || isRunningRef.current) return;
     setConfirmPrompt(null);
+    // Push to prompt history (shell-style, with HIST_IGNOREDUPS — skip if identical
+    // to the most recent entry). Reset scrub index on every submit so the next
+    // up-arrow press starts from the newest entry.
+    const h = promptHistoryRef.current;
+    if (h.length === 0 || h[h.length - 1] !== raw) h.push(raw);
+    promptHistoryIdxRef.current = -1;
 
     // Local UI commands — handled here, never sent to the agent
     if (raw === '/plan' || raw === '/build' || raw === '/auto') {
@@ -1371,6 +1445,37 @@ function App({ onLogout }: { onLogout: () => void }) {
       }
     }
 
+    // Prompt history scrub — up/down through previously submitted prompts when no
+    // other modal (suggestions, /model picker, confirm) has claimed the arrow keys.
+    // Up cycles toward older entries; down cycles toward newer; falling off the
+    // newest end clears the input (matches shell behavior).
+    if (key.upArrow) {
+      const hist = promptHistoryRef.current;
+      if (hist.length === 0) return;
+      const cur = promptHistoryIdxRef.current;
+      const idx = cur === -1 ? hist.length - 1 : Math.max(0, cur - 1);
+      promptHistoryIdxRef.current = idx;
+      inputRef.current = hist[idx]!;
+      setInput(hist[idx]!);
+      return;
+    }
+    if (key.downArrow) {
+      const hist = promptHistoryRef.current;
+      const cur = promptHistoryIdxRef.current;
+      if (cur === -1) return;
+      const next = cur + 1;
+      if (next >= hist.length) {
+        promptHistoryIdxRef.current = -1;
+        inputRef.current = '';
+        setInput('');
+      } else {
+        promptHistoryIdxRef.current = next;
+        inputRef.current = hist[next]!;
+        setInput(hist[next]!);
+      }
+      return;
+    }
+
     // Tab with no slash-completion in flight → cycle agent mode
     if (key.tab) {
       const next = nextMode(modeRef.current);
@@ -1394,6 +1499,7 @@ function App({ onLogout }: { onLogout: () => void }) {
       inputRef.current = next;
       setInput(next);
       setSuggestionIndex(-1);
+      promptHistoryIdxRef.current = -1;
     } else if (inputChar && !key.ctrl && !key.meta) {
       // Ink's keypress parser strips the leading ESC from SGR mouse sequences but lets
       // the rest of the CSI through as printable text — e.g. a left-click leaks `[<0;8;40M`
@@ -1405,13 +1511,14 @@ function App({ onLogout }: { onLogout: () => void }) {
       inputRef.current = next;
       setInput(next);
       setSuggestionIndex(-1);
+      promptHistoryIdxRef.current = -1;
     }
   });
 
   // Welcome screen
   if (messages.length === 0) {
     return (
-      <Box flexDirection="column" paddingTop={1}>
+      <Box ref={containerRef} flexDirection="column" paddingTop={1}>
         <Box flexDirection="column" paddingX={2}>
           {WORDMARK.map((line, i) => (
             <WordmarkLine key={i} line={line} color="#B9FECF" />
@@ -1433,7 +1540,7 @@ function App({ onLogout }: { onLogout: () => void }) {
           <HRule />
           <InputBar input={input} isRunning={isRunning} mode={mode} modelLabel={MODELS[modelIdx]!.label} />
           <HRule />
-          <StatusFooter sessionUsd={sessionUsd} pet={pet} mouseCol={mouseCol} mouseRow={mouseRow} />
+          <StatusFooter sessionUsd={sessionUsd} pet={pet} mouseCol={mouseCol} mouseRow={mouseRow} renderHeight={renderHeight} />
           <HRule />
           <HintBar isRunning={isRunning} />
         </Box>
@@ -1443,7 +1550,7 @@ function App({ onLogout }: { onLogout: () => void }) {
 
   // Conversation view
   return (
-    <Box flexDirection="column">
+    <Box ref={containerRef} flexDirection="column">
       <Box flexDirection="column" paddingX={2} paddingTop={1} paddingBottom={0}>
         {WORDMARK.map((line, i) => (
           <WordmarkLine key={i} line={line} color="#B9FECF" />
@@ -1515,7 +1622,7 @@ function App({ onLogout }: { onLogout: () => void }) {
         ? <ConfirmBar question={confirmPrompt} selectedIdx={confirmSelected} />
         : <InputBar input={input} isRunning={isRunning} mode={mode} modelLabel={MODELS[modelIdx]!.label} />
       }
-      <StatusFooter sessionUsd={sessionUsd} pet={pet} mouseCol={mouseCol} mouseRow={mouseRow} />
+      <StatusFooter sessionUsd={sessionUsd} pet={pet} mouseCol={mouseCol} mouseRow={mouseRow} renderHeight={renderHeight} />
       <HRule />
       <HintBar isRunning={isRunning} />
     </Box>
