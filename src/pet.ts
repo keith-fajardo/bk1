@@ -34,6 +34,7 @@ export interface PetState {
   hunger: number;               // 0 (fed) ... 100 (starving)
   happiness: number;            // 0 (miserable) ... 100 (overjoyed)
   energy: number;               // 0 (exhausted) ... 100 (energetic)
+  sleeping_until?: string;      // ISO — while in the future, pet shows closed eyes + snore
 }
 
 export type Stage = 'egg' | 'baby' | 'adult';
@@ -60,6 +61,7 @@ const FEED_HUNGER_DELTA    = -30;
 const PLAY_HAPPY_DELTA     = +20;
 const PLAY_ENERGY_DELTA    = -10;
 const SLEEP_ENERGY_TARGET  = 100;
+const SLEEP_DURATION_MS    = 10 * 60 * 1000;  // how long the closed-eye + snore animation runs
 
 function clamp(n: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, n));
@@ -103,7 +105,15 @@ export function stage(state: PetState, now: Date = new Date()): Stage {
   return 'adult';
 }
 
-export function mood(state: PetState): Mood {
+export function isSleeping(state: PetState, now: Date = new Date()): boolean {
+  if (!state.sleeping_until) return false;
+  return new Date(state.sleeping_until).getTime() > now.getTime();
+}
+
+export function mood(state: PetState, now: Date = new Date()): Mood {
+  // Active sleep window overrides everything: the pet just got tucked in, we want the
+  // sleepy face / closed-eye sprite / snore animation regardless of stat-derived mood.
+  if (isSleeping(state, now)) return 'sleepy';
   // Priority order matters — most-actionable moods first so /pet tells the user what to
   // do next. "Angry" is reserved for severe combined neglect (very low happiness AND
   // meaningful hunger), distinct from plain "sad" (just lonely).
@@ -148,7 +158,7 @@ const FACES: Record<Stage, Record<Mood, string>> = {
 };
 
 export function petFace(state: PetState, now: Date = new Date()): string {
-  return FACES[stage(state, now)][mood(state)];
+  return FACES[stage(state, now)][mood(state, now)];
 }
 
 // ─── Pixel sprite (rendered in /pet view) ───────────────────────────────────────
@@ -214,6 +224,19 @@ const ADULT_SPRITE: string[] = [
 const ADULT_SPRITE_BLINK: string[] = [
   PET_SPRITE_SENTINEL + 'BBBBBBBBB',
   PET_SPRITE_SENTINEL + 'BBBBBBBBB',
+  PET_SPRITE_SENTINEL + 'BBBBBBBBB',
+];
+
+// Sleep: closed eyelids drawn as TWO thin horizontal lines — one per eye. Uses the
+// `H` cell (─ box-drawing horizontal, fg=eye, bg=body), which renders as a single
+// 1-pixel-tall line centered vertically in the cell. Each cell still has bg=body,
+// so no row-boundary stripe artifact (same trick that fixed the legs).
+//
+// Logical layout (middle terminal row):
+//   B ── B B B ── B    two thin lines, 2 cells wide each, at cols 1-2 and 6-7
+const ADULT_SPRITE_SLEEP: string[] = [
+  PET_SPRITE_SENTINEL + 'BBBBBBBBB',
+  PET_SPRITE_SENTINEL + 'BHHBBBHHB',
   PET_SPRITE_SENTINEL + 'BBBBBBBBB',
 ];
 
@@ -300,6 +323,11 @@ export function petSpriteBlink(state: PetState, now: Date = new Date()): string[
   return stage(state, now) === 'egg' ? EGG_SPRITE : withLegs(ADULT_SPRITE_BLINK);
 }
 
+// Sleep variant — dash-broken closed eyes. Used while isSleeping(pet) is true.
+export function petSpriteSleep(state: PetState, now: Date = new Date()): string[] {
+  return stage(state, now) === 'egg' ? EGG_SPRITE : withLegs(ADULT_SPRITE_SLEEP);
+}
+
 // Look-right variant — exported for the same reason. Eggs don't have eyes to move,
 // so the egg sprite is returned unchanged.
 export function petSpriteLookRight(state: PetState, now: Date = new Date()): string[] {
@@ -368,7 +396,7 @@ function untilHatchString(state: PetState, now: Date = new Date()): string {
 // eggs aren't represented in the footer animation (footer always shows the adult).
 export function renderPetView(state: PetState, now: Date = new Date()): string {
   const s = stage(state, now);
-  const m = mood(state);
+  const m = mood(state, now);
   const label = state.name ?? '(unnamed)';
   const stageLabel = s === 'egg' ? 'egg' : (s === 'baby' ? 'baby' : 'adult');
 
@@ -422,6 +450,7 @@ export function feed(state: PetState, now: Date = new Date()): PetState {
     ...ticked,
     hunger: clamp(ticked.hunger + FEED_HUNGER_DELTA, 0, 100),
     happiness: clamp(ticked.happiness + 3, 0, 100), // small joy from being fed
+    sleeping_until: undefined, // interaction wakes the pet
   };
 }
 
@@ -432,20 +461,28 @@ export function play(state: PetState, now: Date = new Date()): PetState {
     ...ticked,
     happiness: clamp(ticked.happiness + PLAY_HAPPY_DELTA, 0, 100),
     energy:    clamp(ticked.energy + PLAY_ENERGY_DELTA, 0, 100),
+    sleeping_until: undefined,
   };
 }
 
 export function petSleep(state: PetState, now: Date = new Date()): PetState {
   const ticked = tickPet(state, now);
   if (stage(state, now) === 'egg') return ticked;
-  return { ...ticked, energy: SLEEP_ENERGY_TARGET };
+  // Energy refills instantly (mechanic), but we also set a short sleep window so the
+  // closed-eye sprite + snore animation get a chance to play. Without the window the
+  // pet would immediately read as `happy` (energy=100) and the visual would be skipped.
+  return {
+    ...ticked,
+    energy: SLEEP_ENERGY_TARGET,
+    sleeping_until: new Date(now.getTime() + SLEEP_DURATION_MS).toISOString(),
+  };
 }
 
 export function rename(state: PetState, name: string, now: Date = new Date()): PetState {
   const cleaned = name.trim().slice(0, 32);
   if (cleaned.length === 0) return state;
   const ticked = tickPet(state, now);
-  return { ...ticked, name: cleaned };
+  return { ...ticked, name: cleaned, sleeping_until: undefined };
 }
 
 // Small effect applied automatically on every bk1 turn — your activity feeds the pet
@@ -478,12 +515,13 @@ export function readPetFrom(path: string): PetState | null {
         typeof data.happiness === 'number' &&
         typeof data.energy === 'number') {
       return {
-        name:      data.name ?? null,
-        born_at:   data.born_at,
-        last_seen: data.last_seen,
-        hunger:    data.hunger,
-        happiness: data.happiness,
-        energy:    data.energy,
+        name:           data.name ?? null,
+        born_at:        data.born_at,
+        last_seen:      data.last_seen,
+        hunger:         data.hunger,
+        happiness:      data.happiness,
+        energy:         data.energy,
+        sleeping_until: typeof data.sleeping_until === 'string' ? data.sleeping_until : undefined,
       };
     }
     return null;
