@@ -1,1 +1,14 @@
 .env*
+
+# kimball.db IS committed (deterministic build artifact, ships with bk1).
+# But never commit its SQLite sidecar files — those are transient runtime state.
+skills_data/kimball/kimball.db-shm
+skills_data/kimball/kimball.db-wal
+skills_data/kimball/kimball.db-journal
+
+# Rust build artifacts
+lint/target/
+target/
+
+# JS deps
+node_modules/
