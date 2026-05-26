@@ -1,0 +1,23 @@
+{
+  "name": "bk1-context",
+  "displayName": "bk1 IDE Context",
+  "description": "Streams the active editor's file path + selection to ~/.bk1/ide-context.json so the bk1 TUI can read them as per-turn context (mirrors Claude Code's <ide_opened_file>/<ide_selection> behaviour).",
+  "version": "0.1.0",
+  "publisher": "mangrove",
+  "private": true,
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": ["Other"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./out/extension.js",
+  "scripts": {
+    "build": "tsc -p .",
+    "watch": "tsc -p . -w"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.80.0",
+    "typescript": "^5.4.0"
+  }
+}

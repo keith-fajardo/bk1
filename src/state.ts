@@ -1,10 +1,14 @@
 import { Database } from 'bun:sqlite';
-import { existsSync, readFileSync, mkdirSync, statSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, statSync } from 'fs';
 import { resolve, dirname, basename } from 'path';
 import { createHash } from 'crypto';
 
 const PROJECT_DIR = resolve(process.env.DBT_PROJECT_DIR ?? process.cwd());
 const DB_PATH = resolve(PROJECT_DIR, 'target/bk1_state.db');
+// Lint HTML report — written on every lint_run so the user has a clickable artifact
+// of the latest violations, and so /lint-deep can skip its expensive semantic pass
+// when a recent report already exists (the app prompts the user before overwriting).
+export const LINT_REPORT_PATH = resolve(PROJECT_DIR, '.bk1', 'lint-report.html');
 
 interface ModelRow {
   unique_id: string;
@@ -182,7 +186,7 @@ export interface LintOutput {
   semantic_review_queue: string[];
 }
 
-export interface RuleAggregate { code: string; severity: string; count: number; }
+export interface RuleAggregate { code: string; rule: string; severity: string; count: number; }
 export interface AggregatedViolations {
   batchViolations: LintViolation[];
   batchByRule: RuleAggregate[];
@@ -210,7 +214,7 @@ export function aggregateViolations(
     const map = new Map<string, RuleAggregate>();
     for (const v of vs) {
       const e = map.get(v.code);
-      if (e) e.count++; else map.set(v.code, { code: v.code, severity: v.severity, count: 1 });
+      if (e) e.count++; else map.set(v.code, { code: v.code, rule: v.rule, severity: v.severity, count: 1 });
     }
     return [...map.values()].sort(
       (a, b) => sevOrder(a.severity) - sevOrder(b.severity) || b.count - a.count,
@@ -257,39 +261,63 @@ export async function lintRun(binaryPath: string, force: boolean): Promise<strin
     batchFileSet.add(row.path.replace(/\.sql$/, '.yml'));
   }
 
-  // 3. Run binary (with Python fallback)
-  const pythonPath = binaryPath.replace(/bk1-lint$/, 'dbt_lint.py');
-  let ran = false;
-  for (const cmd of [
-    existsSync(binaryPath) ? (force ? [binaryPath, '.', '--no-cache'] : [binaryPath, '.']) : null,
-    existsSync(pythonPath) ? (force ? ['python', pythonPath, '.', '--no-cache'] : ['python', pythonPath, '.']) : null,
-  ]) {
-    if (!cmd) continue;
-    const proc = Bun.spawn(cmd, { cwd: PROJECT_DIR, stdout: 'pipe', stderr: 'pipe' });
-    await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
-    await proc.exited;
-    ran = true;
-    break;
-  }
+  // 3. Run binary (with Python fallback) — unless we can short-circuit from cache.
+  //
+  // Short-circuit: if !force AND incrementalSync reports no added/changed/pruned
+  // models AND a prior violations.json exists on disk, skip the binary run. The
+  // previous run's output is still accurate because no input files changed. This
+  // is what makes /lint-deep cheap across sessions: a fresh bk1 session can't see
+  // the prior lint_run via conversation history, so it always calls lint_run
+  // again — without this short-circuit, that re-call would re-spawn the binary
+  // (cheap but visible). With it, the re-call is a single JSON read.
+  const projectName = getProjectName();
+  const violationsPath = resolve(dirname(binaryPath), 'data', projectName, 'violations.json');
+  const canUseCache = !force
+    && sync.added === 0
+    && sync.changed === 0
+    && sync.pruned === 0
+    && existsSync(violationsPath);
 
-  if (!ran) {
-    return JSON.stringify({
-      error: 'binary_not_found',
-      message: `bk1-lint not found at ${binaryPath}. Run: cd lint && cargo build --release && cp target/release/bk1-lint ${dirname(binaryPath)}/`,
-      sync,
-      batch: { size: batchRows.length, remaining, queue: batchRows.map(r => r.name) },
-    });
+  if (!canUseCache) {
+    const pythonPath = binaryPath.replace(/bk1-lint$/, 'dbt_lint.py');
+    let ran = false;
+    for (const cmd of [
+      existsSync(binaryPath) ? (force ? [binaryPath, '.', '--no-cache'] : [binaryPath, '.']) : null,
+      existsSync(pythonPath) ? (force ? ['python', pythonPath, '.', '--no-cache'] : ['python', pythonPath, '.']) : null,
+    ]) {
+      if (!cmd) continue;
+      const proc = Bun.spawn(cmd, { cwd: PROJECT_DIR, stdout: 'pipe', stderr: 'pipe' });
+      await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+      await proc.exited;
+      ran = true;
+      break;
+    }
+
+    if (!ran) {
+      return JSON.stringify({
+        error: 'binary_not_found',
+        message: `bk1-lint not found at ${binaryPath}. Run: cd lint && cargo build --release && cp target/release/bk1-lint ${dirname(binaryPath)}/`,
+        sync,
+        batch: { size: batchRows.length, remaining, queue: batchRows.map(r => r.name) },
+      });
+    }
   }
 
   // 4. Read, filter, and aggregate violations.json
-  const projectName = getProjectName();
-  const violationsPath = resolve(dirname(binaryPath), 'data', projectName, 'violations.json');
   if (!existsSync(violationsPath)) {
     return JSON.stringify({ error: 'violations_not_found', path: violationsPath, sync });
   }
 
   const output = JSON.parse(readFileSync(violationsPath, 'utf-8')) as LintOutput;
   const agg = aggregateViolations(output, batchFileSet);
+
+  writeLintReportHtml({
+    projectName,
+    projectTotal: output.violations.length,
+    batchSize:    batchRows.length,
+    rules:        agg.projectByRule,
+    violations:   output.violations,
+  });
 
   return JSON.stringify({
     project_name: projectName,
@@ -303,7 +331,98 @@ export async function lintRun(binaryPath: string, force: boolean): Promise<strin
       details:         agg.batchViolations,
     },
     semantic_review_queue: agg.semanticQueue,
+    report_path:           LINT_REPORT_PATH,
+    cached:                canUseCache,
   });
+}
+
+// Write the clickable lint-report.html alongside the per-project state DB. Single
+// self-contained HTML file with inline CSS — no external dependencies, opens cleanly
+// in any browser or the IDE's file preview.
+function writeLintReportHtml(input: {
+  projectName: string;
+  projectTotal: number;
+  batchSize: number;
+  rules: RuleAggregate[];
+  violations: LintViolation[];
+}): void {
+  const esc = (s: string) => s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+
+  const sevColor: Record<string, string> = {
+    blocker: '#f87171',
+    major:   '#fb923c',
+    minor:   '#fcd34d',
+  };
+  const sevOrder = (s: string) => s === 'blocker' ? 0 : s === 'major' ? 1 : 2;
+
+  const ruleRows = [...input.rules]
+    .sort((a, b) => sevOrder(a.severity) - sevOrder(b.severity) || b.count - a.count)
+    .map(r => `
+      <tr>
+        <td><span class="sev" style="background:${sevColor[r.severity] ?? '#7ab890'}">${esc(r.severity)}</span></td>
+        <td><code>${esc(r.code)}</code></td>
+        <td>${esc(r.rule)}</td>
+        <td class="num">${r.count}</td>
+      </tr>`).join('');
+
+  const detailRows = input.violations.slice(0, 500).map(v => `
+    <tr>
+      <td><span class="sev" style="background:${sevColor[v.severity] ?? '#7ab890'}">${esc(v.severity)}</span></td>
+      <td><code>${esc(v.code)}</code></td>
+      <td class="file">${esc(v.file)}</td>
+      <td>${esc(v.evidence)}</td>
+      <td>${esc(v.fix)}</td>
+    </tr>`).join('');
+  const truncatedNote = input.violations.length > 500
+    ? `<p class="note">Showing the first 500 of ${input.violations.length} violations. Run the binary directly for the full list.</p>`
+    : '';
+
+  const html = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>bk1 lint — ${esc(input.projectName)}</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font: 14px/1.5 -apple-system, BlinkMacSystemFont, 'SF Pro Text', sans-serif; background: #0c1413; color: #c0fad2; margin: 0; padding: 2rem 3rem; }
+  h1 { font-size: 1.4rem; color: #b9fecf; margin: 0 0 .25rem; }
+  h2 { font-size: 1.05rem; color: #b9fecf; margin: 2rem 0 .5rem; border-bottom: 1px solid #2a3a36; padding-bottom: .25rem; }
+  .meta { color: #7ab890; font-size: .85rem; margin-bottom: 1.5rem; }
+  table { border-collapse: collapse; width: 100%; font-size: .9rem; }
+  th { text-align: left; color: #7ab890; font-weight: 600; padding: .4rem .6rem; border-bottom: 1px solid #2a3a36; }
+  td { padding: .35rem .6rem; border-bottom: 1px solid #1a2522; vertical-align: top; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  td.file { color: #67e8f9; font-family: ui-monospace, SF Mono, monospace; font-size: .85rem; white-space: nowrap; }
+  code { font-family: ui-monospace, SF Mono, monospace; color: #c4b5fd; }
+  .sev { display: inline-block; padding: .1rem .5rem; border-radius: 999px; font-size: .75rem; font-weight: 600; color: #0c1413; text-transform: lowercase; }
+  .note { color: #5a8060; font-size: .85rem; font-style: italic; }
+</style>
+</head>
+<body>
+  <h1>${esc(input.projectName)} — lint report</h1>
+  <div class="meta">${input.projectTotal} violation${input.projectTotal === 1 ? '' : 's'} · ${input.batchSize} file${input.batchSize === 1 ? '' : 's'} queued · generated ${new Date().toISOString()}</div>
+
+  <h2>Rules</h2>
+  <table>
+    <thead><tr><th>severity</th><th>rule</th><th>description</th><th class="num">count</th></tr></thead>
+    <tbody>${ruleRows}</tbody>
+  </table>
+
+  <h2>Violations</h2>
+  ${truncatedNote}
+  <table>
+    <thead><tr><th>severity</th><th>rule</th><th>file</th><th>evidence</th><th>fix</th></tr></thead>
+    <tbody>${detailRows}</tbody>
+  </table>
+</body>
+</html>`;
+
+  mkdirSync(dirname(LINT_REPORT_PATH), { recursive: true });
+  writeFileSync(LINT_REPORT_PATH, html, 'utf-8');
 }
 
 // Returns a batch of models that need linting. limit controls batch size (default 100).

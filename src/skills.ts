@@ -469,12 +469,15 @@ Using violations.project_by_rule and violations.project_total (project-wide tota
 
   <project_name> · <project_total> violations · <batch.size> files queued
 
-  | **sev** | **rule** | **count** |
-  |---------|----------|----------:|
-  | major | <code> | <N> |
-  | minor | <code> | <N> |
+  | **severity** | **rule** | **description** | **count** |
+  |--------------|----------|-----------------|----------:|
+  | major | <code> | <rule> | <N> |
+  | minor | <code> | <rule> | <N> |
 
-Sort: major first, then minor, each group by count desc. Use the short code field (e.g. mart_naming, staging_cast) — not the long rule text.
+Sort: major first, then minor, each group by count desc. Use the short code field (e.g. mart_naming, staging_cast) for the "rule" column, and the longer "rule" text from each project_by_rule entry for the "description" column.
+
+After the table, print the clickable report line (the tool returns the absolute path in result.report_path):
+  "Report: <report_path>"
 
 End with this line and stop:
   "Reply /lint-deep to run semantic checks and apply fixes, or /lint --full to force a full re-scan."`;
@@ -575,6 +578,9 @@ Render this as a markdown table with exactly three columns and these exact rows.
 
 Only include rows for finding types that actually appear in this run's results. Drop rows that have no matching findings.
 
+After the table, print the clickable report line (the lint_run result returns the absolute path in result.report_path):
+  "Report: <report_path>"
+
 End with: "Reply 'apply all auto-fixable' to fix everything, 'apply <numbers>' for specific items, or 'skip'."
 Stop and wait for explicit approval.
 
@@ -642,7 +648,7 @@ If new score < 90 with remaining auto-fixable findings, offer another approval r
   },
 
   pet: {
-    description: 'Tamagotchi mangrove crab — /pet shows stats, /pet feed|play|sleep|name <name>|release',
+    description: 'Tamagotchi mangrove pet — /pet shows stats, /pet feed|play|sleep|name <name>|release',
     usage: '/pet [feed|play|sleep|name <name>|release]',
     // Intercepted in app.tsx — all interactions are local state updates.
     expand: () => '',

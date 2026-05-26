@@ -1,9 +1,12 @@
 import { useState, useRef, useCallback, useMemo, useEffect } from 'react';
-import { render, Box, Text, useInput, measureElement, type DOMElement } from 'ink';
+import { existsSync } from 'fs';
+import { render, Box, Text, Static, useInput, measureElement, type DOMElement } from 'ink';
 import Spinner from 'ink-spinner';
 import type Anthropic from '@anthropic-ai/sdk';
 import { runAgent, AgentAbortedError, resetAnthropicClient, type TokenUsage } from './agent';
 import { PROJECT_DIR } from './tools';
+import { LINT_REPORT_PATH } from './state';
+import { readIdeContextBlock } from './ide-context';
 import { SKILLS, expandSkill } from './skills';
 import { getStoredKey, storeKey, clearStoredKey, isValidKeyShape, authFilePath } from './auth';
 import { estimateCostUsd, formatUsd } from './pricing';
@@ -14,7 +17,7 @@ import {
   petSpriteLookLeft, petSpriteLookRight, petSpriteLookUp, petSpriteLookDown,
   petSpriteLookUL, petSpriteLookUR, petSpriteLookDL, petSpriteLookDR,
   renderPetView, isSleeping,
-  feed, play, petSleep, rename, autoFeedFromActivity,
+  feed, play, petSleep, wakePet, rename, autoFeedFromActivity,
   type PetState,
 } from './pet';
 import { enableMouseTracking, disableMouseTracking, parseMouseEvents } from './mouse';
@@ -151,7 +154,7 @@ function HintBar({ isRunning }: { isRunning: boolean }) {
     <Box paddingX={2} paddingBottom={1}>
       {isRunning
         ? <Text color="#3D6650">t  toggle output   Esc  stop agent   Ctrl+C  exit</Text>
-        : <Text color="#3D6650">↵ send   Tab switch mode (plan/build/auto)   ↑↓ navigate   /model ↑↓ switch model   Ctrl+C exit</Text>
+        : <Text color="#3D6650">↵ send   Tab switch mode (plan/build/auto)   ↑↓ navigate   /model ↑↓ switch model   /pet sleep to scroll   Ctrl+C exit</Text>
       }
     </Box>
   );
@@ -420,9 +423,24 @@ function StatusFooter({ sessionUsd, pet, mouseCol, mouseRow, renderHeight }: {
 
 type Span = { text: string; color?: string; bold?: boolean; italic?: boolean };
 
+// Decode the small handful of HTML entities the LLM tends to emit when it's trying
+// to control whitespace or escape special chars in markdown. We render to a terminal,
+// not a browser, so anything left as `&nbsp;` would otherwise show up as literal text.
+function decodeHtmlEntities(s: string): string {
+  if (!s.includes('&')) return s;
+  return s
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&#x27;/g, "'");
+}
+
 function parseInline(raw: string): Span[] {
   type Seg = Span & { done?: boolean };
-  let segs: Seg[] = [{ text: raw }];
+  let segs: Seg[] = [{ text: decodeHtmlEntities(raw) }];
 
   function pass(re: RegExp, toSpan: (m: RegExpMatchArray) => Span) {
     const out: Seg[] = [];
@@ -663,17 +681,24 @@ function MarkdownTable({ lines }: { lines: string[] }) {
   const dataRows = lines.slice(2).map(parseRow);
   const colCount = headers.length;
 
+  // Column width must reflect *visible* (post-parseInline) cell width, not raw markdown
+  // length — otherwise `**foo**` (7 chars raw, 3 visible after stripping delimiters)
+  // inflates the column and the trailing border drifts row-to-row.
+  const visibleLen = (s: string) => stripMd(s).length;
   const colWidths = Array.from({ length: colCount }, (_, ci) =>
-    Math.max(headers[ci]?.length ?? 0, ...dataRows.map(r => (r[ci] ?? '').length))
+    Math.max(headers[ci]?.length ?? 0, ...dataRows.map(r => visibleLen(r[ci] ?? '')))
   );
 
-  const pad = (text: string, width: number, align: 'left' | 'right' | 'center') => {
-    if (align === 'right') return text.padStart(width);
+  // Pad against the visible length so the raw markdown (kept for parseInline to color)
+  // still ends up occupying exactly `width` visible cells.
+  const padCell = (raw: string, width: number, align: 'left' | 'right' | 'center') => {
+    const padding = Math.max(0, width - visibleLen(raw));
+    if (align === 'right')  return ' '.repeat(padding) + raw;
     if (align === 'center') {
-      const p = width - text.length;
-      return ' '.repeat(Math.floor(p / 2)) + text + ' '.repeat(Math.ceil(p / 2));
+      const left = Math.floor(padding / 2);
+      return ' '.repeat(left) + raw + ' '.repeat(padding - left);
     }
-    return text.padEnd(width);
+    return raw + ' '.repeat(padding);
   };
 
   // Full-width border strings built once
@@ -682,9 +707,9 @@ function MarkdownTable({ lines }: { lines: string[] }) {
   const bottom = '└' + colWidths.map(w => '─'.repeat(w + 2)).join('┴') + '┘';
 
   // Rows as single pre-padded strings — single Text per row guarantees alignment
-  const headerCells = headers.map((h, ci) => pad(h, colWidths[ci]!, 'center'));
+  const headerCells = headers.map((h, ci) => padCell(h, colWidths[ci]!, 'center'));
   const dataStrs  = dataRows.map(row =>
-    '│ ' + colWidths.map((_, ci) => pad(row[ci] ?? '', colWidths[ci]!, alignments[ci]!)).join(' │ ') + ' │'
+    '│ ' + colWidths.map((_, ci) => padCell(row[ci] ?? '', colWidths[ci]!, alignments[ci]!)).join(' │ ') + ' │'
   );
 
   const BORDER = '#5A8060';
@@ -938,12 +963,17 @@ function AppShell() {
     return false;
   });
 
-  // Enable xterm mouse tracking once at startup, disable on every exit path. Without the
-  // explicit disable, the terminal stays in mouse mode after bk1 closes and any clicks
-  // in the next shell print garbage escape sequences — really bad UX. We hook SIGINT
-  // and the `exit` event so accidental kills still restore the terminal.
+  // Mouse-tracking lifecycle. Enabled by default so the pet's eyes follow the cursor,
+  // but suspended while the pet is asleep — this doubles as the "let me scroll the
+  // terminal" escape hatch: putting the pet to sleep via `/pet sleep` releases the
+  // wheel + scrollbar back to the terminal for ~10 minutes (or until the next /pet
+  // interaction wakes the pet). Without this, xterm modes 1000/1003 swallow wheel
+  // events and the user can't scroll back through their conversation.
+  //
+  // The unconditional restore on unmount/exit still runs so the terminal never gets
+  // stranded in mouse mode after bk1 closes — printing garbage escape sequences in
+  // the next shell session would be very bad UX.
   useEffect(() => {
-    enableMouseTracking(process.stdout);
     const restore = () => disableMouseTracking(process.stdout);
     process.on('exit', restore);
     process.on('SIGINT', () => { restore(); process.exit(0); });
@@ -954,6 +984,7 @@ function AppShell() {
       process.off('SIGTERM', restore);
     };
   }, []);
+
 
   const handleLogin = useCallback((key: string) => {
     storeKey(key);
@@ -998,6 +1029,14 @@ function App({ onLogout }: { onLogout: () => void }) {
   // printable char resets it.
   const promptHistoryRef = useRef<string[]>([]);
   const promptHistoryIdxRef = useRef<number>(-1);
+  // Timestamp of the most recent ESC keypress. Used to discard the trailing byte of
+  // an Option+<letter> sequence that some terminals (VS Code's xterm.js) split into
+  // two keypresses.
+  const lastEscapeAtRef = useRef<number>(0);
+  // When set, the next confirm prompt's yes/no resolves locally via these callbacks
+  // instead of being forwarded to the agent. Used by `/lint-deep` (and any future
+  // command that wants to gate an expensive LLM call on a local Y/N).
+  const pendingConfirmActionRef = useRef<null | { onYes: () => void; onNo: () => void }>(null);
   // Measured rendered height of the App's outer Box. Used by PetSpritePanel to map
   // mouse-Y onto pet sprite coordinates correctly even when content doesn't fill the
   // terminal (intro screen, short conversations).
@@ -1049,10 +1088,29 @@ function App({ onLogout }: { onLogout: () => void }) {
   const petRef = useRef(pet);
   useEffect(() => { petRef.current = pet; }, [pet]);
 
+  // Re-evaluate the desired mouse-mode state whenever the pet flips between awake and
+  // asleep. Polled once per second while the effect is active to catch natural wake-up
+  // (sleeping_until elapses) without lifting the sleep timer into App-level reactivity.
+  const mouseTrackingOnRef = useRef(false);
+  useEffect(() => {
+    const apply = () => {
+      const wantOn = !isSleeping(petRef.current);
+      if (wantOn !== mouseTrackingOnRef.current) {
+        mouseTrackingOnRef.current = wantOn;
+        if (wantOn) enableMouseTracking(process.stdout);
+        else        disableMouseTracking(process.stdout);
+      }
+    };
+    apply();
+    const id = setInterval(apply, 1000);
+    return () => clearInterval(id);
+  }, [pet.sleeping_until]);
+
   // Live mouse cursor position — drives the pet's eye-tracking. `null` means we haven't
-  // seen any motion event yet (eyes stay centered). Throttled to ~100ms updates so a
-  // fast cursor doesn't cause a re-render storm; the eye direction only has 5 states
-  // (L/R/U/D/center), so finer resolution is wasted.
+  // seen any motion event yet (eyes stay centered). Throttled to 250 ms because every
+  // motion update re-renders the whole App tree (Ink writes cursor + content escapes
+  // to stdout each pass) and at 10Hz that's visible as terminal flicker. The pet only
+  // has 9 eye positions, so 4Hz is plenty of resolution.
   const [mouseCol, setMouseCol] = useState<number | null>(null);
   const [mouseRow, setMouseRow] = useState<number | null>(null);
   const lastMouseUpdateRef = useRef(0);
@@ -1073,12 +1131,28 @@ function App({ onLogout }: { onLogout: () => void }) {
       const events = parseMouseEvents(data.toString('utf8'));
       for (const ev of events) {
         if (ev.motion) {
-          // Throttle: at most one state update per 100ms — mouse-move can fire >60Hz.
+          // Throttle: at most one state update per 250ms — mouse-move can fire >60Hz
+          // and every update re-renders the App tree (visible flicker in the terminal).
           const now = Date.now();
-          if (now - lastMouseUpdateRef.current >= 100) {
+          if (now - lastMouseUpdateRef.current >= 250) {
             lastMouseUpdateRef.current = now;
             setMouseCol(ev.col);
             setMouseRow(ev.row);
+          }
+          continue;
+        }
+        // Wheel = user wants to scroll. Put the pet to sleep, which releases all
+        // mouse modes so subsequent wheel ticks and the scrollbar go through to the
+        // terminal natively. This first event is consumed by bk1 (no scroll happens
+        // for it), but the next one — and everything until the pet wakes — works.
+        if (ev.button === 'wheel-up' || ev.button === 'wheel-down') {
+          if (!isSleeping(petRef.current)) {
+            const napping = petSleep(petRef.current);
+            petRef.current = napping;
+            setPet(napping);
+            savePet(napping);
+            disableMouseTracking(process.stdout);
+            mouseTrackingOnRef.current = false;
           }
           continue;
         }
@@ -1138,6 +1212,30 @@ function App({ onLogout }: { onLogout: () => void }) {
       onLogout();
       return;
     }
+    // /lint-deep — gate the (expensive) semantic pass on a local Y/N if a report
+    // already exists in <project>/.bk1/lint-report.html. The check + prompt happen
+    // entirely client-side; the LLM is only called if the user explicitly opts in.
+    // `--force` bypasses the gate so a deliberate re-run never asks twice.
+    if (raw === '/lint-deep' || (raw.startsWith('/lint-deep ') && !raw.includes('--force'))) {
+      if (existsSync(LINT_REPORT_PATH)) {
+        pendingConfirmActionRef.current = {
+          onYes: () => {
+            inputRef.current = '/lint-deep --force';
+            void submit();
+          },
+          onNo: () => {
+            setInput(''); inputRef.current = ''; setSuggestionIndex(-1);
+            setMessages(prev => [
+              ...prev,
+              { role: 'user', content: raw },
+              { role: 'assistant', content: `Existing lint report: ${LINT_REPORT_PATH}\n\nOpen it in your browser, or run \`/lint-deep --force\` to overwrite with a fresh semantic pass.` },
+            ]);
+          },
+        };
+        setConfirmPrompt(`A lint report already exists at ${LINT_REPORT_PATH}. Re-run /lint-deep and overwrite it? (yes/no)`);
+        return;
+      }
+    }
     if (raw === '/usage') {
       // Local report — no LLM call. Inject the formatted breakdown as an assistant
       // message so it appears in the chat scroll just like other responses.
@@ -1172,6 +1270,11 @@ function App({ onLogout }: { onLogout: () => void }) {
         note = `You played with ${nextPet.name ?? 'your pet'}.`;
       } else if (sub === 'sleep') {
         nextPet = petSleep(nextPet);
+        // Release the mouse synchronously, before the next render — otherwise the
+        // user has to wait for the polling effect to re-run before scroll/select
+        // works. Also update the ref so the effect's apply() doesn't re-enable.
+        disableMouseTracking(process.stdout);
+        mouseTrackingOnRef.current = false;
         note = `${nextPet.name ?? 'Your pet'} fell asleep. Energy restored.`;
       } else if (sub === 'name') {
         if (!arg) {
@@ -1223,8 +1326,16 @@ function App({ onLogout }: { onLogout: () => void }) {
     tokenAccRef.current = { input: 0, output: 0, cacheRead: 0 };
     setLiveTokens(null);
 
+    // If the bk1-context VS Code extension is installed and reporting fresh state,
+    // prepend the IDE snapshot as a <system-reminder> so the model sees the active
+    // file + selection alongside the user's prompt (same shape Claude Code uses).
+    // displayText (rendered in chat) stays clean — only the LLM-bound history gets
+    // the extra context, so it doesn't clutter the user's view of what they typed.
+    const ideContext = readIdeContextBlock();
+    const promptForLLM = ideContext ? `${ideContext}\n\n${promptText}` : promptText;
+
     setMessages(prev => [...prev, { role: 'user', content: displayText }]);
-    historyRef.current.push({ role: 'user', content: promptText });
+    historyRef.current.push({ role: 'user', content: promptForLLM });
 
     const controller = new AbortController();
     abortRef.current = controller;
@@ -1383,10 +1494,46 @@ function App({ onLogout }: { onLogout: () => void }) {
   }, []);
 
   useInput((inputChar, key) => {
+    // SGR mouse-event residue (e.g. `[<64;10;20M` from a wheel tick) sometimes
+    // leaks through Ink's keypress parser as "printable text" right after the
+    // dedicated raw-stdin handler processes the same event. Drop it here so
+    // none of the keypress handlers below — especially the wake-on-keypress
+    // hook — react to what was actually a mouse event. Without this guard a
+    // wheel scroll would put the pet to sleep and immediately wake it back up.
+    if (inputChar && /\[<\d+;\d+;\d+[Mm]/.test(inputChar)) return;
+
+    // Any real keypress while the pet is asleep wakes it up — the closest natural
+    // substitute to "click the pet to wake it" we can offer without re-enabling
+    // mouse capture (which would re-break drag-selection and the wheel). The
+    // wake happens before any other key handling so e.g. Esc/Ctrl+C still do
+    // their job, but the pet is awake on the next render and mouse tracking
+    // resumes for eye-following.
+    if (isSleeping(petRef.current)) {
+      const woke = wakePet(petRef.current);
+      petRef.current = woke;
+      setPet(woke);
+      savePet(woke);
+      enableMouseTracking(process.stdout);
+      mouseTrackingOnRef.current = true;
+    }
     // Ctrl+C always exits. ESC interrupts a running agent; when idle, ESC is a no-op
     // so users can't accidentally kill the app with one keystroke.
     if (key.ctrl && inputChar === 'c') process.exit(0);
+    // Ctrl+L force-redraws the UI — recovery hatch when the terminal's cursor gets
+    // out of sync with Ink (e.g. after a stray escape sequence from Option+key in
+    // VS Code's xterm.js, or a window resize). Clears scrollback below the cursor
+    // and resets to row 1 col 1; Ink's next paint fills it back in correctly.
+    if (key.ctrl && inputChar === 'l') {
+      process.stdout.write('\x1b[2J\x1b[H');
+      return;
+    }
     if (key.escape) {
+      // Remember when ESC fired. Option+<letter> in some terminals (notably VS Code's
+      // xterm.js) gets split into two keypresses — ESC, then the letter — instead of
+      // arriving as a single key.meta event. Without this guard the orphan letter
+      // falls through to the printable-char branch and gets appended to the input
+      // (that's the `Sonnet 4.et` glitch where typed letters bled into the model badge).
+      lastEscapeAtRef.current = Date.now();
       if (isRunningRef.current) abortRef.current?.abort();
       return;
     }
@@ -1395,17 +1542,31 @@ function App({ onLogout }: { onLogout: () => void }) {
       return;
     }
 
-    // Confirm bar — arrow keys navigate, Enter confirms, Y/N quick-select
+    // Confirm bar — arrow keys navigate, Enter confirms, Y/N quick-select.
+    // If a local deferred action is pending (e.g. `/lint-deep` overwrite gate),
+    // its callbacks fire instead of forwarding yes/no to the agent.
     if (confirmPrompt !== null) {
+      const resolve = (value: 'yes' | 'no') => {
+        const action = pendingConfirmActionRef.current;
+        if (action) {
+          pendingConfirmActionRef.current = null;
+          setConfirmPrompt(null);
+          setConfirmSelected(0);
+          if (value === 'yes') action.onYes();
+          else                 action.onNo();
+        } else {
+          inputRef.current = value;
+          void submit();
+        }
+      };
       if (key.leftArrow || key.upArrow)   { setConfirmSelected(0); return; }
       if (key.rightArrow || key.downArrow) { setConfirmSelected(1); return; }
       if (key.return) {
-        inputRef.current = CONFIRM_OPTIONS[confirmSelected]!.value;
-        void submit();
+        resolve(CONFIRM_OPTIONS[confirmSelected]!.value as 'yes' | 'no');
         return;
       }
-      if (inputChar === 'y' || inputChar === 'Y') { inputRef.current = 'yes'; void submit(); }
-      else if (inputChar === 'n' || inputChar === 'N') { inputRef.current = 'no'; void submit(); }
+      if (inputChar === 'y' || inputChar === 'Y') resolve('yes');
+      else if (inputChar === 'n' || inputChar === 'N') resolve('no');
       return;
     }
 
@@ -1501,11 +1662,14 @@ function App({ onLogout }: { onLogout: () => void }) {
       setSuggestionIndex(-1);
       promptHistoryIdxRef.current = -1;
     } else if (inputChar && !key.ctrl && !key.meta) {
+      // Drop characters arriving within a brief window after an ESC keypress — almost
+      // always the orphan tail of an Option+<letter> sequence Ink split in two.
+      if (Date.now() - lastEscapeAtRef.current < 50) return;
       // Ink's keypress parser strips the leading ESC from SGR mouse sequences but lets
       // the rest of the CSI through as printable text — e.g. a left-click leaks `[<0;8;40M`
-      // into the input buffer. The raw stdin listener above has already handled the click,
-      // so any residue here is safe to drop.
-      const cleaned = inputChar.replace(/\[<\d+;\d+;\d+[Mm]/g, '');
+      // into the input buffer. Strip any residual CSI-style escape sequence (numbers,
+      // semicolons, `<`/`>`, then a letter or `~`) so nothing weird ever lands in input.
+      const cleaned = inputChar.replace(/\[[\d;<>?]*[A-Za-z~]/g, '');
       if (!cleaned) return;
       const next = inputRef.current + cleaned;
       inputRef.current = next;
@@ -1528,7 +1692,7 @@ function App({ onLogout }: { onLogout: () => void }) {
               <Text bold color="#C0FAD2">bk1</Text>
               <Text color="#5A8060">v0.1.0</Text>
             </Box>
-            <Text color="#5A8060"><Text color="#C0FAD2">{MODELS[modelIdx]!.label}</Text> · Mangrove's dbt Coding Agent</Text>
+            <Text color="#5A8060"><Text color="#C0FAD2">{MODELS[modelIdx]!.label}</Text> · dbt Coding Agent by Mangrove Digital</Text>
             <Text color="#5A8060">{PROJECT_DIR}</Text>
           </Box>
         </Box>
@@ -1560,14 +1724,20 @@ function App({ onLogout }: { onLogout: () => void }) {
             <Text bold color="#C0FAD2">bk1</Text>
             <Text color="#5A8060">v0.1.0</Text>
           </Box>
-          <Text color="#5A8060"><Text color="#C0FAD2">{MODELS[modelIdx]!.label}</Text> · Mangrove's dbt Coding Agent</Text>
+          <Text color="#5A8060"><Text color="#C0FAD2">{MODELS[modelIdx]!.label}</Text> · dbt Coding Agent by Mangrove Digital</Text>
           <Text color="#5A8060">{PROJECT_DIR}</Text>
         </Box>
       </Box>
 
-      <Box flexDirection="column" paddingX={2} paddingTop={1}>
-        {messages.map((msg, i) => (
-          <Box key={i} flexDirection="column" marginBottom={1}>
+      {/* Past messages render through <Static>: each one is written to stdout exactly
+          once when it appears in the items array and never touched by subsequent Ink
+          renders. That's what makes drag-selection on assistant output actually stick —
+          without this, the snore animation / input-bar redraws were repainting the
+          message lines and wiping out the terminal's selection highlight. Padding has
+          to be set per-item because <Static> children don't inherit parent box props. */}
+      <Static items={messages}>
+        {(msg, i) => (
+          <Box key={i} flexDirection="column" marginBottom={1} paddingX={2} marginTop={i === 0 ? 1 : 0}>
             {msg.role === 'user' ? (
               <Box gap={1}>
                 <Text color="#B9FECF">{'>'}</Text>
@@ -1580,8 +1750,13 @@ function App({ onLogout }: { onLogout: () => void }) {
               </>
             )}
           </Box>
-        ))}
+        )}
+      </Static>
 
+      {/* Live running indicator must stay dynamic — it streams updates while the
+          agent is mid-turn. Once the run ends and the final message is appended to
+          `messages`, it moves into Static automatically. */}
+      <Box flexDirection="column" paddingX={2}>
         {isRunning && (
           <Box flexDirection="column" marginBottom={1}>
             <Box gap={1}>

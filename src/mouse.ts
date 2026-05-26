@@ -65,6 +65,17 @@ export function enableMouseTracking(out: NodeJS.WriteStream): void {
 
 // Disable in reverse order. Must run before bk1 exits or the terminal stays in mouse
 // mode after bk1 closes — clicks keep producing garbage characters in the next shell.
+//
+// We disable a broader set than we ever enable, on the theory that some terminal
+// (or downstream library) might have flipped on a sibling mode we don't know about.
+// Modes covered:
+//   1000  basic press/release
+//   1002  button-drag motion
+//   1003  any-motion
+//   1005  utf-8 mouse encoding
+//   1006  SGR encoding
+//   1015  urxvt encoding
+// Disabling a mode that was never set is a no-op, so this is safe.
 export function disableMouseTracking(out: NodeJS.WriteStream): void {
-  out.write('\x1b[?1006l\x1b[?1003l\x1b[?1000l');
+  out.write('\x1b[?1006l\x1b[?1015l\x1b[?1005l\x1b[?1003l\x1b[?1002l\x1b[?1000l');
 }
