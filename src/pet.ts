@@ -478,6 +478,14 @@ export function petSleep(state: PetState, now: Date = new Date()): PetState {
   };
 }
 
+// Clear the sleep window without any other stat change — the gentle wake path the
+// keypress-wake hook uses. Distinct from feed/play, which are deliberate interactions
+// that also boost happiness and (for play) drain energy.
+export function wakePet(state: PetState, now: Date = new Date()): PetState {
+  const ticked = tickPet(state, now);
+  return { ...ticked, sleeping_until: undefined };
+}
+
 export function rename(state: PetState, name: string, now: Date = new Date()): PetState {
   const cleaned = name.trim().slice(0, 32);
   if (cleaned.length === 0) return state;
