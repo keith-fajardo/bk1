@@ -35,6 +35,7 @@ export interface PetState {
   happiness: number;            // 0 (miserable) ... 100 (overjoyed)
   energy: number;               // 0 (exhausted) ... 100 (energetic)
   sleeping_until?: string;      // ISO — while in the future, pet shows closed eyes + snore
+  eating_until?: string;        // ISO — while in the future, pet shows 2-frame chewing animation
 }
 
 export type Stage = 'egg' | 'baby' | 'adult';
@@ -62,6 +63,7 @@ const PLAY_HAPPY_DELTA     = +20;
 const PLAY_ENERGY_DELTA    = -10;
 const SLEEP_ENERGY_TARGET  = 100;
 const SLEEP_DURATION_MS    = 10 * 60 * 1000;  // how long the closed-eye + snore animation runs
+const EATING_DURATION_MS   = 2_500;            // how long the 2-frame chewing animation runs after /pet feed
 
 function clamp(n: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, n));
@@ -108,6 +110,11 @@ export function stage(state: PetState, now: Date = new Date()): Stage {
 export function isSleeping(state: PetState, now: Date = new Date()): boolean {
   if (!state.sleeping_until) return false;
   return new Date(state.sleeping_until).getTime() > now.getTime();
+}
+
+export function isEating(state: PetState, now: Date = new Date()): boolean {
+  if (!state.eating_until) return false;
+  return new Date(state.eating_until).getTime() > now.getTime();
 }
 
 export function mood(state: PetState, now: Date = new Date()): Mood {
@@ -159,6 +166,19 @@ const FACES: Record<Stage, Record<Mood, string>> = {
 
 export function petFace(state: PetState, now: Date = new Date()): string {
   return FACES[stage(state, now)][mood(state, now)];
+}
+
+// Two-frame chewing animation. Mouth alternates between `~` and `∽` (reversed
+// tilde) to read as jaw movement. Eggs don't eat, so both frames are the inert
+// egg face. Caller (StatusFooter) cycles `frame` every ~300ms while isEating().
+const EATING_FACES: Record<Stage, [string, string]> = {
+  egg:   ['( ◯ )',      '( ◯ )'],
+  baby:  ['(•~•)',      '(•∽•)'],
+  adult: ['ᕙ(•~•)ᕗ',   'ᕙ(•∽•)ᕗ'],
+};
+
+export function petFaceEating(state: PetState, frame: number, now: Date = new Date()): string {
+  return EATING_FACES[stage(state, now)][frame % 2]!;
 }
 
 // ─── Pixel sprite (rendered in /pet view) ───────────────────────────────────────
@@ -238,6 +258,24 @@ const ADULT_SPRITE_SLEEP: string[] = [
   PET_SPRITE_SENTINEL + 'BBBBBBBBB',
   PET_SPRITE_SENTINEL + 'BHHBBBHHB',
   PET_SPRITE_SENTINEL + 'BBBBBBBBB',
+];
+
+// Eating: eyes stay open (cols 2 and 6 on row 2) and the mouth on row 3 alternates
+// between two narrow glyphs preceded by a right-cheek paren:
+//   Frame A → `) ~`  (paren + wavy mouth)
+//   Frame B → `) -`  (paren + flat mouth)
+// All glyphs are 1 terminal cell wide so the body stays a 9-cell rectangle.
+// Layout (cols 0-8): paren at col 3, mouth at col 4 — sits just left of dead center,
+// reading as a profile munch.
+const ADULT_SPRITE_EATING_A: string[] = [
+  PET_SPRITE_SENTINEL + 'BBBBBBBBB',
+  PET_SPRITE_SENTINEL + 'BBVBBBVBB',  // eyes
+  PET_SPRITE_SENTINEL + 'BBB)WBBBB',  // ) ~
+];
+const ADULT_SPRITE_EATING_B: string[] = [
+  PET_SPRITE_SENTINEL + 'BBBBBBBBB',
+  PET_SPRITE_SENTINEL + 'BBVBBBVBB',  // eyes
+  PET_SPRITE_SENTINEL + 'BBB)TBBBB',  // ) -
 ];
 
 // Cardinal — eyes shift by 1 col / 1 logical pixel from NORMAL.
@@ -326,6 +364,14 @@ export function petSpriteBlink(state: PetState, now: Date = new Date()): string[
 // Sleep variant — dash-broken closed eyes. Used while isSleeping(pet) is true.
 export function petSpriteSleep(state: PetState, now: Date = new Date()): string[] {
   return stage(state, now) === 'egg' ? EGG_SPRITE : withLegs(ADULT_SPRITE_SLEEP);
+}
+
+// Eating variant — 2-frame chewing animation. Caller (PetSpritePanel) cycles
+// `frame` every ~300ms while isEating(pet) is true; eggs don't eat so the egg
+// sprite is returned unchanged.
+export function petSpriteEating(state: PetState, frame: number, now: Date = new Date()): string[] {
+  if (stage(state, now) === 'egg') return EGG_SPRITE;
+  return withLegs(frame % 2 === 0 ? ADULT_SPRITE_EATING_A : ADULT_SPRITE_EATING_B);
 }
 
 // Look-right variant — exported for the same reason. Eggs don't have eyes to move,
@@ -451,6 +497,7 @@ export function feed(state: PetState, now: Date = new Date()): PetState {
     hunger: clamp(ticked.hunger + FEED_HUNGER_DELTA, 0, 100),
     happiness: clamp(ticked.happiness + 3, 0, 100), // small joy from being fed
     sleeping_until: undefined, // interaction wakes the pet
+    eating_until: new Date(now.getTime() + EATING_DURATION_MS).toISOString(),
   };
 }
 
@@ -475,6 +522,7 @@ export function petSleep(state: PetState, now: Date = new Date()): PetState {
     ...ticked,
     energy: SLEEP_ENERGY_TARGET,
     sleeping_until: new Date(now.getTime() + SLEEP_DURATION_MS).toISOString(),
+    eating_until:   undefined, // sleep cancels any in-progress chew so the animations don't overlap
   };
 }
 
@@ -530,6 +578,7 @@ export function readPetFrom(path: string): PetState | null {
         happiness:      data.happiness,
         energy:         data.energy,
         sleeping_until: typeof data.sleeping_until === 'string' ? data.sleeping_until : undefined,
+        eating_until:   typeof data.eating_until   === 'string' ? data.eating_until   : undefined,
       };
     }
     return null;

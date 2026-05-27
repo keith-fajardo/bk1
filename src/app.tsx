@@ -12,15 +12,16 @@ import { getStoredKey, storeKey, clearStoredKey, isValidKeyShape, authFilePath }
 import { estimateCostUsd, formatUsd } from './pricing';
 import { createUsageState, recordUsage, buildReport, renderReport, classifyTurnLabel } from './usage';
 import {
-  loadPet, savePet, newPet, tickPet, petFace,
-  petSprite, petSpriteBlink, petSpriteSleep,
+  loadPet, savePet, newPet, tickPet, petFace, petFaceEating,
+  petSprite, petSpriteBlink, petSpriteSleep, petSpriteEating,
   petSpriteLookLeft, petSpriteLookRight, petSpriteLookUp, petSpriteLookDown,
   petSpriteLookUL, petSpriteLookUR, petSpriteLookDL, petSpriteLookDR,
-  renderPetView, isSleeping,
+  renderPetView, isSleeping, isEating,
   feed, play, petSleep, wakePet, rename, autoFeedFromActivity,
   type PetState,
 } from './pet';
 import { enableMouseTracking, disableMouseTracking, parseMouseEvents } from './mouse';
+import { GAMES } from './games';
 
 const MODELS = [
   { id: 'claude-haiku-4-5-20251001', label: 'Haiku 4.5' },
@@ -114,6 +115,39 @@ function ModelPicker({ currentIdx }: { currentIdx: number }) {
       })}
       <Box paddingX={2} marginTop={0}>
         <Text color="#5A8060">↑↓ navigate · Enter confirm</Text>
+      </Box>
+    </Box>
+  );
+}
+
+// Mini-game picker — shown when input starts with "/pet play". Same shape as
+// ModelPicker so the UX is consistent with /model. The selected entry is
+// launched on Enter via the /pet play submit branch.
+function GamePicker({ currentIdx }: { currentIdx: number }) {
+  const entries = Object.values(GAMES);
+  // Labels are "/pet play <id>" + " ●" — wider than CMD_COL_WIDTH (sized for
+  // short model names). Size the column to the longest registered label so
+  // game ids never truncate as new games are added.
+  const labelWidth = Math.max(
+    CMD_COL_WIDTH,
+    ...entries.map(g => `/pet play ${g.id}`.length + 2),
+  );
+  return (
+    <Box flexDirection="column" marginBottom={0}>
+      {entries.map((g, i) => {
+        const active = i === currentIdx;
+        return (
+          <Box key={g.id} paddingX={2} gap={1}>
+            <Box width={labelWidth} flexShrink={0}>
+              <Text color={active ? '#C0FAD2' : '#5A8060'} bold={active}>/pet play {g.id}</Text>
+              <Text color="#B9FECF">{active ? ' ●' : '  '}</Text>
+            </Box>
+            <Text color={active ? '#7AB890' : '#3D6650'}>{g.description}</Text>
+          </Box>
+        );
+      })}
+      <Box paddingX={2} marginTop={0}>
+        <Text color="#5A8060">↑↓ navigate · Enter play · Esc cancel</Text>
       </Box>
     </Box>
   );
@@ -254,7 +288,7 @@ function InputBar({ input, isRunning, mode, modelLabel }: {
 // Blink overrides eye direction briefly (~180ms) on a jittered ~3–6s schedule so the
 // pet feels alive even when the cursor is parked.
 type PetFrame =
-  | 'normal' | 'blink' | 'sleep'
+  | 'normal' | 'blink' | 'sleep' | 'eating'
   | 'lookL' | 'lookR' | 'lookU' | 'lookD'
   | 'lookUL' | 'lookUR' | 'lookDL' | 'lookDR';
 
@@ -268,6 +302,41 @@ const SNORE_FRAMES: ReadonlyArray<readonly [string, string, string]> = [
   ['Z', ' ', ' '],
   [' ', ' ', ' '],
 ];
+
+// Single-element items array for the conversation-view header <Static>. Declared
+// at module scope so the reference is stable across renders — Ink keys Static
+// items by index, so a fresh `['header']` literal each render would technically
+// still work, but a stable constant is cheaper and clearer about intent.
+const HEADER_ITEMS: string[] = ['header'];
+
+// Local greeting template — when the user opens with a plain "hi" / "what can you
+// do?" we short-circuit the LLM and reply with this static capability summary.
+// Saves an API call (and the corresponding tokens) for what's otherwise the same
+// boilerplate every session.
+const GREETING_TEMPLATE = `Hi! I'm bk1, your dbt coding agent. I can help you with:
+
+  - dbt Modeling — staging, intermediate, marts, dimensions, facts
+  - data modeling — uses Kimball dimensional modeling
+  - SQL — dialect-specific queries, casting, performance
+  - Testing & documentation — YAML specs, dbt tests, column descriptions
+  - Model Failure Investigations — Investigates failures based on run results
+  - Lineage & impact analysis — tracing dependencies across your project
+  - Folder Linting & refactoring — conventions, naming, structure`;
+
+// Triggers for the local greeting reply. Kept narrow so an actual question that
+// just happens to start with "hi …" doesn't accidentally hit the intercept —
+// each pattern matches the full input after stripping trailing punctuation.
+const GREETING_PATTERNS: ReadonlyArray<RegExp> = [
+  /^(hi|hello|hey|howdy|yo|hiya|sup)(\s+(bk1|there|bot|buddy))?$/i,
+  /^(good\s+(morning|afternoon|evening))(\s+bk1)?$/i,
+  /^(what\s+(can|do)\s+you\s+do(\s+for\s+me)?|what\s+are\s+your\s+(capabilities|features|skills)|how\s+(can|do)\s+you\s+help(\s+me)?)$/i,
+];
+
+function isGreeting(raw: string): boolean {
+  const stripped = raw.trim().replace(/[!.?]+$/, '').replace(/\s+/g, ' ');
+  if (!stripped) return false;
+  return GREETING_PATTERNS.some(re => re.test(stripped));
+}
 
 const PET_CENTER_COL  = 7;
 const PET_DEAD_ZONE_X = 1;
@@ -284,7 +353,11 @@ function PetSpritePanel({ pet, mouseCol, mouseRow, renderHeight }: {
   // naturally drops out of the sleep frame when sleeping_until elapses (isSleeping
   // re-evaluates on each tick and flips to false).
   const [snoreFrame, setSnoreFrame] = useState(0);
+  // Same idea for the chewing animation — cycles every ~300ms while eating_until is
+  // in the future, then naturally drops back to the static sprite when it elapses.
+  const [eatingFrame, setEatingFrame] = useState(0);
   const sleeping = isSleeping(pet);
+  const eating   = isEating(pet) && !sleeping;
 
   useEffect(() => {
     let pending: ReturnType<typeof setTimeout>;
@@ -310,6 +383,14 @@ function PetSpritePanel({ pet, mouseCol, mouseRow, renderHeight }: {
     return () => clearInterval(id);
   }, [sleeping]);
 
+  useEffect(() => {
+    if (!eating) return;
+    const id = setInterval(() => {
+      setEatingFrame(f => (f + 1) % 2);
+    }, 300);
+    return () => clearInterval(id);
+  }, [eating]);
+
   // Pet eye row, in absolute 1-indexed terminal coords (matches mouse Y from xterm).
   // Counting from the bottom of the rendered output: HintBar paddingBottom(1) +
   // HintBar text(1) + HRule(1) + legs(1) + body bottom(1) + eye(1) = the 6th row up.
@@ -330,6 +411,10 @@ function PetSpritePanel({ pet, mouseCol, mouseRow, renderHeight }: {
     // Sleep wins over blink and mouse-tracking — the pet is OUT, not napping with one
     // eye open.
     frame = 'sleep';
+  } else if (eating) {
+    // Eating wins over blink and mouse-tracking too — the jaw animation is the whole
+    // point. Eyes in the sprite stay open so the pet still "looks at" the user.
+    frame = 'eating';
   } else if (blinking) {
     frame = 'blink';
   } else if (mouseCol !== null && mouseRow !== null) {
@@ -355,6 +440,7 @@ function PetSpritePanel({ pet, mouseCol, mouseRow, renderHeight }: {
 
   const sprite =
     frame === 'sleep'  ? petSpriteSleep(pet) :
+    frame === 'eating' ? petSpriteEating(pet, eatingFrame) :
     frame === 'blink'  ? petSpriteBlink(pet) :
     frame === 'lookR'  ? petSpriteLookRight(pet) :
     frame === 'lookL'  ? petSpriteLookLeft(pet) :
@@ -391,7 +477,19 @@ function StatusFooter({ sessionUsd, pet, mouseCol, mouseRow, renderHeight }: {
   mouseRow: number | null;
   renderHeight: number;
 }) {
-  const face = petFace(pet);
+  // 2-frame chewing animation: while isEating(pet) is true, swap the kaomoji
+  // between `(•~•)` and `(•∽•)` every 300 ms. The interval also doubles as the
+  // re-render tick that lets the panel drop back to the static face when
+  // eating_until naturally elapses (similar pattern to the snore animation).
+  const eating = isEating(pet);
+  const [eatingFrame, setEatingFrame] = useState(0);
+  useEffect(() => {
+    if (!eating) return;
+    const id = setInterval(() => setEatingFrame(f => (f + 1) % 2), 300);
+    return () => clearInterval(id);
+  }, [eating]);
+
+  const face = eating ? petFaceEating(pet, eatingFrame) : petFace(pet);
   const petLabel = pet.name ?? 'pet';
   return (
     <Box paddingX={2} gap={2} marginTop={1}>
@@ -568,6 +666,16 @@ const PET_CELLS: Record<string, CellSpec> = {
   V: { glyph: '▀', fg: PET_EYE,   bg: PET_BODY },  // eye-open (top) | body
   M: { glyph: '▄', fg: PET_EYE,   bg: PET_BODY },  // body | eye-open (bottom)
   H: { glyph: '─', fg: PET_EYE,   bg: PET_BODY },  // thin horizontal line — closed-eye dash
+  // Eating-mouth cells — chosen to be GUARANTEED 1 terminal cell wide so the body
+  // outline stays rectangular while the mouth animates. Wide wave glyphs (U+301C
+  // 〜 / U+FF5E ～) render as 1 cell in some fonts and 2 in others, which leaves a
+  // notch on the side of the body whenever the terminal's idea of the char width
+  // disagrees with the encoded row length.
+  W: { glyph: '~', fg: PET_EYE,   bg: PET_BODY },  // ASCII tilde — eating frame A (wavy mouth)
+  T: { glyph: '—', fg: PET_EYE,   bg: PET_BODY },  // ASCII em dash — eating frame B (flat mouth)
+  // Right-cheek paren — sits to the LEFT of the eating mouth so the face reads as
+  // a profile munch: `)` (cheek) then `~` / `-` (mouth in motion).
+  ')': { glyph: ')', fg: PET_EYE, bg: PET_BODY },
   Y: { glyph: '▀', fg: PET_BLINK, bg: PET_BODY },  // eye-blink | body
   U: { glyph: '▀', fg: PET_BODY },                 // body | empty (legacy: legs / sprite top)
   L: { glyph: '▄', fg: PET_BODY },                 // empty | body  (leg hanging below body)
@@ -1014,6 +1122,7 @@ function App({ onLogout }: { onLogout: () => void }) {
   const [suggestionIndex, setSuggestionIndex] = useState(-1);
   const [mode, setMode] = useState<Mode>('plan');
   const [modelIdx, setModelIdx] = useState(DEFAULT_MODEL_IDX);
+  const [petPlayIdx, setPetPlayIdx] = useState(0);
   const [semanticProgress, setSemanticProgress] = useState<SemanticProgress | null>(null);
   const [lintProgress, setLintProgress] = useState<LintProgress | null>(null);
   const [confirmPrompt, setConfirmPrompt] = useState<string | null>(null);
@@ -1042,6 +1151,15 @@ function App({ onLogout }: { onLogout: () => void }) {
   // terminal (intro screen, short conversations).
   const containerRef = useRef<DOMElement>(null);
   const [renderHeight, setRenderHeight] = useState(process.stdout.rows ?? 24);
+  // Reactive terminal-row count. Pet eye-tracking anchors to terminal_bottom - 5,
+  // so the calculation needs to follow window resizes. Ink doesn't expose a
+  // ready-made hook, so we listen to stdout's resize event ourselves.
+  const [terminalRows, setTerminalRows] = useState(process.stdout.rows ?? 24);
+  useEffect(() => {
+    const onResize = () => setTerminalRows(process.stdout.rows ?? 24);
+    process.stdout.on('resize', onResize);
+    return () => { process.stdout.off('resize', onResize); };
+  }, []);
   useEffect(() => {
     if (!containerRef.current) return;
     const { height } = measureElement(containerRef.current);
@@ -1088,6 +1206,15 @@ function App({ onLogout }: { onLogout: () => void }) {
   const petRef = useRef(pet);
   useEffect(() => { petRef.current = pet; }, [pet]);
 
+  // Active pet mini-game (currently 'fetch'). When set, the game owns the screen +
+  // input; the welcome / conversation view is suppressed and the App-level mouse
+  // handler short-circuits via activeGameRef so clicks don't double-fire as both
+  // "throw to fetch" AND "tap the StatusFooter pet". onExit applies any happiness
+  // boost the game earned, like the old /pet play tap did instantly.
+  const [activeGame, setActiveGame] = useState<string | null>(null);
+  const activeGameRef = useRef<string | null>(null);
+  useEffect(() => { activeGameRef.current = activeGame; }, [activeGame]);
+
   // Re-evaluate the desired mouse-mode state whenever the pet flips between awake and
   // asleep. Polled once per second while the effect is active to catch natural wake-up
   // (sleeping_until elapses) without lifting the sleep timer into App-level reactivity.
@@ -1128,6 +1255,11 @@ function App({ onLogout }: { onLogout: () => void }) {
   // worst case is "user clicked the cost text and pet got happier" — harmless.
   useEffect(() => {
     const handler = (data: Buffer) => {
+      // While a mini-game is active it owns mouse input — its own handler parses
+      // the same stdin chunk. Bail out so a single click doesn't fire both "throw
+      // to fetch" AND "tap the StatusFooter pet" (which would credit happiness twice
+      // and re-render the bottom bar mid-game).
+      if (activeGameRef.current) return;
       const events = parseMouseEvents(data.toString('utf8'));
       for (const ev of events) {
         if (ev.motion) {
@@ -1172,14 +1304,18 @@ function App({ onLogout }: { onLogout: () => void }) {
     return () => { process.stdin.off('data', handler); };
   }, []);
 
-  const isModelPicker = input.startsWith('/model');
+  const isModelPicker   = input.startsWith('/model');
+  // /pet play (with or without trailing chars) → arrow-key game picker.
+  // Matches "/pet play" exactly OR "/pet play <anything>" so partial typing
+  // of a game id keeps the picker visible.
+  const isPetPlayPicker = input === '/pet play' || input.startsWith('/pet play ');
 
   const suggestions = useMemo(() => {
-    if (isModelPicker) return [] as [string, typeof SKILLS[string]][];
+    if (isModelPicker || isPetPlayPicker) return [] as [string, typeof SKILLS[string]][];
     if (!input.startsWith('/')) return [] as [string, typeof SKILLS[string]][];
     const partial = input.slice(1).split(' ')[0]?.toLowerCase() ?? '';
     return Object.entries(SKILLS).filter(([cmd]) => cmd.startsWith(partial)) as [string, typeof SKILLS[string]][];
-  }, [input, isModelPicker]);
+  }, [input, isModelPicker, isPetPlayPicker]);
 
   const submit = useCallback(async () => {
     const raw = inputRef.current.trim();
@@ -1248,6 +1384,18 @@ function App({ onLogout }: { onLogout: () => void }) {
       ]);
       return;
     }
+    // Local greeting reply — short-circuits the LLM for boilerplate "hi" / "what
+    // can you do" inputs. Not added to historyRef so the LLM never sees these
+    // turns on subsequent prompts (no token cost now, no cache pollution later).
+    if (isGreeting(raw)) {
+      setInput(''); inputRef.current = ''; setSuggestionIndex(-1);
+      setMessages(prev => [
+        ...prev,
+        { role: 'user',      content: raw },
+        { role: 'assistant', content: GREETING_TEMPLATE },
+      ]);
+      return;
+    }
     if (raw === '/pet' || raw.startsWith('/pet ')) {
       // Local handler — all pet interactions are pure state updates against the on-disk
       // pet.json. No LLM call, no token spend. Each interaction ticks first so elapsed
@@ -1266,8 +1414,26 @@ function App({ onLogout }: { onLogout: () => void }) {
         nextPet = feed(nextPet);
         note = `You fed ${nextPet.name ?? 'your pet'}.`;
       } else if (sub === 'play') {
-        nextPet = play(nextPet);
-        note = `You played with ${nextPet.name ?? 'your pet'}.`;
+        // Arg present → direct launch (`/pet play fetch`); arg invalid → error.
+        // No arg → launch whatever the GamePicker is currently highlighting.
+        // Happiness is credited inside each game's onExit (it accumulates
+        // per-click), so launching does not tap stats by itself.
+        if (arg && GAMES[arg]) {
+          setActiveGame(arg);
+          return;
+        }
+        if (arg) {
+          const ids = Object.keys(GAMES).map(id => `/pet play ${id}`).join(' · ');
+          note = `Unknown game "${arg}". Try: ${ids}`;
+        } else {
+          const ids = Object.keys(GAMES);
+          const picked = ids[petPlayIdx] ?? ids[0];
+          if (picked) {
+            setActiveGame(picked);
+            return;
+          }
+          note = 'No games are registered.';
+        }
       } else if (sub === 'sleep') {
         nextPet = petSleep(nextPet);
         // Release the mouse synchronously, before the next render — otherwise the
@@ -1582,6 +1748,48 @@ function App({ onLogout }: { onLogout: () => void }) {
       return;
     }
 
+    // /pet play arrow cycling — up/down navigate the games picker. ONLY swallow
+    // up/down here; every other key (Enter, character input, backspace, Esc)
+    // must fall through so the launch-on-Enter handler at key.return can fire
+    // and so the user can still edit the input.
+    if ((inputRef.current === '/pet play' || inputRef.current.startsWith('/pet play '))
+        && (key.upArrow || key.downArrow)) {
+      const total = Object.keys(GAMES).length;
+      if (total > 0) {
+        if (key.upArrow) setPetPlayIdx(i => (i - 1 + total) % total);
+        else             setPetPlayIdx(i => (i + 1) % total);
+      }
+      return;
+    }
+
+    // History-scrub continuation — once we're actively scrubbing (idx !== -1),
+    // up/down stay bound to history even if the recalled prompt happens to be a
+    // slash command that lights up the Suggestions list. Without this, pressing
+    // UP twice with a "/pet feed" in history would surface the /pet suggestions
+    // on the second press and we'd never reach the older history entries.
+    if (promptHistoryIdxRef.current !== -1 && (key.upArrow || key.downArrow)) {
+      const hist = promptHistoryRef.current;
+      if (key.upArrow) {
+        const idx = Math.max(0, promptHistoryIdxRef.current - 1);
+        promptHistoryIdxRef.current = idx;
+        inputRef.current = hist[idx]!;
+        setInput(hist[idx]!);
+        return;
+      }
+      // downArrow
+      const next = promptHistoryIdxRef.current + 1;
+      if (next >= hist.length) {
+        promptHistoryIdxRef.current = -1;
+        inputRef.current = '';
+        setInput('');
+      } else {
+        promptHistoryIdxRef.current = next;
+        inputRef.current = hist[next]!;
+        setInput(hist[next]!);
+      }
+      return;
+    }
+
     // Navigate suggestions with arrow keys
     if (suggestions.length > 0) {
       if (key.upArrow) {
@@ -1679,6 +1887,28 @@ function App({ onLogout }: { onLogout: () => void }) {
     }
   });
 
+  // Active mini-game takes over the full screen — replaces welcome + conversation
+  // views entirely. The game owns its own mouse/keyboard handling and signals exit
+  // via onExit, which credits any happiness it earned through the standard play()
+  // path so the existing decay/cap rules apply uniformly.
+  if (activeGame && GAMES[activeGame]) {
+    const GameComponent = GAMES[activeGame].component;
+    const onGameExit = (happinessGain?: number) => {
+      // Convert the game's earned happiness into play() taps. play() is the canonical
+      // mutation; calling it N times preserves the existing rate-limit + decay semantics
+      // we'd otherwise have to duplicate. happinessGain is roughly "happiness points",
+      // which we floor to integer taps.
+      const taps = Math.max(0, Math.floor((happinessGain ?? 0) / 2));
+      let next = petRef.current;
+      for (let i = 0; i < taps; i++) next = play(next);
+      petRef.current = next;
+      setPet(next);
+      savePet(next);
+      setActiveGame(null);
+    };
+    return <GameComponent pet={pet} onExit={onGameExit} />;
+  }
+
   // Welcome screen
   if (messages.length === 0) {
     return (
@@ -1699,7 +1929,9 @@ function App({ onLogout }: { onLogout: () => void }) {
         <Box marginTop={1} flexDirection="column">
           {isModelPicker
             ? <ModelPicker currentIdx={modelIdx} />
-            : <Suggestions suggestions={suggestions} selectedIndex={suggestionIndex} input={input} />
+            : isPetPlayPicker
+              ? <GamePicker currentIdx={petPlayIdx} />
+              : <Suggestions suggestions={suggestions} selectedIndex={suggestionIndex} input={input} />
           }
           <HRule />
           <InputBar input={input} isRunning={isRunning} mode={mode} modelLabel={MODELS[modelIdx]!.label} />
@@ -1715,19 +1947,31 @@ function App({ onLogout }: { onLogout: () => void }) {
   // Conversation view
   return (
     <Box ref={containerRef} flexDirection="column">
-      <Box flexDirection="column" paddingX={2} paddingTop={1} paddingBottom={0}>
-        {WORDMARK.map((line, i) => (
-          <WordmarkLine key={i} line={line} color="#B9FECF" />
-        ))}
-        <Box marginTop={1} flexDirection="column">
-          <Box gap={1}>
-            <Text bold color="#C0FAD2">bk1</Text>
-            <Text color="#5A8060">v0.1.0</Text>
+      {/* WORDMARK + intro block — pinned at the very top of scrollback via its own
+          single-item <Static>. Rendered exactly once when the conversation view
+          mounts so it never gets repainted on subsequent turns (and so it sits
+          above the messages Static below, instead of inside the dynamic frame
+          where it would otherwise appear *between* messages and the footer).
+          Note: the model label captured here is the one current when this block
+          first rendered; if the user later /model-switches, the live label is
+          still visible in the InputBar. */}
+      <Static items={HEADER_ITEMS}>
+        {() => (
+          <Box key="header" flexDirection="column" paddingX={2} paddingTop={1} paddingBottom={0}>
+            {WORDMARK.map((line, i) => (
+              <WordmarkLine key={i} line={line} color="#B9FECF" />
+            ))}
+            <Box marginTop={1} flexDirection="column">
+              <Box gap={1}>
+                <Text bold color="#C0FAD2">bk1</Text>
+                <Text color="#5A8060">v0.1.0</Text>
+              </Box>
+              <Text color="#5A8060"><Text color="#C0FAD2">{MODELS[modelIdx]!.label}</Text> · dbt Coding Agent by Mangrove Digital</Text>
+              <Text color="#5A8060">{PROJECT_DIR}</Text>
+            </Box>
           </Box>
-          <Text color="#5A8060"><Text color="#C0FAD2">{MODELS[modelIdx]!.label}</Text> · dbt Coding Agent by Mangrove Digital</Text>
-          <Text color="#5A8060">{PROJECT_DIR}</Text>
-        </Box>
-      </Box>
+        )}
+      </Static>
 
       {/* Past messages render through <Static>: each one is written to stdout exactly
           once when it appears in the items array and never touched by subsequent Ink
@@ -1790,14 +2034,23 @@ function App({ onLogout }: { onLogout: () => void }) {
 
       {!confirmPrompt && (isModelPicker
         ? <ModelPicker currentIdx={modelIdx} />
-        : <Suggestions suggestions={suggestions} selectedIndex={suggestionIndex} input={input} />
+        : isPetPlayPicker
+          ? <GamePicker currentIdx={petPlayIdx} />
+          : <Suggestions suggestions={suggestions} selectedIndex={suggestionIndex} input={input} />
       )}
       <HRule />
       {confirmPrompt
         ? <ConfirmBar question={confirmPrompt} selectedIdx={confirmSelected} />
         : <InputBar input={input} isRunning={isRunning} mode={mode} modelLabel={MODELS[modelIdx]!.label} />
       }
-      <StatusFooter sessionUsd={sessionUsd} pet={pet} mouseCol={mouseCol} mouseRow={mouseRow} renderHeight={renderHeight} />
+      {/* Eye-tracking anchor: `terminalRows - 5`. Once a conversation has enough
+          Static scrollback to push the dynamic frame down, the cursor lands at the
+          terminal bottom and this is exact. For short conversations on tall terminals
+          it can be a bit off (eye is higher than the anchor), but that's the
+          least-bad option given we can't measure absolute position with Static
+          content present. terminalRows itself follows window resizes via the
+          stdout.on('resize') listener at the top of App. */}
+      <StatusFooter sessionUsd={sessionUsd} pet={pet} mouseCol={mouseCol} mouseRow={mouseRow} renderHeight={terminalRows} />
       <HRule />
       <HintBar isRunning={isRunning} />
     </Box>
