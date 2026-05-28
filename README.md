@@ -8,7 +8,7 @@ The name is short for **bakawan** — Filipino for *mangrove*.
 
 What sets bk1 apart in the dbt Core + terminal space:
 
-- **A real linter, not a prompt.** A native Rust binary ([`lint/`](lint/)) mechanically checks your project against Kimball-flavored conventions before a single LLM token is spent. Cursor, Aider, and Claude Code can *talk about* dbt style; bk1 *enforces* it deterministically and in milliseconds.
+- **A real linter, not a prompt.** A native Rust binary ([`sidecars/lint/`](sidecars/lint/)) mechanically checks your project against Kimball-flavored conventions before a single LLM token is spent. Cursor, Aider, and Claude Code can *talk about* dbt style; bk1 *enforces* it deterministically and in milliseconds.
 - **Manifest-aware by default.** Tools like `query_manifest` read `manifest.json` directly, so the agent doesn't burn tokens rediscovering your project on every turn.
 - **Opinionated dbt conventions baked into the system prompt** — first-draft output already conforms to `stg_ / int_ / dim_ / fct_` patterns, SCD typing, schema placement, and YAML structure.
 - **Cost-aware architecture.** Prompt caching on the system prompt and tool definitions; sub-agents on Haiku, throttled to 2 concurrent; per-project SQLite state for incremental sync so re-runs stay cheap on 1,000+ model repos.
@@ -33,7 +33,7 @@ Everything ships in one repo: the agent, the linter, an optional VS Code compani
 - **Investigate failed dbt runs** — diagnoses every failed model from the last `dbt run`, distinguishes upstream cascades from root causes, proposes fixes in dependency order.
 - **Explain models** — purpose, lineage, columns, SQL walkthrough, recent change history.
 - **Document models** — generates YAML with descriptions and conservative tests, waits for approval before writing.
-- **Lint mechanically** — Rust binary scans the project against the rules in [`lint/src/checks.rs`](lint/src/checks.rs), emits an [HTML report](#html-lint-reports) and a tabular summary.
+- **Lint mechanically** — Rust binary scans the project against the rules in [`sidecars/lint/src/checks.rs`](sidecars/lint/src/checks.rs), emits an [HTML report](#html-lint-reports) and a tabular summary.
 - **Lint-deep (semantic)** — fans out to sub-agents that each enforce one rule across the relevant files, then aggregates a health score and prioritized fix plan.
 - **Kimball consultancy** — answers dimensional-modeling questions grounded in *The Data Warehouse Toolkit (3rd ed.)*, indexed via a bundled SQLite + FTS5 library.
 - **Refactor with guardrails** — never runs `dbt build` / `dbt run`, never touches `CLAUDE.md`, never deletes a model file. All edits gated on explicit user approval.
@@ -164,7 +164,8 @@ src/
   kimball.ts        SQLite + FTS5 wrapper around the Data Warehouse Toolkit index
   lineage.ts        Compiled-SQL lineage for /explain and downstream-impact analysis
 
-lint/               Rust mechanical linter — emits violations.json
+sidecars/
+  lint/             Rust mechanical linter — emits violations.json
 vscode-ext/         VS Code companion extension (IDE context bridge)
 skills_data/        Pre-built knowledge bases (e.g. kimball.db)
 scripts/install.sh  One-shot setup: build binary, deploy assets, bun install
@@ -185,7 +186,7 @@ tests/              bun:test suites
 - **UI:** React + [Ink](https://github.com/vadimdemedes/ink) (terminal rendering)
 - **API:** [`@anthropic-ai/sdk`](https://www.npmjs.com/package/@anthropic-ai/sdk) — main agent on `claude-sonnet-4-6`, sub-agents on `claude-haiku-4-5-20251001`
 - **State:** [`bun:sqlite`](https://bun.sh/docs/api/sqlite) (per-project at `<dbt_project>/target/bk1_state.db`)
-- **Lint:** Rust (Cargo) — source in [`lint/`](lint/), binary installed to `~/.bk1/bk1-lint`
+- **Lint:** Rust (Cargo) — source in [`sidecars/lint/`](sidecars/lint/), binary installed to `~/.bk1/bk1-lint`
 - **Tests:** `bun test`
 
 Prefer Bun APIs (`Bun.spawn`, `Bun.Glob`, `Bun.file`) over Node equivalents when both work.

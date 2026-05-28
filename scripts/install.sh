@@ -62,7 +62,7 @@ fi
 # ── Build Rust binary (only if cargo is available) ───────────────────────────
 if [[ $HAVE_CARGO -eq 1 ]]; then
   step "Building bk1-lint (release)"
-  cd "$REPO_ROOT/lint"
+  cd "$REPO_ROOT/sidecars/lint"
   cargo build --release --quiet
   [[ -f target/release/bk1-lint ]] || fail "cargo build did not produce target/release/bk1-lint"
 
