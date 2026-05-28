@@ -14,19 +14,26 @@ const WIN_AT = 2; // best of 3 → first to 2
 
 // Picker option order chosen by user — Papel first, then Gunting, then Bato.
 // The arrow-key cursor cycles within this array; Enter locks in.
-const PICKER_OPTIONS: { id: JakenpoyChoice; emoji: string; label: string }[] = [
-  { id: 'papel',   emoji: '📄', label: 'Papel'   },
-  { id: 'gunting', emoji: '✂️',  label: 'Gunting' },
-  { id: 'bato',    emoji: '🪨', label: 'Bato'    },
+//
+// NOTE: emoji glyphs are intentionally absent. The earlier version
+// rendered "📄 Papel" / "✂️ Gunting" / "🪨 Bato" and crashed Yoga (Ink's
+// WASM layout engine) with "Out of bounds memory access" when the picker
+// or reveal screen mounted. The ✂️ variation-selector sequence is the
+// most cursed, but all three triggered measurement failures. Adding
+// emojis back would require a Yoga-safe width override or replacing
+// with single-codepoint substitutes that aren't ambiguous.
+const PICKER_OPTIONS: { id: JakenpoyChoice; label: string }[] = [
+  { id: 'papel',   label: 'Papel'   },
+  { id: 'gunting', label: 'Gunting' },
+  { id: 'bato',    label: 'Bato'    },
 ];
 
 function choiceLabel(c: JakenpoyChoice): string {
   const o = PICKER_OPTIONS.find(o => o.id === c);
-  return o ? `${o.emoji} ${o.label}` : c;
+  return o ? o.label : c;
 }
 
-// Verdict line for the reveal screen, using the emoji-decorated choice
-// names. Falls back silently to '' for unknown combinations — pure helper.
+// Verdict line for the reveal screen. Pure helper.
 function prettyVerdict(winner: JakenpoyChoice, loser: JakenpoyChoice): string {
   if (winner === 'bato'    && loser === 'gunting') return `${choiceLabel('bato')} dulls ${choiceLabel('gunting')}`;
   if (winner === 'gunting' && loser === 'papel'  ) return `${choiceLabel('gunting')} cuts ${choiceLabel('papel')}`;
@@ -208,8 +215,8 @@ export function Jakenpoy({ pet, peerPet, sidecar, onExit }: Props) {
                   const active = i === pickerIdx;
                   return (
                     <Box key={opt.id}>
-                      <Text color={active ? '#C0FAD2' : 'gray'}>{active ? '  ❯ ' : '    '}</Text>
-                      <Text color={active ? '#C0FAD2' : 'gray'} bold={active}>{opt.emoji}  {opt.label}</Text>
+                      <Text color={active ? '#C0FAD2' : 'gray'}>{active ? '  > ' : '    '}</Text>
+                      <Text color={active ? '#C0FAD2' : 'gray'} bold={active}>{opt.label}</Text>
                     </Box>
                   );
                 })}
