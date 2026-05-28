@@ -18,9 +18,12 @@ interface Env {
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    if (request.headers.get('upgrade') !== 'websocket') {
+    const upgrade = request.headers.get('upgrade');
+    if (upgrade !== 'websocket') {
+      console.log(`[worker fetch] non-ws request: ${request.url}`);
       return new Response('bk1 playroom relay (cf worker)\n', { status: 200 });
     }
+    console.log(`[worker fetch] ws upgrade from ${request.headers.get('cf-connecting-ip') ?? '?'}`);
     const id = env.ROOMS.idFromName('global');
     const stub = env.ROOMS.get(id);
     return stub.fetch(request);
