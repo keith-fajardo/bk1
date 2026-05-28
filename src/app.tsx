@@ -1492,6 +1492,11 @@ function App({ onLogout }: { onLogout: () => void }) {
   // empty deps) can read the current value without re-binding on every append.
   const dbtLogsRef = useRef<string[]>([]);
   useEffect(() => { dbtLogsRef.current = dbtLogs; }, [dbtLogs]);
+  // Mirror messages into a ref so callbacks with empty deps (e.g. submit's
+  // /history handler) read the live state instead of the empty array captured
+  // at mount. Same pattern as dbtLogsRef above.
+  const messagesRef = useRef<Message[]>([]);
+  useEffect(() => { messagesRef.current = messages; }, [messages]);
   const dbtProcRef = useRef<ReturnType<typeof Bun.spawn> | null>(null);
 
   const inputRef = useRef('');
@@ -1640,6 +1645,13 @@ function App({ onLogout }: { onLogout: () => void }) {
   // with `!` to shell out for a single command. Toggled via Ctrl+T.
   const [terminalMode, setTerminalMode] = useState(false);
   const terminalModeRef = useRef(false);
+  // Live shell indicator state. liveShellCmd is the command currently running
+  // (null when idle); liveShellText is the rolling stdout+stderr buffer that
+  // gets rendered in the dynamic frame so the user sees output as it streams
+  // instead of waiting for the command to exit.
+  const [liveShellCmd, setLiveShellCmd] = useState<string | null>(null);
+  const [liveShellText, setLiveShellText] = useState('');
+  const shellProcRef = useRef<ReturnType<typeof Bun.spawn> | null>(null);
 
   // Unified mouse-tracking lifecycle. Tracking is ON if EITHER a pet mini-game
   // is active (fetch needs to receive clicks) OR pane mode is on (dbt pane
@@ -1914,6 +1926,10 @@ function App({ onLogout }: { onLogout: () => void }) {
       const cmd = (raw.startsWith('!') ? raw.slice(1) : raw).trim();
       setInput(''); inputRef.current = ''; setSuggestionIndex(-1);
       if (!cmd) return;
+      if (shellProcRef.current) {
+        setMessages(prev => [...prev, { role: 'assistant', content: 'A shell command is still running. Press Esc to abort it, then re-submit.' }]);
+        return;
+      }
       setMessages(prev => [...prev, { role: 'user', content: (raw.startsWith('!') ? '!' : '') + cmd }]);
       void runInlineShell(cmd);
       return;
@@ -2031,7 +2047,7 @@ function App({ onLogout }: { onLogout: () => void }) {
       // updated view.
       setInput(''); inputRef.current = ''; setSuggestionIndex(-1);
       const md: string[] = [`# bk1 session — ${new Date().toISOString()}`, ''];
-      for (const msg of messages) {
+      for (const msg of messagesRef.current) {
         if (msg.role === 'user') {
           md.push(`## > ${msg.content}`, '');
         } else {
@@ -2439,30 +2455,45 @@ function App({ onLogout }: { onLogout: () => void }) {
     }
   }, [appendDbtLines]);
 
-  // Inline shell runner — for `!cmd` escapes and terminal-mode lines. Output
-  // is captured to a single string and pushed into the chat as an assistant
-  // message so it appears where the user typed (terminal mental model),
-  // instead of in the dbt log pane which is reserved for `dbt …` runs.
+  // Inline shell runner — for `!cmd` escapes and terminal-mode lines. Streams
+  // stdout+stderr through the live indicator block (so the user sees output
+  // as it's produced) and commits the full result as an assistant message
+  // when the process exits. The dbt log pane stays reserved for `dbt …` runs.
+  //
+  // 2>&1 in the bash invocation merges stderr into stdout so we only need to
+  // pump one stream and ordering is preserved (interleaved reads of two
+  // separate streams can race). PROJECT_DIR matches runShellCommand's cwd.
   const runInlineShell = useCallback(async (cmd: string) => {
+    setLiveShellCmd(cmd);
+    setLiveShellText('');
+    let buffer = '';
+    const ansi = /\x1b\[[\d;?]*[A-Za-z~]/g;
     try {
-      const proc = Bun.spawn(['bash', '-c', cmd], {
+      const proc = Bun.spawn(['bash', '-c', `${cmd} 2>&1`], {
         cwd: PROJECT_DIR,
         stdout: 'pipe',
-        stderr: 'pipe',
       });
-      const [stdout, stderr] = await Promise.all([
-        new Response(proc.stdout as ReadableStream<Uint8Array>).text(),
-        new Response(proc.stderr as ReadableStream<Uint8Array>).text(),
-      ]);
+      shellProcRef.current = proc;
+      const reader = (proc.stdout as ReadableStream<Uint8Array>).getReader();
+      const decoder = new TextDecoder();
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true }).replace(ansi, '');
+        setLiveShellText(buffer);
+      }
       const code = await proc.exited;
-      const ansi = /\x1b\[[\d;?]*[A-Za-z~]/g;
-      const out = (stdout + stderr).replace(ansi, '').replace(/\s+$/, '');
+      const out = buffer.replace(/\s+$/, '');
       const content = out
         ? (code === 0 ? out : `${out}\n[exit ${code}]`)
         : (code === 0 ? '(no output)' : `[exit ${code}]`);
       setMessages(prev => [...prev, { role: 'assistant', content }]);
     } catch (err) {
       setMessages(prev => [...prev, { role: 'assistant', content: `error: ${err instanceof Error ? err.message : String(err)}` }]);
+    } finally {
+      shellProcRef.current = null;
+      setLiveShellCmd(null);
+      setLiveShellText('');
     }
   }, []);
 
@@ -2596,6 +2627,7 @@ function App({ onLogout }: { onLogout: () => void }) {
       lastEscapeAtRef.current = Date.now();
       if (isRunningRef.current) abortRef.current?.abort();
       if (dbtProcRef.current) { try { dbtProcRef.current.kill(); } catch { /* already exited */ } }
+      if (shellProcRef.current) { try { shellProcRef.current.kill(); } catch { /* already exited */ } }
       // When nothing's running, Esc clears the input — dismisses any open
       // picker (/model, /pet play, /pet feed) and acts as a general
       // "cancel current entry" affordance.
@@ -2944,6 +2976,23 @@ function App({ onLogout }: { onLogout: () => void }) {
               {liveExpanded && liveText && (
                 <Box flexDirection="column" paddingLeft={3}>
                   <Text wrap="wrap" color="#7AB890">{liveText.trimEnd()}</Text>
+                </Box>
+              )}
+            </Box>
+          )}
+          {liveShellCmd && (
+            <Box flexDirection="column" marginBottom={1}>
+              <Box gap={1}>
+                <Text color="#7DD3FC">$</Text>
+                <Text color="#BAE6FD" bold>{liveShellCmd}</Text>
+                <Text color="#5A8060"><Spinner type="sand" /></Text>
+                <Text color="#3D6650">Esc to abort</Text>
+              </Box>
+              {liveShellText && (
+                <Box flexDirection="column" paddingLeft={2}>
+                  <Text wrap="wrap" color="#7AB890">
+                    {liveShellText.trimEnd().split('\n').slice(-12).join('\n')}
+                  </Text>
                 </Box>
               )}
             </Box>
