@@ -5,6 +5,7 @@ import { PetSpriteLine } from '../app';
 import { petSprite, type PetState } from '../pet';
 import { encodeMessage, parseGameMessage } from './messages';
 import { Jakenpoy } from './jakenpoy';
+import { Race } from './race';
 
 type LobbyState =
   | { kind: 'starting' }
@@ -20,7 +21,7 @@ export type LobbyMode =
   | { kind: 'create' }
   | { kind: 'join'; address?: string };
 
-type SubScreen = 'lobby' | 'jakenpoy';
+type SubScreen = 'lobby' | 'jakenpoy' | 'race';
 
 interface Props {
   mode: LobbyMode;
@@ -100,6 +101,7 @@ export function PlayroomLobby({ mode, pet, onExit }: Props) {
 
     if (state.kind === 'connected') {
       if (input === 'j') { setSubscreen('jakenpoy'); return; }
+      if (input === 'r') { setSubscreen('race'); return; }
       return;
     }
 
@@ -126,6 +128,17 @@ export function PlayroomLobby({ mode, pet, onExit }: Props) {
   if (subscreen === 'jakenpoy' && state.kind === 'connected' && peerPet && sidecarRef.current) {
     return (
       <Jakenpoy
+        pet={pet}
+        peerPet={peerPet}
+        sidecar={sidecarRef.current}
+        onExit={() => setSubscreen('lobby')}
+      />
+    );
+  }
+
+  if (subscreen === 'race' && state.kind === 'connected' && peerPet && sidecarRef.current) {
+    return (
+      <Race
         pet={pet}
         peerPet={peerPet}
         sidecar={sidecarRef.current}
@@ -222,7 +235,7 @@ function Body({ state, pet, peerPet }: { state: LobbyState; pet: PetState; peerP
         <Box flexDirection="column">
           <PetPair pet={pet} peerPet={peerPet} />
           <Text> </Text>
-          <Text color="gray">j  jakenpoy   r  race (soon)   s  space impact (soon)</Text>
+          <Text color="gray">j  jakenpoy   r  race   s  space impact (soon)</Text>
         </Box>
       );
 
