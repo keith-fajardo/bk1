@@ -1,0 +1,16 @@
+name = "bk1-playroom-relay"
+main = "src/worker.ts"
+compatibility_date = "2024-12-01"
+
+# Single Durable Object class holds all rooms in memory. We route every
+# connection to one DO instance (id "global") via env.ROOMS.idFromName("global"),
+# which gives us shared state without per-pin DO overhead. If the relay ever
+# needs to scale past a single instance, switch to env.ROOMS.idFromName(pin)
+# inside the worker fetch so each room gets its own DO.
+[[durable_objects.bindings]]
+name = "ROOMS"
+class_name = "PlayroomRelay"
+
+[[migrations]]
+tag = "v1"
+new_classes = ["PlayroomRelay"]

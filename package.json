@@ -11,6 +11,8 @@
     "deploy:assets": "bash scripts/deploy_assets.sh",
     "build:all": "bun run build:lint && bun run build && mv dbt-agent ~/.local/bin/bk1 && bun run deploy:assets",
     "relay": "bun src/playroom/relay-server.ts",
+    "relay:deploy": "cd relay && npx wrangler deploy",
+    "relay:dev": "cd relay && npx wrangler dev",
     "test": "bun test"
   },
   "dependencies": {
