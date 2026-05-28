@@ -673,9 +673,10 @@ export function readPetFrom(path: string): PetState | null {
         coins:          typeof data.coins === 'number' ? data.coins : STARTING_COINS,
         sleeping_until: typeof data.sleeping_until === 'string' ? data.sleeping_until : undefined,
         eating_until:   typeof data.eating_until   === 'string' ? data.eating_until   : undefined,
-        color:          typeof data.color === 'string' && (PET_COLOR_NAMES as readonly string[]).includes(data.color)
-                          ? (data.color as PetColorName)
-                          : undefined,
+        // color is intentionally NOT read from disk — it's a session-only
+        // setting that resets each time bk1 launches. The field stays on
+        // PetState so in-process code can set it for rendering, but writePetTo
+        // strips it before persisting.
       };
     }
     return null;
@@ -686,7 +687,10 @@ export function readPetFrom(path: string): PetState | null {
 
 export function writePetTo(path: string, state: PetState): void {
   mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, JSON.stringify(state, null, 2), 'utf-8');
+  // Strip session-only fields before serializing. `color` is per-launch;
+  // restoring it from disk would defeat the "reset on bk1 startup" intent.
+  const { color: _omitColor, ...persistable } = state;
+  writeFileSync(path, JSON.stringify(persistable, null, 2), 'utf-8');
   chmodSync(path, 0o600);
 }
 

@@ -2000,6 +2000,10 @@ function App({ onLogout }: { onLogout: () => void }) {
     savePet(initial);
     return initial;
   });
+  // Session alias — overrides pet.name when sending hello messages in the
+  // playroom so peers/spectators see "Keith" rather than "Motchi". Lives
+  // only in process memory; resets on bk1 launch and on /pet release.
+  const [sessionAlias, setSessionAlias] = useState<string | null>(null);
   // Mirror the latest pet in a ref so the closure in onUsage (registered once) can read
   // the freshest value without re-creating callbacks every render.
   const petRef = useRef(pet);
@@ -2434,6 +2438,10 @@ function App({ onLogout }: { onLogout: () => void }) {
         // explicit — the user typed the word "release" so we don't gate behind a confirm.
         const farewellName = nextPet.name ?? 'your pet';
         nextPet = newPet();
+        // newPet() returns a fresh state with no color set — so pet color
+        // resets automatically. The session alias lives separately, so we
+        // clear it explicitly here.
+        setSessionAlias(null);
         note = `You released ${farewellName} back into the mangroves. A new egg appears.`;
       } else if (sub === 'playroom') {
         // /pet playroom <create|join [<pin>]|leave>. Opens the fullscreen lobby
@@ -3058,10 +3066,14 @@ function App({ onLogout }: { onLogout: () => void }) {
       <PlayroomLobby
         mode={playroom}
         pet={pet}
+        sessionAlias={sessionAlias}
+        onSetAlias={setSessionAlias}
         onExit={() => setPlayroom(null)}
         onCycleColor={() => {
-          // Cycle through the palette and persist. The lobby's useEffect on
-          // pet.color picks this up and re-broadcasts hello to the peer.
+          // Cycle through the palette. writePetTo strips `color` before
+          // hitting disk, so the change is in-memory for this session only.
+          // savePet still runs (keeps last_seen + other fields fresh) but
+          // doesn't persist the color change — resetting on next launch.
           const current = pet.color ?? DEFAULT_PET_COLOR;
           const idx = PET_COLOR_NAMES.indexOf(current);
           const next = PET_COLOR_NAMES[(idx + 1) % PET_COLOR_NAMES.length]!;
