@@ -1703,7 +1703,6 @@ function UsageBars({
   // made it hard to scan a time series — this one reads left-to-right.
   const values = series.buckets.map(b => metric === 'cost' ? b.totalUsd : b.totalTokens);
   const maxVal = Math.max(0.0000001, ...values);
-  const maxIdx = values.indexOf(Math.max(...values));
 
   // Y-axis width is fixed so the bars line up no matter what value formatter
   // we're using. Heights are tuned for terminals that are typically 24 rows
@@ -1758,6 +1757,16 @@ function UsageBars({
   };
 
   const fmtVal = (v: number) => metric === 'cost' ? formatUsd(v) : fmtTokens(v);
+  // Compact form used for on-graph labels — needs to fit in roughly colW*2
+  // cells (one slot + one slot of right-overflow). The Y-axis still uses the
+  // full formatter so the scale ticks read precisely.
+  const compactVal = (v: number) => {
+    if (metric === 'tokens') return fmtTokens(v);
+    if (v >= 1000) return `$${(v / 1000).toFixed(1)}k`;
+    if (v >= 10)   return `$${Math.round(v)}`;
+    if (v >= 1)    return `$${v.toFixed(1)}`;
+    return `$${v.toFixed(2)}`;
+  };
   const yTicks: Record<number, string> = {
     [0]:                      fmtVal(maxVal),
     [Math.floor(chartH / 2)]: fmtVal(maxVal / 2),
@@ -1770,29 +1779,71 @@ function UsageBars({
   const maxLabel = Math.max(...labels.map(l => l.length));
   const stride = Math.max(1, Math.ceil((maxLabel + 1) / colW));
 
+  // Build a per-cell plan for each row. Cells are either part of a bar
+  // (backgroundColor = family) or empty/text. Value labels go into empty
+  // cells one row above each bar's tip; if a label is wider than `colW`
+  // it spills into the adjacent empty cell to the right. Bar cells always
+  // win over label cells, so a label on a short bar can't ever overlay a
+  // taller bar's column.
+  type RowCell = { bg: string | null; ch: string };
+  const buildRow = (row: number): RowCell[] => {
+    const totalCols = bars.length * colW;
+    const cells: RowCell[] = Array.from({ length: totalCols }, () => ({ bg: null, ch: ' ' }));
+    // Bars
+    bars.forEach((_, col) => {
+      const fam = cellAt(col, row);
+      if (!fam) return;
+      const color = USAGE_FAMILY_COLOR[fam];
+      if (!color) return;
+      for (let i = 0; i < colW; i++) cells[col * colW + i] = { bg: color, ch: ' ' };
+    });
+    // Value labels — one row above each non-zero bar's tip
+    bars.forEach((b, col) => {
+      if (b.value === 0) return;
+      const labelRow = Math.max(0, chartH - b.filled - 1);
+      if (labelRow !== row) return;
+      const label = compactVal(b.value);
+      for (let i = 0; i < label.length; i++) {
+        const idx = col * colW + i;
+        if (idx >= totalCols) break;
+        // Don't overwrite a bar cell from a taller neighbor.
+        if (cells[idx]!.bg === null) cells[idx] = { bg: null, ch: label[i]! };
+      }
+    });
+    return cells;
+  };
+  // Collapse a row's cells into contiguous spans so Ink only allocates one
+  // <Text> per color change.
+  const rowToSpans = (cells: RowCell[]): { bg: string | null; text: string }[] => {
+    const spans: { bg: string | null; text: string }[] = [];
+    for (const c of cells) {
+      const last = spans[spans.length - 1];
+      if (last && last.bg === c.bg) last.text += c.ch;
+      else                          spans.push({ bg: c.bg, text: c.ch });
+    }
+    return spans;
+  };
+
   return (
     <Box flexDirection="column">
-      {Array.from({ length: chartH }, (_, row) => (
-        <Box key={row}>
-          <Box width={yLabelW} flexShrink={0}>
-            <Text color="#5A8060">{(yTicks[row] ?? '').padStart(yLabelW)}</Text>
+      {Array.from({ length: chartH }, (_, row) => {
+        const spans = rowToSpans(buildRow(row));
+        return (
+          <Box key={row}>
+            <Box width={yLabelW} flexShrink={0}>
+              <Text color="#5A8060">{(yTicks[row] ?? '').padStart(yLabelW)}</Text>
+            </Box>
+            <Text color="#3D6650">{row === chartH - 1 ? '└' : '│'}</Text>
+            <Text>
+              {spans.map((s, i) => (
+                s.bg
+                  ? <Text key={i} backgroundColor={s.bg}>{s.text}</Text>
+                  : <Text key={i} color="#C0FAD2">{s.text}</Text>
+              ))}
+            </Text>
           </Box>
-          <Text color="#3D6650">{row === chartH - 1 ? '└' : '│'}</Text>
-          <Text>
-            {bars.map((_, col) => {
-              const fam = cellAt(col, row);
-              const isMaxCol = col === maxIdx && bars[col]!.value > 0;
-              if (fam) {
-                return <Text key={col} backgroundColor={USAGE_FAMILY_COLOR[fam]}>{' '.repeat(colW)}</Text>;
-              }
-              // Mark the peak column above the bar with a small caret so the
-              // user can still pick out the max even when many bars are close.
-              const showCaret = isMaxCol && row === chartH - bars[col]!.filled - 1 && row >= 0;
-              return <Text key={col} color="#3D6650">{showCaret ? '▼'.padEnd(colW) : ' '.repeat(colW)}</Text>;
-            })}
-          </Text>
-        </Box>
-      ))}
+        );
+      })}
       {/* X-axis labels — staggered by stride so they don't overlap */}
       <Box>
         <Box width={yLabelW + 1} flexShrink={0}><Text> </Text></Box>
