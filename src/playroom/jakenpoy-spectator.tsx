@@ -16,10 +16,12 @@ import {
 
 const WIN_AT = 2;
 
+// Text-only labels — see PICKER_OPTIONS comment in jakenpoy.tsx. Emoji
+// glyphs crash Yoga during layout measurement.
 const CHOICE_LABELS: Record<JakenpoyChoice, string> = {
-  papel:   '📄 Papel',
-  gunting: '✂️ Gunting',
-  bato:    '🪨 Bato',
+  papel:   'Papel',
+  gunting: 'Gunting',
+  bato:    'Bato',
 };
 
 function prettyVerdict(winner: JakenpoyChoice, loser: JakenpoyChoice): string {
