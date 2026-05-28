@@ -352,7 +352,7 @@ export function PlayroomLobby({ mode, pet, sessionAlias, onSetAlias, onExit, onC
       if (subscreen === 'jakenpoy') {
         return <Jakenpoy pet={pet} peerPet={peerPet} sidecar={sidecar} onExit={exitGame} onMatchDismiss={dismissMatch} />;
       }
-      return <Race pet={pet} peerPet={peerPet} sidecar={sidecar} onExit={exitGame} />;
+      return <Race pet={pet} peerPet={peerPet} sidecar={sidecar} onExit={exitGame} onMatchDismiss={dismissMatch} />;
     }
     if (state.kind === 'connected' && !peerPet) {
       // Hello hasn't arrived yet — show an explicit waiting state so the
