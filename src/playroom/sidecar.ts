@@ -16,7 +16,7 @@
 //   - `peer_message` payload is the line as sent (no framing for us — the
 //     relay forwards one message per data op).
 
-import type { RelayClientMsg, RelayServerMsg } from './relay-protocol';
+import type { RelayClientMsg, RelayServerMsg, PlayerRole } from './relay-protocol';
 
 const DEFAULT_RELAY_URL = process.env.PLAYROOM_RELAY_URL ?? 'ws://localhost:8787';
 
@@ -25,11 +25,20 @@ type Pending = {
   reject: (err: Error) => void;
 };
 
-type EventName = 'peer_connected' | 'peer_disconnected' | 'peer_message' | 'error';
+type EventName =
+  | 'peer_connected'
+  | 'peer_disconnected'
+  | 'peer_message'
+  | 'spectator_joined'
+  | 'spectator_left'
+  | 'joined_as_spectator'
+  | 'error';
 type EventListener = (data: any) => void;
 
 interface CreateResult { pin: string; }
-interface JoinResult { joined: true; }
+// `join` resolves with the role the relay assigned. 'joiner' = primary player
+// (both player slots are now filled); 'spectator' = view-only attach.
+interface JoinResult { role: 'joiner' | 'spectator'; pin: string; }
 
 export class PlayroomSidecar {
   private ws: WebSocket | null = null;
@@ -37,6 +46,10 @@ export class PlayroomSidecar {
   private pendingCreate: Pending | null = null;
   private pendingJoin: Pending | null = null;
   private opened = false;
+  // Role assigned by the relay. Set after create or join resolves; null until
+  // then. Exposed so the UI can render player vs spectator chrome.
+  private _role: PlayerRole | null = null;
+  get role(): PlayerRole | null { return this._role; }
 
   async start(url: string = DEFAULT_RELAY_URL): Promise<void> {
     if (this.ws) return;
@@ -100,18 +113,35 @@ export class PlayroomSidecar {
     catch { return; }
     switch (msg.op) {
       case 'created':
+        this._role = 'host';
         this.pendingCreate?.resolve({ pin: msg.pin });
         this.pendingCreate = null;
         return;
       case 'joined':
-        this.pendingJoin?.resolve({ joined: true });
+        this._role = 'joiner';
+        this.pendingJoin?.resolve({ role: 'joiner', pin: '' });
         this.pendingJoin = null;
+        return;
+      case 'joined_as_spectator':
+        this._role = 'spectator';
+        this.pendingJoin?.resolve({ role: 'spectator', pin: msg.pin });
+        this.pendingJoin = null;
+        // Also fire as an event so the lobby can immediately swap to spectator chrome.
+        this.emit('joined_as_spectator', { pin: msg.pin });
         return;
       case 'paired':
         this.emit('peer_connected', {});
         return;
       case 'data':
-        this.emit('peer_message', { line: msg.payload });
+        // `from` is set when the relay forwards a player's message. Spectators
+        // use it to attribute; players ignore it (they only have one peer).
+        this.emit('peer_message', { line: msg.payload, from: msg.from });
+        return;
+      case 'spectator_joined':
+        this.emit('spectator_joined', { count: msg.count });
+        return;
+      case 'spectator_left':
+        this.emit('spectator_left', { count: msg.count });
         return;
       case 'peer_left':
         this.emit('peer_disconnected', {});

@@ -10,6 +10,12 @@ export type JakenpoyChoice = 'bato' | 'gunting' | 'papel';
 
 export type GameMessage =
   | { type: 'hello'; pet: PetState }
+  // Sent by whichever player launches a game from the lobby; everyone else
+  // (the other player + any spectators) auto-routes into that game's view.
+  | { type: 'game_started'; game: 'jakenpoy' | 'race' }
+  // Sent by whoever exits a game (esc or match-over → ↵). Returns all
+  // viewers to the lobby.
+  | { type: 'game_ended' }
   | { type: 'jakenpoy_choice'; round: number; choice: JakenpoyChoice }
   | { type: 'jakenpoy_quit' }
   | { type: 'race_ready' }
@@ -45,6 +51,13 @@ export function parseGameMessage(line: string): GameMessage | null {
     }
     case 'jakenpoy_quit':
       return { type: 'jakenpoy_quit' };
+    case 'game_started': {
+      const game = (raw as { game?: unknown }).game;
+      if (game !== 'jakenpoy' && game !== 'race') return null;
+      return { type: 'game_started', game };
+    }
+    case 'game_ended':
+      return { type: 'game_ended' };
     case 'race_ready':
       return { type: 'race_ready' };
     case 'race_position': {
