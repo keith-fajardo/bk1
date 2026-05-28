@@ -1,12 +1,19 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
-  <!-- body -->
-  <rect x="2" y="2" width="20" height="14" fill="#9FE749"/>
-  <!-- left eye -->
-  <rect x="5" y="6" width="4" height="4" fill="#000000"/>
-  <!-- right eye -->
-  <rect x="15" y="6" width="4" height="4" fill="#000000"/>
-  <!-- left foot -->
-  <rect x="3" y="16" width="5" height="6" fill="#9FE749"/>
-  <!-- right foot -->
-  <rect x="16" y="16" width="5" height="6" fill="#9FE749"/>
+  <!-- Body with eye cutouts as transparent holes via evenodd fill-rule, so
+       the eyes survive VS Code's activity-bar alpha-mask rendering. The
+       activity bar repaints in the theme foreground color, but #9FE749 is
+       preserved for any non-mask usage. -->
+  <path fill="#9FE749" fill-rule="evenodd" d="
+    M2,2 H22 V16 H2 Z
+    M5,6  H9  V10 H5  Z
+    M15,6 H19 V10 H15 Z
+  "/>
+  <!-- 5 feet, evenly spaced across the body width, with a 1-unit gap
+       between body bottom (y=16) and foot top (y=17). Mirrors the in-app
+       pet sprite's 5-leg layout (cols 0/2/4/6/8 of the 9-wide sprite). -->
+  <rect x="3"  y="17" width="2" height="5" fill="#9FE749"/>
+  <rect x="7"  y="17" width="2" height="5" fill="#9FE749"/>
+  <rect x="11" y="17" width="2" height="5" fill="#9FE749"/>
+  <rect x="15" y="17" width="2" height="5" fill="#9FE749"/>
+  <rect x="19" y="17" width="2" height="5" fill="#9FE749"/>
 </svg>
