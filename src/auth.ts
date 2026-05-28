@@ -19,6 +19,7 @@ import { homedir } from 'os';
 import { join, dirname } from 'path';
 
 const AUTH_FILE = join(homedir(), '.bk1', 'auth.json');
+const ADMIN_AUTH_FILE = join(homedir(), '.bk1', 'admin-auth.json');
 
 interface StoredAuth {
   apiKey: string;
@@ -78,4 +79,16 @@ export function isValidKeyShape(key: string): boolean {
 
 export function authFilePath(): string {
   return AUTH_FILE;
+}
+
+export function getStoredAdminKey(): string | null {
+  return readKeyFrom(ADMIN_AUTH_FILE);
+}
+
+export function storeAdminKey(key: string): void {
+  writeKeyTo(ADMIN_AUTH_FILE, key);
+}
+
+export function adminAuthFilePath(): string {
+  return ADMIN_AUTH_FILE;
 }

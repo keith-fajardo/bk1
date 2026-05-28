@@ -9,9 +9,9 @@ import { PROJECT_DIR } from './tools';
 import { LINT_REPORT_PATH } from './state';
 import { readIdeContextBlock } from './ide-context';
 import { SKILLS, expandSkill } from './skills';
-import { getStoredKey, storeKey, clearStoredKey, isValidKeyShape, authFilePath } from './auth';
+import { getStoredKey, storeKey, clearStoredKey, isValidKeyShape, authFilePath, getStoredAdminKey, storeAdminKey, adminAuthFilePath } from './auth';
 import { estimateCostUsd, formatUsd } from './pricing';
-import { createUsageState, recordUsage, buildReport, renderReport, classifyTurnLabel } from './usage';
+import { createUsageState, recordUsage, buildReport, renderReport, classifyTurnLabel, fetchOrgUsage } from './usage';
 import {
   loadPet, savePet, newPet, tickPet, petFace, petFaceEating,
   petSprite, petSpriteBlink, petSpriteSleep, petSpriteEating,
@@ -1515,11 +1515,6 @@ function App({ onLogout }: { onLogout: () => void }) {
   const [terminalRows, setTerminalRows] = useState(process.stdout.rows ?? 24);
   useEffect(() => {
     const onResize = () => {
-      // Ink can't reliably erase its previous dynamic frame across a resize —
-      // the old row count no longer matches the new viewport, so ghost frames
-      // (e.g. a stale DbtLogPane) leak into the scrollback. Clear once so the
-      // next paint starts from a known-clean screen.
-      process.stdout.write('\x1b[2J\x1b[H');
       setTerminalRows(process.stdout.rows ?? 24);
     };
     process.stdout.on('resize', onResize);
@@ -1625,6 +1620,8 @@ function App({ onLogout }: { onLogout: () => void }) {
   // Replaces the normal TUI with a keyboard-navigable history so users don't
   // depend on VS Code's terminal scrollback to read back through long sessions.
   const [reviewMode, setReviewMode] = useState(false);
+  const [awaitingAdminKey, setAwaitingAdminKey] = useState(false);
+  const awaitingAdminKeyRef = useRef(false);
   // Pane mode toggle. When ON, bk1 enables xterm mouse tracking so the dbt
   // log pane's wheel/click/scrollbar/copy button respond again — at the cost
   // of the terminal's native scroll/select. When OFF (default), no mouse
@@ -1869,6 +1866,32 @@ function App({ onLogout }: { onLogout: () => void }) {
     if (h.length === 0 || h[h.length - 1] !== raw) h.push(raw);
     promptHistoryIdxRef.current = -1;
 
+    // Admin key entry — intercept BEFORE all other handlers so the pasted key
+    // isn't interpreted as a slash command or chat message.
+    if (awaitingAdminKeyRef.current) {
+      setInput(''); inputRef.current = ''; setSuggestionIndex(-1);
+      setAwaitingAdminKey(false); awaitingAdminKeyRef.current = false;
+      if (!isValidKeyShape(raw)) {
+        setMessages(prev => [
+          ...prev,
+          { role: 'assistant', content: 'Invalid key — must start with "sk-ant-" and be at least 20 characters. Run /usage to try again.' },
+        ]);
+        return;
+      }
+      storeAdminKey(raw);
+      setMessages(prev => [
+        ...prev,
+        { role: 'assistant', content: 'Admin key saved. Fetching organization usage...' },
+      ]);
+      const orgReport = await fetchOrgUsage(raw);
+      const sessionReport = renderReport(buildReport(usageStateRef.current));
+      setMessages(prev => [
+        ...prev,
+        { role: 'assistant', content: orgReport + '\n\n---\n\n' + sessionReport },
+      ]);
+      return;
+    }
+
     // Local UI commands — handled here, never sent to the agent
     if (raw === '/plan' || raw === '/build' || raw === '/auto') {
       const next = raw.slice(1) as Mode;
@@ -1914,14 +1937,27 @@ function App({ onLogout }: { onLogout: () => void }) {
       }
     }
     if (raw === '/usage') {
-      // Local report — no LLM call. Inject the formatted breakdown as an assistant
-      // message so it appears in the chat scroll just like other responses.
-      const report = renderReport(buildReport(usageStateRef.current));
       setInput(''); inputRef.current = ''; setSuggestionIndex(-1);
+      const adminKey = getStoredAdminKey();
+      if (!adminKey) {
+        setAwaitingAdminKey(true); awaitingAdminKeyRef.current = true;
+        setMessages(prev => [
+          ...prev,
+          { role: 'user',      content: raw },
+          { role: 'assistant', content: `Enter your Claude Admin API key to fetch organization usage.\nGet one at console.anthropic.com/settings/admin-keys\n\nPaste your key and press Enter (stored at ${adminAuthFilePath()}, chmod 0600):` },
+        ]);
+        return;
+      }
       setMessages(prev => [
         ...prev,
         { role: 'user',      content: raw },
-        { role: 'assistant', content: report },
+        { role: 'assistant', content: 'Fetching organization usage...' },
+      ]);
+      const orgReport = await fetchOrgUsage(adminKey);
+      const sessionReport = renderReport(buildReport(usageStateRef.current));
+      setMessages(prev => [
+        ...prev,
+        { role: 'assistant', content: orgReport + '\n\n---\n\n' + sessionReport },
       ]);
       return;
     }
