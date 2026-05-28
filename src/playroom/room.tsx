@@ -236,9 +236,15 @@ function Body({ state, pet, peerPet }: { state: LobbyState; pet: PetState; peerP
         <Box flexDirection="column">
           <PetPair pet={pet} peerPet={null} />
           <Text> </Text>
-          <Text>Share this with your friend so they can join:</Text>
+          <Text>Send this address to your friend so they can join:</Text>
           <Text> </Text>
           <Text color="cyan">    {state.address}</Text>
+          <Text> </Text>
+          <Text>One-time per friend: also share your bk1 device with them in Tailscale —</Text>
+          <Text color="gray">  1. Open login.tailscale.com/admin/machines in your browser</Text>
+          <Text color="gray">  2. Click your bk1 device, then "Share..."</Text>
+          <Text color="gray">  3. Enter your friend's Tailscale email and send the invite</Text>
+          <Text color="gray">  4. They accept the email invite, then run /pet playroom join in their bk1</Text>
           <Text> </Text>
           <Text color="gray">c  cycle color</Text>
         </Box>
@@ -247,7 +253,8 @@ function Body({ state, pet, peerPet }: { state: LobbyState; pet: PetState; peerP
     case 'join_input':
       return (
         <Box flexDirection="column">
-          <Text>Enter the tailnet address your friend shared with you:</Text>
+          <Text>Paste the tailnet address your friend sent you.</Text>
+          <Text color="gray">It looks like:  keithfajardo-bk1.tail-something.ts.net:47800</Text>
           <Text> </Text>
           <Box>
             <Text color="gray">address › </Text>
@@ -255,7 +262,14 @@ function Body({ state, pet, peerPet }: { state: LobbyState; pet: PetState; peerP
           </Box>
           {state.error && <Text color="red">{state.error}</Text>}
           <Text> </Text>
-          <Text color="gray">↵ join</Text>
+          <Text color="gray">Tip: Cmd+V (Ctrl+V on Linux/Win) pastes from your clipboard.</Text>
+          <Text color="gray">Then press ↵ to connect.</Text>
+          <Text> </Text>
+          <Text>For this to work, your friend must first share their bk1 device with you:</Text>
+          <Text color="gray">  1. They open login.tailscale.com/admin/machines</Text>
+          <Text color="gray">  2. Click their "keithfajardo-bk1" (or similarly named) device</Text>
+          <Text color="gray">  3. Click "Share..." and enter your Tailscale email</Text>
+          <Text color="gray">  4. You'll get an email invite — accept it before pressing ↵ here</Text>
         </Box>
       );
 
