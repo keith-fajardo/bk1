@@ -7,10 +7,10 @@
     "dev": "bun src/app.tsx",
     "build": "bun build --compile src/app.tsx --outfile dbt-agent",
     "build:lint": "cd sidecars/lint && $HOME/.cargo/bin/cargo build --release && cp target/release/bk1-lint ~/.bk1/bk1-lint",
-    "build:playroom": "cd sidecars/playroom && go build -o ~/.bk1/bk1-playroom .",
     "build:kimball": "bun scripts/build_kimball_db.ts",
     "deploy:assets": "bash scripts/deploy_assets.sh",
-    "build:all": "bun run build:lint && bun run build:playroom && bun run build && mv dbt-agent ~/.local/bin/bk1 && bun run deploy:assets",
+    "build:all": "bun run build:lint && bun run build && mv dbt-agent ~/.local/bin/bk1 && bun run deploy:assets",
+    "relay": "bun src/playroom/relay-server.ts",
     "test": "bun test"
   },
   "dependencies": {

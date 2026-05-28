@@ -1,166 +1,140 @@
-import { join } from 'node:path';
-import { homedir } from 'node:os';
-import { existsSync } from 'node:fs';
-import type {
-  PlayroomMethod,
-  PlayroomEvent,
-  PlayroomEventName,
-  InitResult,
-  CreateResult,
-  JoinResult,
-  LeaveResult,
-  SendResult,
-} from './protocol';
+// Playroom transport: WebSocket client to the playroom relay.
+//
+// API surface kept similar to the previous Tailscale-based sidecar so the
+// lobby code only needs minor adjustments:
+//   .start()                  open the WebSocket connection
+//   .create()                 server returns a pin
+//   .join(pin)                pair with an existing room
+//   .send(data)               forward a string to the peer
+//   .close()                  drop the connection
+//   .on(event, handler)       subscribe to peer events
+//
+// Differences vs. the old sidecar:
+//   - No separate `init` (no auth step) — relay connection is the only setup.
+//   - `auth_url` event is gone.
+//   - `peer_connected` fires when both peers are paired in the relay.
+//   - `peer_message` payload is the line as sent (no framing for us — the
+//     relay forwards one message per data op).
 
-// Lazy-spawned long-lived child process. Speaks newline-delimited JSON
-// over stdin/stdout. Each request gets an id; responses match by id;
-// events have no id and fan out via listeners.
+import type { RelayClientMsg, RelayServerMsg } from './relay-protocol';
 
-const BINARY_PATH = join(homedir(), '.bk1', 'bk1-playroom');
+const DEFAULT_RELAY_URL = process.env.PLAYROOM_RELAY_URL ?? 'ws://localhost:8787';
 
 type Pending = {
   resolve: (value: any) => void;
   reject: (err: Error) => void;
 };
 
+type EventName = 'peer_connected' | 'peer_disconnected' | 'peer_message' | 'error';
 type EventListener = (data: any) => void;
 
+interface CreateResult { pin: string; }
+interface JoinResult { joined: true; }
+
 export class PlayroomSidecar {
-  private proc: ReturnType<typeof Bun.spawn> | null = null;
-  private pending = new Map<string, Pending>();
-  private listeners = new Map<PlayroomEventName, Set<EventListener>>();
-  private nextId = 1;
-  private readBuf = '';
-  private exited = false;
-  // Ring of recent stderr lines, surfaced if the sidecar dies — without this,
-  // a crash inside the Go process looks like an opaque "sidecar exited" error.
-  private stderrTail: string[] = [];
+  private ws: WebSocket | null = null;
+  private listeners = new Map<EventName, Set<EventListener>>();
+  private pendingCreate: Pending | null = null;
+  private pendingJoin: Pending | null = null;
+  private opened = false;
 
-  static binaryAvailable(): boolean {
-    return existsSync(BINARY_PATH);
-  }
-
-  async start(): Promise<void> {
-    if (this.proc) return;
-    if (!PlayroomSidecar.binaryAvailable()) {
-      throw new Error(
-        `bk1-playroom not found at ${BINARY_PATH}. Run "bun run build:playroom" or "bun run setup".`,
-      );
-    }
-    this.proc = Bun.spawn([BINARY_PATH], {
-      stdin: 'pipe',
-      stdout: 'pipe',
-      stderr: 'pipe',
-    });
-    this.consumeStdout();
-    this.consumeStderr();
-    this.proc.exited.then(exitCode => {
-      this.exited = true;
-      const tail = this.stderrTail.slice(-10).join('\n');
-      const msg = tail
-        ? `bk1-playroom sidecar exited (code ${exitCode}). recent stderr:\n${tail}`
-        : `bk1-playroom sidecar exited (code ${exitCode}). no stderr captured.`;
-      const err = new Error(msg);
-      for (const p of this.pending.values()) p.reject(err);
-      this.pending.clear();
+  async start(url: string = DEFAULT_RELAY_URL): Promise<void> {
+    if (this.ws) return;
+    this.ws = new WebSocket(url);
+    await new Promise<void>((resolve, reject) => {
+      this.ws!.onopen = () => { this.opened = true; resolve(); };
+      this.ws!.onerror = (e) => {
+        if (!this.opened) reject(new Error(`relay connection failed: ${url}`));
+      };
+      this.ws!.onmessage = (e) => this.handleMessage(e.data as string);
+      this.ws!.onclose = () => this.handleClose();
     });
   }
 
-  // Methods ──────────────────────────────────────────────────────────────────
-  init(): Promise<InitResult> { return this.request('init'); }
-  create(): Promise<CreateResult> { return this.request('create'); }
-  join(address: string): Promise<JoinResult> { return this.request('join', { address }); }
-  leave(): Promise<LeaveResult> { return this.request('leave'); }
-  send(data: string): Promise<SendResult> { return this.request('send', { data }); }
+  async create(): Promise<CreateResult> {
+    if (!this.ws) throw new Error('relay not connected');
+    if (this.pendingCreate) throw new Error('create already in flight');
+    return new Promise((resolve, reject) => {
+      this.pendingCreate = { resolve, reject };
+      this.sendRaw({ op: 'create' });
+    });
+  }
 
-  // Event subscription ───────────────────────────────────────────────────────
-  on<N extends PlayroomEventName>(
-    name: N,
-    fn: (data: Extract<PlayroomEvent, { name: N }>['data']) => void,
-  ): () => void {
+  async join(pin: string): Promise<JoinResult> {
+    if (!this.ws) throw new Error('relay not connected');
+    if (this.pendingJoin) throw new Error('join already in flight');
+    return new Promise((resolve, reject) => {
+      this.pendingJoin = { resolve, reject };
+      this.sendRaw({ op: 'join', pin });
+    });
+  }
+
+  // Kept as a Promise so existing call sites can `.catch` — the WebSocket
+  // send itself is synchronous best-effort.
+  async send(data: string): Promise<void> {
+    this.sendRaw({ op: 'data', payload: data });
+  }
+
+  on(name: EventName, fn: EventListener): () => void {
     let set = this.listeners.get(name);
     if (!set) { set = new Set(); this.listeners.set(name, set); }
-    set.add(fn as EventListener);
-    return () => { set!.delete(fn as EventListener); };
+    set.add(fn);
+    return () => { set!.delete(fn); };
   }
 
   async close(): Promise<void> {
-    if (!this.proc) return;
-    try { this.proc.kill(); } catch {}
-    await this.proc.exited;
-    this.proc = null;
+    if (!this.ws) return;
+    try { this.ws.close(); } catch {}
+    this.ws = null;
   }
 
   // Internals ────────────────────────────────────────────────────────────────
-  private async request(method: PlayroomMethod, params?: Record<string, unknown>): Promise<any> {
-    if (!this.proc || this.exited) throw new Error('sidecar not running');
-    const id = String(this.nextId++);
-    const envelope = { id, type: 'request', method, params: params ?? {} };
-    const line = JSON.stringify(envelope) + '\n';
-    const writer = this.proc.stdin as any;
-    if (typeof writer.write === 'function') {
-      writer.write(line);
-      if (typeof writer.flush === 'function') writer.flush();
-    }
-    return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
-    });
+  private sendRaw(msg: RelayClientMsg): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    try { this.ws.send(JSON.stringify(msg)); } catch {}
   }
 
-  private async consumeStderr(): Promise<void> {
-    if (!this.proc) return;
-    const reader = (this.proc.stderr as ReadableStream<Uint8Array>).getReader();
-    const decoder = new TextDecoder();
-    let buf = '';
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) return;
-      buf += decoder.decode(value, { stream: true });
-      let nl = buf.indexOf('\n');
-      while (nl >= 0) {
-        const line = buf.slice(0, nl).trimEnd();
-        buf = buf.slice(nl + 1);
-        if (line) {
-          this.stderrTail.push(line);
-          if (this.stderrTail.length > 50) this.stderrTail.shift();
-        }
-        nl = buf.indexOf('\n');
-      }
-    }
-  }
-
-  private async consumeStdout(): Promise<void> {
-    if (!this.proc) return;
-    const reader = (this.proc.stdout as ReadableStream<Uint8Array>).getReader();
-    const decoder = new TextDecoder();
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) return;
-      this.readBuf += decoder.decode(value, { stream: true });
-      let nl = this.readBuf.indexOf('\n');
-      while (nl >= 0) {
-        const line = this.readBuf.slice(0, nl).trim();
-        this.readBuf = this.readBuf.slice(nl + 1);
-        if (line) this.handleLine(line);
-        nl = this.readBuf.indexOf('\n');
-      }
+  private handleMessage(raw: string): void {
+    let msg: RelayServerMsg;
+    try { msg = JSON.parse(raw) as RelayServerMsg; }
+    catch { return; }
+    switch (msg.op) {
+      case 'created':
+        this.pendingCreate?.resolve({ pin: msg.pin });
+        this.pendingCreate = null;
+        return;
+      case 'joined':
+        this.pendingJoin?.resolve({ joined: true });
+        this.pendingJoin = null;
+        return;
+      case 'paired':
+        this.emit('peer_connected', {});
+        return;
+      case 'data':
+        this.emit('peer_message', { line: msg.payload });
+        return;
+      case 'peer_left':
+        this.emit('peer_disconnected', {});
+        return;
+      case 'error':
+        // Bias toward whichever request is pending; if neither, surface as an event.
+        if (this.pendingCreate) { this.pendingCreate.reject(new Error(msg.msg)); this.pendingCreate = null; return; }
+        if (this.pendingJoin)   { this.pendingJoin.reject(new Error(msg.msg));   this.pendingJoin = null;   return; }
+        this.emit('error', { msg: msg.msg });
+        return;
     }
   }
 
-  private handleLine(line: string): void {
-    let msg: any;
-    try { msg = JSON.parse(line); } catch { return; }
-    if (msg.type === 'response' && msg.id) {
-      const p = this.pending.get(msg.id);
-      if (!p) return;
-      this.pending.delete(msg.id);
-      if (msg.error) p.reject(new Error(msg.error));
-      else p.resolve(msg.result);
-      return;
-    }
-    if (msg.type === 'event' && msg.name) {
-      const set = this.listeners.get(msg.name as PlayroomEventName);
-      if (set) for (const fn of set) fn(msg.data);
-    }
+  private handleClose(): void {
+    const err = new Error('relay connection closed');
+    this.pendingCreate?.reject(err); this.pendingCreate = null;
+    this.pendingJoin?.reject(err);   this.pendingJoin = null;
+    this.emit('error', { msg: 'relay disconnected' });
+    this.ws = null;
+  }
+
+  private emit(name: EventName, data: any): void {
+    const set = this.listeners.get(name);
+    if (set) for (const fn of set) fn(data);
   }
 }

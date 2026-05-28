@@ -192,13 +192,13 @@ function FoodPicker({ currentIdx, balance }: { currentIdx: number; balance: numb
               <Text color={active ? '#C0FAD2' : '#5A8060'} bold={active}>/pet feed {f.id}</Text>
               <Text color="#B9FECF">{active ? ' ●' : '  '}</Text>
             </Box>
-            <Text color={affordable ? '#FCD34D' : '#7A4747'}>🪙  {f.cost}</Text>
+            <Text color={affordable ? '#FCD34D' : '#7A4747'}>💰  {f.cost}</Text>
             <Text color={active ? '#7AB890' : '#3D6650'}>{f.description}</Text>
           </Box>
         );
       })}
       <Box paddingX={2} marginTop={0}>
-        <Text color="#5A8060">↑↓ navigate · Enter buy · Esc cancel · balance 🪙  {balance}</Text>
+        <Text color="#5A8060">↑↓ navigate · Enter buy · Esc cancel · balance 💰  {balance}</Text>
       </Box>
     </Box>
   );
@@ -2332,7 +2332,7 @@ function App({ onLogout }: { onLogout: () => void }) {
             note = result.error;
           } else {
             const food = FOODS[foodId]!;
-            note = `You fed ${nextPet.name ?? 'your pet'} a ${food.label.toLowerCase()} (-${food.cost} 🪙 ).`;
+            note = `You fed ${nextPet.name ?? 'your pet'} a ${food.label.toLowerCase()} (-${food.cost} 💰 ).`;
           }
         }
       } else if (sub === 'play') {
@@ -2394,19 +2394,19 @@ function App({ onLogout }: { onLogout: () => void }) {
         nextPet = newPet();
         note = `You released ${farewellName} back into the mangroves. A new egg appears.`;
       } else if (sub === 'playroom') {
-        // /pet playroom <create|join [<address>]|leave>. Opens the fullscreen lobby
+        // /pet playroom <create|join [<pin>]|leave>. Opens the fullscreen lobby
         // and returns immediately — the render path swaps to <PlayroomLobby> via
         // the `playroom` state gate above. No pet state change.
         const [action, ...joinRest] = rest;
-        const joinAddress = joinRest.join(' ').trim();
+        const joinPin = joinRest.join(' ').trim().toUpperCase();
         if (action === 'create') {
           setPlayroom({ kind: 'create' });
         } else if (action === 'join') {
-          setPlayroom(joinAddress ? { kind: 'join', address: joinAddress } : { kind: 'join' });
+          setPlayroom(joinPin ? { kind: 'join', pin: joinPin } : { kind: 'join' });
         } else if (action === 'leave') {
           setPlayroom(null);
         } else {
-          note = `Usage: /pet playroom create · /pet playroom join [<address>] · /pet playroom leave`;
+          note = `Usage: /pet playroom create · /pet playroom join [<pin>] · /pet playroom leave`;
         }
         if (!note) return;
       } else {

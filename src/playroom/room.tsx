@@ -4,22 +4,22 @@ import { PlayroomSidecar } from './sidecar';
 import { PetSpriteLine } from '../app';
 import { petSprite, petColorHex, type PetState } from '../pet';
 import { encodeMessage, parseGameMessage } from './messages';
+import { isValidPin, PIN_LENGTH } from './relay-protocol';
 import { Jakenpoy } from './jakenpoy';
 import { Race } from './race';
 
 type LobbyState =
   | { kind: 'starting' }
-  | { kind: 'auth_required'; url: string }
   | { kind: 'creating' }
-  | { kind: 'waiting'; address: string }
+  | { kind: 'waiting'; pin: string }
   | { kind: 'join_input'; value: string; error: string | null }
-  | { kind: 'joining'; address: string }
-  | { kind: 'connected'; peer: string }
+  | { kind: 'joining'; pin: string }
+  | { kind: 'connected' }
   | { kind: 'error'; msg: string };
 
 export type LobbyMode =
   | { kind: 'create' }
-  | { kind: 'join'; address?: string };
+  | { kind: 'join'; pin?: string };
 
 type SubScreen = 'lobby' | 'jakenpoy' | 'race';
 
@@ -42,18 +42,15 @@ export function PlayroomLobby({ mode, pet, onExit, onCycleColor }: Props) {
     const sidecar = new PlayroomSidecar();
     sidecarRef.current = sidecar;
 
-    const offAuth = sidecar.on('auth_url', ({ url }) => {
-      setState(s => s.kind === 'starting' ? { kind: 'auth_required', url } : s);
-    });
-    const offConnected = sidecar.on('peer_connected', ({ from }) => {
-      setState({ kind: 'connected', peer: from });
+    const offConnected = sidecar.on('peer_connected', () => {
+      setState({ kind: 'connected' });
       // Hello exchange: send our pet state as soon as the channel is up.
       // Both sides do this; receive handler below stores the peer pet.
       sidecar.send(encodeMessage({ type: 'hello', pet: petRef.current })).catch(() => {});
     });
     const offDisconnected = sidecar.on('peer_disconnected', () => {
       setPeerPet(null);
-      setState({ kind: 'error', msg: 'Peer disconnected. Press esc to leave.' });
+      setState({ kind: 'error', msg: 'Peer left the room. Press esc to leave.' });
     });
     const offMessage = sidecar.on('peer_message', ({ line }) => {
       const msg = parseGameMessage(line);
@@ -67,14 +64,13 @@ export function PlayroomLobby({ mode, pet, onExit, onCycleColor }: Props) {
     (async () => {
       try {
         await sidecar.start();
-        await sidecar.init();
         if (mode.kind === 'create') {
           setState({ kind: 'creating' });
-          const { address } = await sidecar.create();
-          setState({ kind: 'waiting', address });
-        } else if (mode.address) {
-          setState({ kind: 'joining', address: mode.address });
-          await sidecar.join(mode.address);
+          const { pin } = await sidecar.create();
+          setState({ kind: 'waiting', pin });
+        } else if (mode.pin) {
+          setState({ kind: 'joining', pin: mode.pin });
+          await sidecar.join(mode.pin);
         } else {
           setState({ kind: 'join_input', value: '', error: null });
         }
@@ -84,12 +80,10 @@ export function PlayroomLobby({ mode, pet, onExit, onCycleColor }: Props) {
     })();
 
     return () => {
-      offAuth();
       offConnected();
       offDisconnected();
       offMessage();
       offError();
-      sidecar.leave().catch(() => {});
       sidecar.close().catch(() => {});
     };
   }, [mode]);
@@ -105,15 +99,10 @@ export function PlayroomLobby({ mode, pet, onExit, onCycleColor }: Props) {
   }, [pet.color, state.kind]);
 
   useInput((input, key) => {
-    // Subscreen owns its own input.
     if (subscreen !== 'lobby') return;
-
     if (key.escape) { onExit(); return; }
 
     if (state.kind === 'connected' || state.kind === 'waiting') {
-      // Color cycling is allowed both before peer joins (so you can pick your
-      // color while sharing the address) and after (so you can change it
-      // mid-session and have the peer see it via the re-broadcast).
       if (input === 'c' && onCycleColor) { onCycleColor(); return; }
     }
     if (state.kind === 'connected') {
@@ -124,9 +113,12 @@ export function PlayroomLobby({ mode, pet, onExit, onCycleColor }: Props) {
 
     if (state.kind !== 'join_input') return;
     if (key.return) {
-      const trimmed = state.value.trim();
-      if (!trimmed) { setState({ ...state, error: 'address is required' }); return; }
-      setState({ kind: 'joining', address: trimmed });
+      const trimmed = state.value.trim().toUpperCase();
+      if (!isValidPin(trimmed)) {
+        setState({ ...state, error: `pin must be ${PIN_LENGTH} characters (letters/digits, no 0/1/I/L/O)` });
+        return;
+      }
+      setState({ kind: 'joining', pin: trimmed });
       sidecarRef.current?.join(trimmed).catch(err => {
         setState({ kind: 'error', msg: err instanceof Error ? err.message : String(err) });
       });
@@ -137,8 +129,12 @@ export function PlayroomLobby({ mode, pet, onExit, onCycleColor }: Props) {
       return;
     }
     if (input && !key.ctrl && !key.meta) {
-      const cleaned = input.replace(/[\r\n\t]/g, '');
-      if (cleaned) setState({ ...state, value: state.value + cleaned, error: null });
+      // Pins are case-insensitive in display; normalize as we go.
+      const cleaned = input.replace(/[^A-Za-z0-9]/g, '').toUpperCase();
+      if (cleaned) {
+        const next = (state.value + cleaned).slice(0, PIN_LENGTH);
+        setState({ ...state, value: next, error: null });
+      }
     }
   });
 
@@ -167,7 +163,7 @@ export function PlayroomLobby({ mode, pet, onExit, onCycleColor }: Props) {
   return (
     <Box flexDirection="column" paddingX={1} paddingY={0}>
       <Header state={state} />
-      <Box flexDirection="column" marginY={1} paddingX={2} minHeight={14}>
+      <Box flexDirection="column" marginY={1} paddingX={2} minHeight={12}>
         <Body state={state} pet={pet} peerPet={peerPet} />
       </Box>
       <Box paddingX={1}>
@@ -190,14 +186,13 @@ function Header({ state }: { state: LobbyState }) {
 
 function headerStatus(state: LobbyState): string {
   switch (state.kind) {
-    case 'starting':       return 'starting...';
-    case 'auth_required':  return 'auth required';
-    case 'creating':       return 'creating room...';
-    case 'waiting':        return 'waiting for peer';
-    case 'join_input':     return 'enter address';
-    case 'joining':        return 'joining...';
-    case 'connected':      return 'connected';
-    case 'error':          return 'error';
+    case 'starting':   return 'connecting to relay...';
+    case 'creating':   return 'creating room...';
+    case 'waiting':    return 'waiting for peer';
+    case 'join_input': return 'enter pin';
+    case 'joining':    return 'joining...';
+    case 'connected':  return 'connected';
+    case 'error':      return 'error';
   }
 }
 
@@ -206,29 +201,12 @@ function Body({ state, pet, peerPet }: { state: LobbyState; pet: PetState; peerP
     case 'starting':
     case 'creating':
     case 'joining':
-      return <Text color="gray">{state.kind === 'creating' ? 'opening a room on your tailnet...' : state.kind === 'joining' ? `dialing ${state.address}...` : 'starting tailnet...'}</Text>;
-
-    case 'auth_required':
       return (
-        <Box flexDirection="column">
-          <Text>First-time setup: authorize this device with Tailscale.</Text>
-          <Text color="gray">Tailscale is the private mesh network bk1 uses to connect pets directly,</Text>
-          <Text color="gray">without exposing your machine to the public internet. Free for personal use.</Text>
-          <Text> </Text>
-          <Text>1. Open this URL in your browser:</Text>
-          <Text> </Text>
-          <Text color="cyan">     {state.url}</Text>
-          <Text> </Text>
-          <Text>2. Sign in with Google / GitHub / Microsoft / email (creates a free account</Text>
-          <Text>   if you don't have one).</Text>
-          <Text> </Text>
-          <Text>3. Click "Connect" to authorize this bk1 device. You won't be asked again.</Text>
-          <Text> </Text>
-          <Text color="gray">To play with a friend later: both of you do the steps above, then one</Text>
-          <Text color="gray">of you shares this device from login.tailscale.com/admin/machines.</Text>
-          <Text> </Text>
-          <Text color="gray">Waiting for authorization...</Text>
-        </Box>
+        <Text color="gray">
+          {state.kind === 'creating' ? 'opening a room...'
+            : state.kind === 'joining' ? `joining room ${state.pin}...`
+            : 'connecting to the playroom relay...'}
+        </Text>
       );
 
     case 'waiting':
@@ -236,15 +214,12 @@ function Body({ state, pet, peerPet }: { state: LobbyState; pet: PetState; peerP
         <Box flexDirection="column">
           <PetPair pet={pet} peerPet={null} />
           <Text> </Text>
-          <Text>Send this address to your friend so they can join:</Text>
+          <Text>Send this pin to your friend so they can join:</Text>
           <Text> </Text>
-          <Text color="cyan">    {state.address}</Text>
+          <Text color="cyan" bold>    {state.pin}</Text>
           <Text> </Text>
-          <Text>One-time per friend: also share your bk1 device with them in Tailscale —</Text>
-          <Text color="gray">  1. Open login.tailscale.com/admin/machines in your browser</Text>
-          <Text color="gray">  2. Click your bk1 device, then "Share..."</Text>
-          <Text color="gray">  3. Enter your friend's Tailscale email and send the invite</Text>
-          <Text color="gray">  4. They accept the email invite, then run /pet playroom join in their bk1</Text>
+          <Text color="gray">In their bk1, they type:  /pet playroom join</Text>
+          <Text color="gray">Then paste the pin and hit ↵.</Text>
           <Text> </Text>
           <Text color="gray">c  cycle color</Text>
         </Box>
@@ -253,23 +228,16 @@ function Body({ state, pet, peerPet }: { state: LobbyState; pet: PetState; peerP
     case 'join_input':
       return (
         <Box flexDirection="column">
-          <Text>Paste the tailnet address your friend sent you.</Text>
-          <Text color="gray">It looks like:  keithfajardo-bk1.tail-something.ts.net:47800</Text>
+          <Text>Enter the {PIN_LENGTH}-character pin your friend sent you.</Text>
+          <Text color="gray">Letters and digits, case-insensitive. Example:  EMCQG4</Text>
           <Text> </Text>
           <Box>
-            <Text color="gray">address › </Text>
-            <Text>{state.value || ' '}</Text>
+            <Text color="gray">pin › </Text>
+            <Text color="cyan" bold>{state.value.padEnd(PIN_LENGTH, '·')}</Text>
           </Box>
           {state.error && <Text color="red">{state.error}</Text>}
           <Text> </Text>
-          <Text color="gray">Tip: Cmd+V (Ctrl+V on Linux/Win) pastes from your clipboard.</Text>
-          <Text color="gray">Then press ↵ to connect.</Text>
-          <Text> </Text>
-          <Text>For this to work, your friend must first share their bk1 device with you:</Text>
-          <Text color="gray">  1. They open login.tailscale.com/admin/machines</Text>
-          <Text color="gray">  2. Click their "keithfajardo-bk1" (or similarly named) device</Text>
-          <Text color="gray">  3. Click "Share..." and enter your Tailscale email</Text>
-          <Text color="gray">  4. You'll get an email invite — accept it before pressing ↵ here</Text>
+          <Text color="gray">↵ join     paste with Cmd+V (Ctrl+V on Linux/Win)</Text>
         </Box>
       );
 
