@@ -124,9 +124,14 @@ func (t *tailnet) createRoom(ctx context.Context) (string, error) {
 
 	go t.acceptLoop(ln)
 
+	// tsnet's listener returns a tsnet.addr, not *net.TCPAddr — type-asserting
+	// to *net.TCPAddr panics. Parse the port out of the string form instead.
+	_, portStr, err := net.SplitHostPort(ln.Addr().String())
+	if err != nil {
+		return "", fmt.Errorf("parse listener addr %q: %w", ln.Addr().String(), err)
+	}
 	host := strings.TrimSuffix(t.hostname, ".")
-	port := ln.Addr().(*net.TCPAddr).Port
-	return fmt.Sprintf("%s:%d", host, port), nil
+	return fmt.Sprintf("%s:%s", host, portStr), nil
 }
 
 func (t *tailnet) acceptLoop(ln net.Listener) {
