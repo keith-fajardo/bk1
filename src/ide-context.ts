@@ -15,7 +15,7 @@ import { join } from 'path';
 export const IDE_CONTEXT_PATH   = join(homedir(), '.bk1', 'ide-context.json');
 const IDE_CONTEXT_TTL_MS        = 15_000;
 
-interface IdeContext {
+export interface IdeContext {
   file_path:            string | null;
   language:             string | null;
   has_selection:        boolean;
@@ -24,6 +24,20 @@ interface IdeContext {
   selection_text:       string | null;
   selection_truncated:  boolean;
   updated_at:           string;
+}
+
+// Raw parsed context for the UI — same freshness + parse rules as
+// readIdeContextBlock, but returns the structured object so the indicator
+// bar can render file path + selection range directly.
+export function readIdeContextRaw(now: Date = new Date()): IdeContext | null {
+  if (!existsSync(IDE_CONTEXT_PATH)) return null;
+  try {
+    const stat = statSync(IDE_CONTEXT_PATH);
+    if (now.getTime() - stat.mtimeMs > IDE_CONTEXT_TTL_MS) return null;
+    return JSON.parse(readFileSync(IDE_CONTEXT_PATH, 'utf-8')) as IdeContext;
+  } catch {
+    return null;
+  }
 }
 
 export function readIdeContextBlock(now: Date = new Date()): string | null {

@@ -339,6 +339,22 @@ function monthShort(d: Date): string {
   return d.toLocaleString('en-US', { month: 'short' });
 }
 
+// Best-effort short timezone label for the current locale. Falls back to
+// the IANA name (e.g. "America/Los_Angeles") if the runtime doesn't expose
+// a short form, and to a UTC offset if even that's unavailable.
+function localTzAbbr(): string {
+  try {
+    const parts = new Intl.DateTimeFormat(undefined, { timeZoneName: 'short' }).formatToParts(new Date());
+    const tz = parts.find(p => p.type === 'timeZoneName')?.value;
+    if (tz) return tz;
+  } catch {}
+  const offMin = -new Date().getTimezoneOffset();
+  const sign = offMin >= 0 ? '+' : '-';
+  const h = String(Math.floor(Math.abs(offMin) / 60)).padStart(2, '0');
+  const m = String(Math.abs(offMin) % 60).padStart(2, '0');
+  return `UTC${sign}${h}:${m}`;
+}
+
 export async function fetchOrgUsageSeries(
   adminKey: string,
   granularity: UsageGranularity,
@@ -366,7 +382,9 @@ export async function fetchOrgUsageSeries(
         totalUsd    += s.usd;
       }
       return {
-        label: `${pad(start.getUTCHours())}:00`,
+        // API buckets are aligned to UTC hours, but the user reads time
+        // in their local zone — convert here so "14:00" means 14:00 local.
+        label: `${pad(start.getHours())}:00`,
         startMs: start.getTime(),
         perFamily,
         totalTokens,
@@ -374,7 +392,7 @@ export async function fetchOrgUsageSeries(
       };
     });
     buckets.sort((a, b) => a.startMs - b.startMs);
-    return buildSeries(granularity, buckets, 'Last 24 hours', 1);
+    return buildSeries(granularity, buckets, `Last 24 hours · ${localTzAbbr()}`, 1);
   }
 
   if (granularity === 'daily') {
@@ -396,7 +414,7 @@ export async function fetchOrgUsageSeries(
         totalUsd    += s.usd;
       }
       return {
-        label: `${monthShort(start)} ${pad(start.getUTCDate())}`,
+        label: `${monthShort(start)} ${pad(start.getDate())}`,
         startMs: start.getTime(),
         perFamily,
         totalTokens,
@@ -404,7 +422,7 @@ export async function fetchOrgUsageSeries(
       };
     });
     buckets.sort((a, b) => a.startMs - b.startMs);
-    const rangeLabel = `${monthShort(new Date(year, month - 1, 1))} 1 – ${monthShort(now)} ${now.getUTCDate()}`;
+    const rangeLabel = `${monthShort(new Date(year, month - 1, 1))} 1 – ${monthShort(now)} ${now.getDate()} · ${localTzAbbr()}`;
     return buildSeries(granularity, buckets, rangeLabel, buckets.length || 1);
   }
 
