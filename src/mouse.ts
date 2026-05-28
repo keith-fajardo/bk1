@@ -25,6 +25,9 @@ export interface MouseEvent {
   row: number;        // 1-indexed terminal row
   press: boolean;     // true = button-press, false = release
   motion: boolean;    // true if this is a mouse-move event (from mode 1002/1003)
+  shift: boolean;     // shift modifier held (bit 2 of SGR button byte)
+  alt:   boolean;     // alt/meta modifier held (bit 3)
+  ctrl:  boolean;     // ctrl modifier held (bit 4)
 }
 
 // SGR mouse protocol pattern. Buttons & modifiers are encoded in the first number;
@@ -40,6 +43,9 @@ export function parseMouseEvents(chunk: string): MouseEvent[] {
   while ((m = re.exec(chunk)) !== null) {
     const raw    = parseInt(m[1]!, 10);
     const motion = (raw & 0x20) !== 0;                // bit 5 = motion flag (set by 1002/1003)
+    const shift  = (raw & 0x04) !== 0;                // bit 2 = shift
+    const alt    = (raw & 0x08) !== 0;                // bit 3 = alt/meta
+    const ctrl   = (raw & 0x10) !== 0;                // bit 4 = ctrl
     const code   = raw & 0b11000011;                  // strip modifier + motion bits; keep button + wheel
     const col    = parseInt(m[2]!, 10);
     const row    = parseInt(m[3]!, 10);
@@ -50,7 +56,7 @@ export function parseMouseEvents(chunk: string): MouseEvent[] {
     else if (code === 2)  button = 'right';
     else if (code === 64) button = 'wheel-up';
     else if (code === 65) button = 'wheel-down';
-    events.push({ button, col, row, press, motion });
+    events.push({ button, col, row, press, motion, shift, alt, ctrl });
   }
   return events;
 }

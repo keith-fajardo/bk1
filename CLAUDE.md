@@ -97,7 +97,6 @@ silently referenced a non-existent field and the LLM fell back to the wrong one.
   filter excludes only `agent`; anything that could trigger expensive fan-out (new tool
   spawning, long-running shell) should be reviewed before sub-agents get it.
 - Don't bypass `safeResolvePath` in any file-handling tool.
-- Don't have any skill run `dbt build` or `dbt run` — bk1 only reads, parses, and compiles.
 
 ## Testing
 

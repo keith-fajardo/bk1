@@ -1,4 +1,5 @@
 import { FetchGame } from './fetch';
+import { ExamGame } from './exam';
 import type { Game } from './types';
 
 // Registry of pet mini-games. Each game owns its own screen + input handling
@@ -12,6 +13,11 @@ export const GAMES: Record<string, Game> = {
     description: 'Click anywhere to throw — your pet hops over to fetch.',
     component: FetchGame,
   },
+  exam: {
+    id: 'exam',
+    description: '5 dbt-cert questions, 5s each. Perfect = +10 🪙 , anything less = −20 🪙 .',
+    component: ExamGame,
+  },
 };
 
-export type { Game, GameProps } from './types';
+export type { Game, GameProps, GameResult } from './types';

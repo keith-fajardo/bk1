@@ -1,12 +1,20 @@
 # bk1
 
-A Terminal UI coding agent for **dbt Core** projects, by [Mangrove](https://gridland.io).
+A **deterministic dbt linter with a coding agent attached** — for **dbt Core**, in your terminal. By [Mangrove](https://gridland.io).
 
 dbt Cloud users get **dbt Copilot** inside the dbt Cloud IDE. Everyone on **dbt Core** — the open-source CLI most teams actually run — has had to choose between generic coding agents that don't understand dbt conventions, or VS Code plugins that lock them into one editor. bk1 is the dbt-native option for the terminal: it runs locally against your project on disk, uses your own Anthropic key, and requires no Cloud account.
 
 The name is short for **bakawan** — Filipino for *mangrove*.
 
-bk1 mechanically lints with a Rust binary, surfaces actionable diagnostics, and applies fixes only with your approval. Everything ships in one repo: the agent, the linter, an optional VS Code companion extension, and a bundled Kimball-dimensional-modeling knowledge base.
+What sets bk1 apart in the dbt Core + terminal space:
+
+- **A real linter, not a prompt.** A native Rust binary ([`lint/`](lint/)) mechanically checks your project against Kimball-flavored conventions before a single LLM token is spent. Cursor, Aider, and Claude Code can *talk about* dbt style; bk1 *enforces* it deterministically and in milliseconds.
+- **Manifest-aware by default.** Tools like `query_manifest` read `manifest.json` directly, so the agent doesn't burn tokens rediscovering your project on every turn.
+- **Opinionated dbt conventions baked into the system prompt** — first-draft output already conforms to `stg_ / int_ / dim_ / fct_` patterns, SCD typing, schema placement, and YAML structure.
+- **Cost-aware architecture.** Prompt caching on the system prompt and tool definitions; sub-agents on Haiku, throttled to 2 concurrent; per-project SQLite state for incremental sync so re-runs stay cheap on 1,000+ model repos.
+- **Bundled Kimball knowledge base.** *The Data Warehouse Toolkit (3rd ed.)* indexed via SQLite + FTS5 — ask dimensional-modeling questions and get grounded answers.
+
+Everything ships in one repo: the agent, the linter, an optional VS Code companion extension, and the Kimball knowledge base. Fixes are only applied with your approval.
 
 ```
 ┌──────────────────────────────────────────────────────────┐
@@ -45,7 +53,7 @@ bk1 mechanically lints with a Rust binary, surfaces actionable diagnostics, and 
 | Bring-your-own API key                       | ✅ (Anthropic)         | ❌ (bundled)        | ✅                             | ✅ (OpenAI)              |
 | Cost model                                   | Pay-per-token only     | Per-seat Cloud tier | Pay-per-token + tool sub       | Free + own key           |
 
-If you're on dbt Cloud, dbt Copilot is the obvious choice. If you're on dbt Core and live in the terminal, bk1 is built for you. If you're on Core but live in VS Code, `dbt-power-user` covers a lot of ground; bk1 complements it by adding the lint-first agent loop and Kimball reasoning.
+If you're on dbt Cloud, dbt Copilot is the obvious choice. If you're on dbt Core and live in the terminal, bk1 is built for you — it's the only option in that segment that pairs a dbt-aware agent with a deterministic Rust linter and a manifest-first toolset. If you're on Core but live in VS Code, `dbt-power-user` covers a lot of ground; bk1 complements it by adding the lint-first agent loop and Kimball reasoning.
 
 ## Quickstart
 

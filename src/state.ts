@@ -2,6 +2,7 @@ import { Database } from 'bun:sqlite';
 import { existsSync, readFileSync, writeFileSync, mkdirSync, statSync } from 'fs';
 import { resolve, dirname, basename } from 'path';
 import { createHash } from 'crypto';
+import { emitCoinEvent, COIN_REWARDS, COIN_PENALTIES } from './coin-events';
 
 const PROJECT_DIR = resolve(process.env.DBT_PROJECT_DIR ?? process.cwd());
 const DB_PATH = resolve(PROJECT_DIR, 'target/bk1_state.db');
@@ -55,6 +56,11 @@ function getDb(): Database {
   `);
   // Migration: add sql_mtime column if not present
   try { _db.run(`ALTER TABLE models ADD COLUMN sql_mtime TEXT`); } catch {}
+  // Migration: add prev_lint_status — preserves the LAST KNOWN TERMINAL status
+  // ('clean' or 'violations') across a recheck transition, so markModelLinted
+  // can detect regressions and fixes. NULL means "never linted to a terminal
+  // state" → first lint, grandfathered (no penalty even if violations).
+  try { _db.run(`ALTER TABLE models ADD COLUMN prev_lint_status TEXT`); } catch {}
   return _db;
 }
 
@@ -117,7 +123,17 @@ async function incrementalSync(): Promise<SyncStats> {
 
   // Step 4: write everything in one transaction
   const insert       = db.prepare(`INSERT INTO models (unique_id, name, path, file_hash, sql_mtime, lint_status) VALUES (?, ?, ?, ?, ?, 'pending')`);
-  const recheck      = db.prepare(`UPDATE models SET file_hash = ?, sql_mtime = ?, lint_status = 'needs_recheck', last_linted_at = NULL WHERE unique_id = ?`);
+  // Recheck preserves the prior TERMINAL status into prev_lint_status before
+  // overwriting lint_status with 'needs_recheck'. Only 'clean' / 'violations'
+  // get preserved; 'pending' or 'needs_recheck' would be meaningless to keep.
+  // The COALESCE keeps a previously preserved value if we recheck twice in a
+  // row without an intervening markModelLinted call.
+  const recheck      = db.prepare(`UPDATE models
+     SET file_hash = ?, sql_mtime = ?,
+         prev_lint_status = CASE WHEN lint_status IN ('clean','violations') THEN lint_status ELSE prev_lint_status END,
+         lint_status = 'needs_recheck',
+         last_linted_at = NULL
+     WHERE unique_id = ?`);
   const updateMtime  = db.prepare(`UPDATE models SET sql_mtime = ? WHERE unique_id = ?`);
   const upsertContent = db.prepare(`INSERT OR REPLACE INTO file_content (path, content, cached_at) VALUES (?, ?, ?)`);
 
@@ -697,7 +713,32 @@ export function resetModelState(): string {
   return JSON.stringify({ reset: result.changes });
 }
 
-// Records the lint result for a single model after checking.
+// Pure transition logic — exported so it can be unit-tested without spawning
+// SQLite. Returns the coin event to emit (or null for "no event").
+// Transition rules:
+//   prev=NULL          → grandfathered (first lint), no event regardless of new
+//   prev='violations'  + new='clean'      → fixed, +lintFix
+//   prev='violations'  + new='violations' → already violating, no event
+//   prev='clean'       + new='violations' → regression, -newViolation
+//   prev='clean'       + new='clean'      → no change, no event
+export function computeLintTransition(
+  prev: string | null,
+  next: 'clean' | 'violations',
+  name: string,
+): { type: 'lint_fix' | 'new_violation'; delta: number; reason: string } | null {
+  if (prev === 'violations' && next === 'clean') {
+    return { type: 'lint_fix', delta: COIN_REWARDS.lintFix, reason: `Fixed lint: ${name}` };
+  }
+  if (prev === 'clean' && next === 'violations') {
+    return { type: 'new_violation', delta: COIN_PENALTIES.newViolation, reason: `New lint violation: ${name}` };
+  }
+  return null;
+}
+
+// Records the lint result for a single model after checking. Reads the last
+// known TERMINAL status from prev_lint_status (set by incrementalSync on every
+// recheck), computes the transition, updates the row, and emits a coin event
+// if applicable.
 export function markModelLinted(
   name: string,
   lintStatus: 'clean' | 'violations',
@@ -705,12 +746,26 @@ export function markModelLinted(
   violationsJson: string,
 ): string {
   const db = getDb();
+  // Read prior state BEFORE updating so we can compute the transition.
+  const prior = db.prepare<{ prev_lint_status: string | null }, [string]>(
+    `SELECT prev_lint_status FROM models WHERE name = ?`,
+  ).get(name);
+  const prev = prior?.prev_lint_status ?? null;
+
+  // Update row: persist new terminal status both as current AND as the new
+  // prev_lint_status so the next recheck has the correct baseline.
   const result = db.run(
     `UPDATE models
-     SET lint_status = ?, violation_count = ?, violations_json = ?, last_linted_at = ?
+     SET lint_status = ?, violation_count = ?, violations_json = ?, last_linted_at = ?,
+         prev_lint_status = ?
      WHERE name = ?`,
-    [lintStatus, violationCount, violationsJson, new Date().toISOString(), name],
+    [lintStatus, violationCount, violationsJson, new Date().toISOString(), lintStatus, name],
   );
   if (result.changes === 0) return `Model "${name}" not found in state.`;
+
+  // Emit AFTER the DB write so any side-effect handler reads back fresh state.
+  const event = computeLintTransition(prev, lintStatus, name);
+  if (event) emitCoinEvent(event);
+
   return `${name} → ${lintStatus} (${violationCount} violation${violationCount === 1 ? '' : 's'}).`;
 }

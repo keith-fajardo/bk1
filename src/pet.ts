@@ -34,6 +34,7 @@ export interface PetState {
   hunger: number;               // 0 (fed) ... 100 (starving)
   happiness: number;            // 0 (miserable) ... 100 (overjoyed)
   energy: number;               // 0 (exhausted) ... 100 (energetic)
+  coins: number;                // bk1 in-game currency — starts at 100, earned via dbt activity + games
   sleeping_until?: string;      // ISO — while in the future, pet shows closed eyes + snore
   eating_until?: string;        // ISO — while in the future, pet shows 2-frame chewing animation
 }
@@ -46,8 +47,19 @@ const STAGE_ADULT_AT_MS = 24 * 60 * 60 * 1000;   // 24 hours
 
 // Decay rates per minute of real-world elapsed time. Tuned so a session of light use
 // keeps the pet in good shape, but a multi-hour absence noticeably changes its mood.
-const HUNGER_PER_MIN     = 0.20;   // +1 per 5 minutes idle
-const HAPPINESS_PER_MIN  = 0.08;   // -1 per 12.5 minutes idle
+//
+// Hunger: pet should need feeding ~3× per 24h. Each feed() reduces hunger by
+// FEED_HUNGER_DELTA (30), so total daily growth = 3 × 30 = 90 units / 1440 min.
+const HUNGER_PER_MIN     = 90 / (24 * 60);   // ≈ 0.0625 — 3 meals per day at -30 each
+//
+// Happiness has two stacked decay sources, summed each tickPet:
+//   • NO_PLAY: 10% per 8 hours — baseline drift when the pet isn't being played with.
+//   • IDLE:    1% per 30 min   — extra decay when bk1 itself sees no activity.
+// tickPet can't currently distinguish "actively chatting but not playing" from "user
+// walked away," so both rates apply on every elapsed-time tick. Total ≈ 3.25%/hour.
+const HAPPINESS_NO_PLAY_PER_MIN = 10 / (8 * 60);   // ≈ 0.02083
+const HAPPINESS_IDLE_PER_MIN    = 1  / 30;          // ≈ 0.03333
+const HAPPINESS_PER_MIN  = HAPPINESS_NO_PLAY_PER_MIN + HAPPINESS_IDLE_PER_MIN;
 const ENERGY_RECOVER_MIN = 0.40;   // recovers when idle (resting)
 
 // Per-turn auto-feed deltas: each LLM turn slightly improves stats. Small enough that
@@ -60,7 +72,7 @@ const AUTO_FEED_ENERGY   = -0.3;
 
 const FEED_HUNGER_DELTA    = -30;
 const PLAY_HAPPY_DELTA     = +20;
-const PLAY_ENERGY_DELTA    = -10;
+const PLAY_ENERGY_DELTA    = -3;
 const SLEEP_ENERGY_TARGET  = 100;
 const SLEEP_DURATION_MS    = 10 * 60 * 1000;  // how long the closed-eye + snore animation runs
 const EATING_DURATION_MS   = 2_500;            // how long the 2-frame chewing animation runs after /pet feed
@@ -68,6 +80,8 @@ const EATING_DURATION_MS   = 2_500;            // how long the 2-frame chewing a
 function clamp(n: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, n));
 }
+
+export const STARTING_COINS = 100;
 
 export function newPet(now: Date = new Date()): PetState {
   return {
@@ -77,7 +91,24 @@ export function newPet(now: Date = new Date()): PetState {
     hunger: 0,
     happiness: 80,
     energy: 100,
+    coins: STARTING_COINS,
   };
+}
+
+// Coins API — keep all mutations in one place so future earn/spend events
+// (game rewards, dbt-activity triggers, food purchases) route through it.
+// Returns a NEW state; caller persists via savePet.
+export function addCoins(state: PetState, delta: number): PetState {
+  return { ...state, coins: Math.max(0, state.coins + delta) };
+}
+
+// Attempted spend — returns null if the pet can't afford it, so callers can
+// surface a "not enough coins" message without mutating state. Cost must be
+// non-negative; negative values would silently add coins instead of charging.
+export function spendCoins(state: PetState, cost: number): PetState | null {
+  if (cost < 0) return null;
+  if (state.coins < cost) return null;
+  return { ...state, coins: state.coins - cost };
 }
 
 // Pure: advance the pet's stats based on real-world minutes elapsed since last_seen.
@@ -471,6 +502,7 @@ export function renderPetView(state: PetState, now: Date = new Date()): string {
     `🍗 hunger     ${statBar(state.hunger)}  ${Math.round(state.hunger)}%`,
     `😊 happiness  ${statBar(state.happiness)}  ${Math.round(state.happiness)}%`,
     `🔋 energy     ${statBar(state.energy)}  ${Math.round(state.energy)}%`,
+    `🪙  coins      ${state.coins}`,
     '',
   ];
 
@@ -489,15 +521,55 @@ export function renderPetView(state: PetState, now: Date = new Date()): string {
 // persisting via savePet(). Interactions are no-ops while the pet is an egg — only
 // last_seen advances (via tickPet) so the caller can still show a fresh view.
 
-export function feed(state: PetState, now: Date = new Date()): PetState {
+// ─── Foods ────────────────────────────────────────────────────────────────────
+// Three tiers ranging from cheap snack to premium feast. Cost scales sub-linearly
+// with hunger effect so the premium tier is the best value per coin but takes
+// the most up-front to afford. Premium also bumps happiness — eating well is
+// satisfying. Hunger/happiness deltas apply on top of the same "wakes the pet
+// and starts the chew animation" logic as the original feed().
+export interface Food {
+  id: string;
+  label: string;
+  cost: number;          // coins charged on purchase
+  hungerDelta: number;   // negative = reduces hunger
+  happyDelta: number;    // positive = boosts happiness
+  energyDelta: number;   // positive = restores energy (calories → fuel)
+  description: string;   // shown in the /pet feed picker
+}
+
+// Energy values scale super-linearly with cost so premium has the best
+// energy-per-coin ratio (otherwise there'd be no reason to buy feast).
+//   snack: 5c   → +2 energy   (0.40/coin)
+//   meal:  15c  → +8 energy   (0.53/coin)
+//   feast: 35c  → +25 energy  (0.71/coin)
+export const FOODS: Record<string, Food> = {
+  snack: { id: 'snack', label: 'Snack', cost:  5, hungerDelta: -15, happyDelta: 0, energyDelta:  2, description: 'Quick bite. -15 hunger, +2 energy.' },
+  meal:  { id: 'meal',  label: 'Meal',  cost: 15, hungerDelta: -30, happyDelta: 3, energyDelta:  8, description: 'Standard meal. -30 hunger, +3 happy, +8 energy.' },
+  feast: { id: 'feast', label: 'Feast', cost: 35, hungerDelta: -60, happyDelta: 8, energyDelta: 25, description: 'Premium feast. -60 hunger, +8 happy, +25 energy.' },
+};
+
+export const DEFAULT_FOOD_ID = 'meal';
+
+// feed() now charges coins and returns {state, error?} so callers can surface a
+// "not enough coins" message without mutating state. Existing call sites that
+// just wanted the new state read `.state`; lookups against an unknown foodId or
+// insufficient balance return the ticked-but-unfed pet plus an `error` string.
+export function feed(state: PetState, foodId: string = DEFAULT_FOOD_ID, now: Date = new Date()): { state: PetState; error?: string } {
+  const food = FOODS[foodId];
+  if (!food) return { state, error: `Unknown food "${foodId}". Try: ${Object.keys(FOODS).join(' · ')}` };
   const ticked = tickPet(state, now);
-  if (stage(state, now) === 'egg') return ticked;
+  if (stage(state, now) === 'egg') return { state: ticked };
+  const charged = spendCoins(ticked, food.cost);
+  if (!charged) return { state: ticked, error: `Not enough coins (need ${food.cost}, have ${ticked.coins}).` };
   return {
-    ...ticked,
-    hunger: clamp(ticked.hunger + FEED_HUNGER_DELTA, 0, 100),
-    happiness: clamp(ticked.happiness + 3, 0, 100), // small joy from being fed
-    sleeping_until: undefined, // interaction wakes the pet
-    eating_until: new Date(now.getTime() + EATING_DURATION_MS).toISOString(),
+    state: {
+      ...charged,
+      hunger:    clamp(charged.hunger    + food.hungerDelta, 0, 100),
+      happiness: clamp(charged.happiness + food.happyDelta,  0, 100),
+      energy:    clamp(charged.energy    + food.energyDelta, 0, 100),
+      sleeping_until: undefined, // interaction wakes the pet
+      eating_until:   new Date(now.getTime() + EATING_DURATION_MS).toISOString(),
+    },
   };
 }
 
@@ -577,6 +649,9 @@ export function readPetFrom(path: string): PetState | null {
         hunger:         data.hunger,
         happiness:      data.happiness,
         energy:         data.energy,
+        // Migration: pet.json files from before the coins feature default to
+        // STARTING_COINS so existing users get the same starter pot as new pets.
+        coins:          typeof data.coins === 'number' ? data.coins : STARTING_COINS,
         sleeping_until: typeof data.sleeping_until === 'string' ? data.sleeping_until : undefined,
         eating_until:   typeof data.eating_until   === 'string' ? data.eating_until   : undefined,
       };

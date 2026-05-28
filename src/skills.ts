@@ -647,6 +647,20 @@ If new score < 90 with remaining auto-fixable findings, offer another approval r
     expand: () => '',
   },
 
+  history: {
+    description: 'Write the current conversation to a markdown file and open it in a VS Code editor pane',
+    usage: '/history',
+    // Intercepted in app.tsx — snapshots messages to <project>/.bk1/session-*.md and shells `code` to open it.
+    expand: () => '',
+  },
+
+  find: {
+    description: 'Highlight lines matching a query in the dbt log pane; /find with no arg clears',
+    usage: '/find <query>',
+    // Intercepted in app.tsx — sets dbtSearchQuery state; matching lines render in yellow.
+    expand: () => '',
+  },
+
   pet: {
     description: 'Tamagotchi mangrove pet — /pet shows stats, /pet feed|play|sleep|name <name>|release',
     usage: '/pet [feed|play|sleep|name <name>|release]',
