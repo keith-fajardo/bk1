@@ -1,26 +1,3 @@
-// bk1 IDE Context — companion VS Code extension.
-//
-// Watches the active editor and the user's selection inside it, and writes a
-// debounced snapshot to ~/.bk1/ide-context.json on every change. The bk1 TUI
-// reads that file at the start of each turn and (if recent) injects the file
-// path + selection as a <system-reminder> in the user message, mirroring the
-// way Claude Code surfaces <ide_opened_file> / <ide_selection> tags.
-//
-// Design notes:
-//   - The handshake is intentionally a flat JSON file, not an IPC socket.
-//     File-on-disk is the lowest-friction protocol that survives editor
-//     reloads, terminal restarts, and crashed processes — there's nothing to
-//     reconnect to.
-//   - Writes are debounced ~200 ms so dragging a selection doesn't flood disk
-//     I/O. The bk1 side checks mtime to decide whether the snapshot is fresh
-//     enough to inject (currently a 10 s window), so we don't need a separate
-//     "stale" marker.
-//   - The file is rewritten atomically (temp + rename) so a partial read on
-//     the bk1 side never sees a half-written JSON blob.
-//   - Untitled / non-file documents (output panes, scratch buffers) are
-//     reported with file_path = null so bk1 can distinguish "no useful
-//     context" from "stale snapshot."
-
 import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -29,44 +6,154 @@ import * as path from 'path';
 const CONTEXT_DIR  = path.join(os.homedir(), '.bk1');
 const CONTEXT_FILE = path.join(CONTEXT_DIR, 'ide-context.json');
 const DEBOUNCE_MS  = 200;
-// Cap the selection payload — pasting a 10MB document into the prompt would
-// blow up bk1's context window for no benefit. Truncated selections are still
-// useful as a "user is looking at roughly here" signal.
 const MAX_SELECTION_BYTES = 8_000;
+const MAX_LOG_ENTRIES = 50;
 
 interface IdeContext {
   file_path:            string | null;
   language:             string | null;
   has_selection:        boolean;
-  selection_start_line: number | null;   // 1-indexed, inclusive
-  selection_end_line:   number | null;   // 1-indexed, inclusive
+  selection_start_line: number | null;
+  selection_end_line:   number | null;
   selection_text:       string | null;
   selection_truncated:  boolean;
-  updated_at:           string;          // ISO 8601
+  updated_at:           string;
 }
 
+// ---------------------------------------------------------------------------
+// bk1 terminal (opens as an editor tab, like Claude Code)
+// ---------------------------------------------------------------------------
+
+let bk1Terminal: vscode.Terminal | undefined;
+
+function openBk1(extensionUri: vscode.Uri) {
+  if (bk1Terminal) {
+    bk1Terminal.show();
+    return;
+  }
+
+  const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || os.homedir();
+  const bk1Bin = path.join(os.homedir(), '.local', 'bin', 'bk1');
+  const shellPath = fs.existsSync(bk1Bin) ? bk1Bin : 'bk1';
+
+  bk1Terminal = vscode.window.createTerminal({
+    name: 'bk1',
+    shellPath,
+    cwd,
+    iconPath: vscode.Uri.joinPath(extensionUri, 'media', 'icon.svg'),
+    location: vscode.TerminalLocation.Editor,
+  });
+
+  bk1Terminal.show();
+}
+
+function stopBk1() {
+  bk1Terminal?.dispose();
+  bk1Terminal = undefined;
+}
+
+// ---------------------------------------------------------------------------
+// Status tree view
+// ---------------------------------------------------------------------------
+
+class StatusItem extends vscode.TreeItem {
+  constructor(label: string, description: string, icon?: string) {
+    super(label, vscode.TreeItemCollapsibleState.None);
+    this.description = description;
+    if (icon) this.iconPath = new vscode.ThemeIcon(icon);
+  }
+}
+
+class StatusProvider implements vscode.TreeDataProvider<StatusItem> {
+  private _onChange = new vscode.EventEmitter<void>();
+  readonly onDidChangeTreeData = this._onChange.event;
+  private ctx: IdeContext | null = null;
+
+  update(ctx: IdeContext) { this.ctx = ctx; this._onChange.fire(); }
+  getTreeItem(el: StatusItem) { return el; }
+
+  getChildren(): StatusItem[] {
+    if (!this.ctx) return [];
+    const items: StatusItem[] = [];
+    const fp = this.ctx.file_path;
+    if (fp) {
+      const ws = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+      const rel = ws ? path.relative(ws, fp) : path.basename(fp);
+      const f = new StatusItem('File', rel, 'file');
+      f.tooltip = fp;
+      items.push(f);
+      if (this.ctx.language) items.push(new StatusItem('Language', this.ctx.language, 'symbol-keyword'));
+    } else {
+      items.push(new StatusItem('File', 'none', 'file'));
+    }
+    if (this.ctx.has_selection && this.ctx.selection_start_line && this.ctx.selection_end_line) {
+      const r = `L${this.ctx.selection_start_line}–${this.ctx.selection_end_line}`;
+      items.push(new StatusItem('Selection', r + (this.ctx.selection_truncated ? ' (truncated)' : ''), 'selection'));
+    }
+    items.push(new StatusItem('Updated', timeAgo(this.ctx.updated_at), 'clock'));
+    return items;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Activity log tree view
+// ---------------------------------------------------------------------------
+
+interface LogEntry { time: Date; event: string; detail: string }
+
+class LogItem extends vscode.TreeItem {
+  constructor(entry: LogEntry) {
+    super(`${entry.time.toLocaleTimeString()}  ${entry.event}`, vscode.TreeItemCollapsibleState.None);
+    this.description = entry.detail;
+    this.iconPath = new vscode.ThemeIcon(
+      entry.event === 'file opened' ? 'file' :
+      entry.event === 'selection'   ? 'selection' :
+      entry.event === 'file closed' ? 'close' : 'circle-outline'
+    );
+  }
+}
+
+class LogProvider implements vscode.TreeDataProvider<LogItem> {
+  private _onChange = new vscode.EventEmitter<void>();
+  readonly onDidChangeTreeData = this._onChange.event;
+  private entries: LogEntry[] = [];
+
+  push(event: string, detail: string) {
+    this.entries.unshift({ time: new Date(), event, detail });
+    if (this.entries.length > MAX_LOG_ENTRIES) this.entries.length = MAX_LOG_ENTRIES;
+    this._onChange.fire();
+  }
+
+  getTreeItem(el: LogItem) { return el; }
+  getChildren(): LogItem[] { return this.entries.map(e => new LogItem(e)); }
+}
+
+// ---------------------------------------------------------------------------
+// IDE context writer (streams to ~/.bk1/ide-context.json)
+// ---------------------------------------------------------------------------
+
 let writeTimer: NodeJS.Timeout | undefined;
+let statusProvider: StatusProvider;
+let logProvider: LogProvider;
+let lastFilePath: string | null | undefined;
+let lastSelKey: string | undefined;
 
 function snapshot(): IdeContext {
   const editor = vscode.window.activeTextEditor;
   if (!editor) {
     return {
-      file_path:            null,
-      language:             null,
-      has_selection:        false,
-      selection_start_line: null,
-      selection_end_line:   null,
-      selection_text:       null,
-      selection_truncated:  false,
-      updated_at:           new Date().toISOString(),
+      file_path: null, language: null, has_selection: false,
+      selection_start_line: null, selection_end_line: null,
+      selection_text: null, selection_truncated: false,
+      updated_at: new Date().toISOString(),
     };
   }
-  const doc        = editor.document;
-  const sel        = editor.selection;
-  const hasSel     = !sel.isEmpty;
-  const rawText    = hasSel ? doc.getText(sel) : null;
-  const truncated  = rawText !== null && rawText.length > MAX_SELECTION_BYTES;
-  const text       = truncated ? rawText!.slice(0, MAX_SELECTION_BYTES) : rawText;
+  const doc     = editor.document;
+  const sel     = editor.selection;
+  const hasSel  = !sel.isEmpty;
+  const rawText = hasSel ? doc.getText(sel) : null;
+  const trunc   = rawText !== null && rawText.length > MAX_SELECTION_BYTES;
+  const text    = trunc ? rawText!.slice(0, MAX_SELECTION_BYTES) : rawText;
   return {
     file_path:            doc.uri.scheme === 'file' ? doc.uri.fsPath : null,
     language:             doc.languageId,
@@ -74,23 +161,37 @@ function snapshot(): IdeContext {
     selection_start_line: hasSel ? sel.start.line + 1 : null,
     selection_end_line:   hasSel ? sel.end.line   + 1 : null,
     selection_text:       text,
-    selection_truncated:  truncated,
+    selection_truncated:  trunc,
     updated_at:           new Date().toISOString(),
   };
 }
 
 function writeNow() {
   const ctx = snapshot();
+  statusProvider.update(ctx);
+
+  const fp = ctx.file_path;
+  if (fp !== lastFilePath) {
+    if (fp) logProvider.push('file opened', path.basename(fp));
+    else if (lastFilePath) logProvider.push('file closed', path.basename(lastFilePath));
+    lastFilePath = fp;
+    lastSelKey = undefined;
+  }
+  if (ctx.has_selection && ctx.selection_start_line && ctx.selection_end_line) {
+    const sk = `${ctx.selection_start_line}-${ctx.selection_end_line}`;
+    if (sk !== lastSelKey) {
+      logProvider.push('selection', `L${ctx.selection_start_line}–${ctx.selection_end_line}`);
+      lastSelKey = sk;
+    }
+  }
+
   try {
     fs.mkdirSync(CONTEXT_DIR, { recursive: true });
-    // Atomic write: stage to a sibling temp file, then rename. fs.renameSync
-    // is atomic on the same filesystem on macOS and Linux.
     const tmp = `${CONTEXT_FILE}.${process.pid}.tmp`;
     fs.writeFileSync(tmp, JSON.stringify(ctx, null, 2), 'utf8');
     fs.renameSync(tmp, CONTEXT_FILE);
   } catch (err) {
-    // Best-effort — never disrupt the editor if the disk write fails.
-    console.error('[bk1-context] failed to write ide-context.json:', err);
+    console.error('[bk1-context] write failed:', err);
   }
 }
 
@@ -99,23 +200,38 @@ function scheduleWrite() {
   writeTimer = setTimeout(writeNow, DEBOUNCE_MS);
 }
 
+function timeAgo(iso: string): string {
+  const d = Date.now() - new Date(iso).getTime();
+  if (d < 1000)      return 'just now';
+  if (d < 60_000)    return `${Math.floor(d / 1000)}s ago`;
+  if (d < 3_600_000) return `${Math.floor(d / 60_000)}m ago`;
+  return `${Math.floor(d / 3_600_000)}h ago`;
+}
+
+// ---------------------------------------------------------------------------
+// Lifecycle
+// ---------------------------------------------------------------------------
+
 export function activate(context: vscode.ExtensionContext) {
-  // Seed the file immediately so bk1 has *something* to read on first turn,
-  // even if the user hasn't interacted with the editor yet.
-  writeNow();
+  statusProvider = new StatusProvider();
+  logProvider    = new LogProvider();
 
   context.subscriptions.push(
+    vscode.window.registerTreeDataProvider('bk1.status', statusProvider),
+    vscode.window.registerTreeDataProvider('bk1.log', logProvider),
+    vscode.commands.registerCommand('bk1.open', () => openBk1(context.extensionUri)),
+    vscode.commands.registerCommand('bk1.stop', () => stopBk1()),
+    vscode.window.onDidCloseTerminal(t => { if (t === bk1Terminal) bk1Terminal = undefined; }),
     vscode.window.onDidChangeActiveTextEditor(scheduleWrite),
     vscode.window.onDidChangeTextEditorSelection(scheduleWrite),
-    // When the user closes every editor, snapshot() returns the "no editor"
-    // shape — bk1 then knows there's no file context to inject.
     vscode.workspace.onDidCloseTextDocument(scheduleWrite),
   );
+
+  writeNow();
 }
 
 export function deactivate() {
   if (writeTimer) clearTimeout(writeTimer);
-  // One final flush so the next bk1 turn sees the latest state if the user
-  // reloads the window or disables the extension.
   writeNow();
+  stopBk1();
 }

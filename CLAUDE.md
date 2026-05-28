@@ -29,6 +29,10 @@ src/
   skills.ts         Slash-command expansions (LLM instructions, not code)
   system-prompt.ts  Static system prompt for the main agent
 lint/               Rust mechanical linter — emits violations.json
+vscode-ext/         Optional VS Code companion extension — streams the active file
+                    path + selection to ~/.bk1/ide-context.json, which
+                    src/ide-context.ts reads and injects as a <system-reminder>
+                    each turn (mirrors Claude Code's <ide_opened_file>)
 scripts/install.sh  One-shot setup: builds binary, installs to skill dir, bun install
 tests/              bun:test suites (aggregation correctness, skill contract)
 ```
