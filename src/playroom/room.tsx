@@ -215,6 +215,19 @@ export function PlayroomLobby({ mode, pet, sessionAlias, onSetAlias, onExit, onC
   };
 
   useInput((input, key) => {
+    // Game placeholder state ("syncing with peer...") has no input handler
+    // of its own, so the lobby's useInput must handle esc for it — otherwise
+    // the user is stuck inside the placeholder with no way back. Apply this
+    // BEFORE the `subscreen !== 'lobby'` early return.
+    const isInGamePlaceholder =
+      (subscreen === 'jakenpoy' || subscreen === 'race') &&
+      roleRef.current !== 'spectator' &&
+      (state.kind !== 'connected' || !peerPet);
+    if (isInGamePlaceholder && key.escape) {
+      setSubscreen('lobby');
+      return;
+    }
+
     if (subscreen !== 'lobby') return;
 
     // Alias-edit text field takes priority over everything else when active.
