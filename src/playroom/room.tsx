@@ -479,48 +479,52 @@ function Body({
             rightPet={peerPet} rightLabel={peerPet ? 'friend' : '(empty)'}
           />
           <Text> </Text>
-          {aliasEditing ? (
-            // Inline alias-edit text field. Takes over the menu while open.
-            // Esc cancels, Enter saves (empty = clear alias, falls back to
-            // the persistent pet name).
-            <Box flexDirection="column">
-              <Text>Change alias — what should your friend see as your name?</Text>
-              <Text color="gray">Leave empty and press ↵ to clear (uses pet name: {pet.name ?? 'motchi'}).</Text>
-              <Text> </Text>
-              <Box>
-                <Text color="gray">alias › </Text>
-                <Text color="cyan" bold>{aliasEditing.value || ' '}</Text>
-              </Box>
-              <Text> </Text>
-              <Text color="gray">↵ save · esc cancel · up to 20 characters</Text>
-            </Box>
-          ) : (
-            <>
-              <Text>games:</Text>
-              {CONNECTED_ACTIONS.map((a, i) => {
-                const active = i === actionIdx;
-                const color = a.disabled
-                  ? '#3D6650'                       // dim — not yet implemented
-                  : active ? '#C0FAD2' : 'gray';
-                return (
-                  <Box key={a.id}>
-                    <Text color={color}>{active ? '  > ' : '    '}</Text>
-                    <Text color={color} bold={active && !a.disabled}>
-                      {a.label}
-                    </Text>
-                  </Box>
-                );
-              })}
-              <Text> </Text>
-              <Text color="gray">↑↓ navigate · ↵ select · shortcut letters also work</Text>
-              {watchers > 0 && (
-                <>
-                  <Text> </Text>
-                  <Text color="gray">{watchers} {watchers === 1 ? 'person is' : 'people are'} watching.</Text>
-                </>
-              )}
-            </>
-          )}
+          {/* Both branches use the same outer Box flexDirection="column" so
+              React's reconciler keeps the subtree stable across the menu
+              ↔ alias-input swap. Switching between Box and fragment can
+              force a remount of children, which in turn loses internal
+              state held by descendants. */}
+          <Box flexDirection="column">
+            {aliasEditing ? (
+              <>
+                <Text>Change alias — what should your friend see as your name?</Text>
+                <Text color="gray">Leave empty and press ↵ to clear (uses pet name: {pet.name ?? 'motchi'}).</Text>
+                <Text> </Text>
+                <Box>
+                  <Text color="gray">alias › </Text>
+                  <Text color="cyan" bold>{aliasEditing.value || ' '}</Text>
+                </Box>
+                <Text> </Text>
+                <Text color="gray">↵ save · esc cancel · up to 20 characters</Text>
+              </>
+            ) : (
+              <>
+                <Text>games:</Text>
+                {CONNECTED_ACTIONS.map((a, i) => {
+                  const active = i === actionIdx;
+                  const color = a.disabled
+                    ? '#3D6650'                       // dim — not yet implemented
+                    : active ? '#C0FAD2' : 'gray';
+                  return (
+                    <Box key={a.id}>
+                      <Text color={color}>{active ? '  > ' : '    '}</Text>
+                      <Text color={color} bold={active && !a.disabled}>
+                        {a.label}
+                      </Text>
+                    </Box>
+                  );
+                })}
+                <Text> </Text>
+                <Text color="gray">↑↓ navigate · ↵ select · shortcut letters also work</Text>
+                {watchers > 0 && (
+                  <>
+                    <Text> </Text>
+                    <Text color="gray">{watchers} {watchers === 1 ? 'person is' : 'people are'} watching.</Text>
+                  </>
+                )}
+              </>
+            )}
+          </Box>
         </Box>
       );
 
