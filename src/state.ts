@@ -498,7 +498,7 @@ interface ModelInfo  { name: string; description?: string; columns: ColumnInfo[]
 // dbt projects actually use — top-level `models:` list, each entry with `name`,
 // optional `description` (inline, single-line, or | / > block scalar), and
 // optional `columns:` list with name/description/data_type. Mirrors the regex
-// approach used by lint/src/checks.rs::yaml_docs.
+// approach used by sidecars/lint/src/checks.rs::yaml_docs.
 //
 // Only entries under the `models:` top-level key are returned; entries under
 // `sources:`, `seeds:`, etc. are ignored.

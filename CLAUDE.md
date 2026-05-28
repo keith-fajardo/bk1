@@ -5,7 +5,7 @@ Filipino word for mangrove — after Mangrove, the company building it.
 
 This file is context for agents working **on bk1's source code**. For the conventions
 bk1 enforces on *target* dbt projects, see [src/system-prompt.ts](src/system-prompt.ts)
-and the Rust rule set in [lint/src/checks.rs](lint/src/checks.rs).
+and the Rust rule set in [sidecars/lint/src/checks.rs](sidecars/lint/src/checks.rs).
 
 ## Tech stack
 
@@ -13,7 +13,8 @@ and the Rust rule set in [lint/src/checks.rs](lint/src/checks.rs).
 - UI: React + Ink (terminal rendering)
 - API: `@anthropic-ai/sdk` — main agent on `claude-sonnet-4-6`, sub-agents on `claude-haiku-4-5-20251001`
 - State: `bun:sqlite` (per-project DB at `<dbt_project>/target/bk1_state.db`)
-- Lint binary: Rust (Cargo), source in [lint/](lint/), installed to `~/.bk1/bk1-lint` (alongside the bundled kimball SQLite index at `~/.bk1/kimball/kimball.db`)
+- Sidecar binaries: source under [sidecars/](sidecars/), installed under `~/.bk1/`.
+  - `bk1-lint` — Rust (Cargo), source in [sidecars/lint/](sidecars/lint/), installed to `~/.bk1/bk1-lint` (alongside the bundled kimball SQLite index at `~/.bk1/kimball/kimball.db`).
 - Tests: `bun test`
 
 Prefer Bun APIs (`Bun.spawn`, `Bun.Glob`, `Bun.file`) over Node equivalents when both work.
@@ -28,7 +29,8 @@ src/
   state.ts          SQLite model state, incremental sync, lint aggregation
   skills.ts         Slash-command expansions (LLM instructions, not code)
   system-prompt.ts  Static system prompt for the main agent
-lint/               Rust mechanical linter — emits violations.json
+sidecars/
+  lint/             Rust mechanical linter — emits violations.json
 vscode-ext/         Optional VS Code companion extension — streams the active file
                     path + selection to ~/.bk1/ide-context.json, which
                     src/ide-context.ts reads and injects as a <system-reminder>
@@ -59,7 +61,7 @@ tests/              bun:test suites (aggregation correctness, skill contract)
   definition (Anthropic caches up to and including the marked block). Caching is the
   single biggest cost lever — do not break the `withToolCache` / `cachedSystem` pattern.
 
-### Lint pipeline ([src/state.ts](src/state.ts) + [lint/](lint/))
+### Lint pipeline ([src/state.ts](src/state.ts) + [sidecars/lint/](sidecars/lint/))
 1. `incrementalSync` stats every SQL file, reads/hashes only changed ones — this is what
    keeps re-runs cheap on large projects.
 2. `lintRun` is a fused tool: sync → batch queue → spawn binary → aggregate violations.
