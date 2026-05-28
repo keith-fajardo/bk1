@@ -305,28 +305,20 @@ export function PlayroomLobby({ mode, pet, sessionAlias, onSetAlias, onExit, onC
   });
 
   // Subscreen routing — when a game is active, render its UI. Spectators get
-  // the view-only variant; players get the interactive one.
+  // the view-only variant; players get the interactive one. Edge case: a
+  // player can launch a game before the peer's hello has arrived (rare race,
+  // but possible if you click immediately on connect). When that happens
+  // peerPet is null and the game can't render. Previously this fell through
+  // to the lobby silently, which looked like "I clicked but nothing happened."
+  // Now we render a clear waiting placeholder.
   const sidecar = sidecarRef.current;
-  if (subscreen === 'jakenpoy' && sidecar) {
-    if (role === 'spectator') {
-      return (
-        <JakenpoySpectator
-          hostPet={hostPet}
-          joinerPet={joinerPet}
-          sidecar={sidecar}
-          onExit={exitGame}
-        />
-      );
-    }
-    if (state.kind === 'connected' && peerPet) {
-      return <Jakenpoy pet={pet} peerPet={peerPet} sidecar={sidecar} onExit={exitGame} />;
-    }
-  }
 
-  if (subscreen === 'race' && sidecar) {
+  const isGameSubscreen = subscreen === 'jakenpoy' || subscreen === 'race';
+  if (isGameSubscreen && sidecar) {
     if (role === 'spectator') {
+      const SpecComponent = subscreen === 'jakenpoy' ? JakenpoySpectator : RaceSpectator;
       return (
-        <RaceSpectator
+        <SpecComponent
           hostPet={hostPet}
           joinerPet={joinerPet}
           sidecar={sidecar}
@@ -334,8 +326,33 @@ export function PlayroomLobby({ mode, pet, sessionAlias, onSetAlias, onExit, onC
         />
       );
     }
+    // Player path — need peerPet to render the interactive game.
     if (state.kind === 'connected' && peerPet) {
+      if (subscreen === 'jakenpoy') {
+        return <Jakenpoy pet={pet} peerPet={peerPet} sidecar={sidecar} onExit={exitGame} />;
+      }
       return <Race pet={pet} peerPet={peerPet} sidecar={sidecar} onExit={exitGame} />;
+    }
+    if (state.kind === 'connected' && !peerPet) {
+      // Hello hasn't arrived yet — show an explicit waiting state so the
+      // click doesn't look ignored. Once peerPet lands via the peer_message
+      // handler this re-renders into the actual game.
+      return (
+        <Box flexDirection="column" paddingX={1} paddingY={0}>
+          <Box>
+            <Text color="cyan" bold>{subscreen}</Text>
+            <Box flexGrow={1} />
+            <Text color="gray">syncing with peer...</Text>
+          </Box>
+          <Box flexDirection="column" marginY={1} paddingX={2} minHeight={6}>
+            <Text color="gray">Waiting for your friend's pet info to arrive over the relay.</Text>
+            <Text color="gray">If this hangs more than a few seconds, your friend's bk1 may</Text>
+            <Text color="gray">be on an older build or their connection dropped.</Text>
+            <Text> </Text>
+            <Text color="gray">esc  back to lobby</Text>
+          </Box>
+        </Box>
+      );
     }
   }
 
