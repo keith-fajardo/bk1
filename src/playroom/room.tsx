@@ -3,8 +3,9 @@ import { Box, Text, useInput } from 'ink';
 import { PlayroomSidecar } from './sidecar';
 import { PetSpriteLine } from '../app';
 import { petSprite, type PetState } from '../pet';
+import { encodeMessage, parseGameMessage } from './messages';
+import { Jakenpoy } from './jakenpoy';
 
-// Lobby states. Drives the body of the modal.
 type LobbyState =
   | { kind: 'starting' }
   | { kind: 'auth_required'; url: string }
@@ -19,6 +20,8 @@ export type LobbyMode =
   | { kind: 'create' }
   | { kind: 'join'; address?: string };
 
+type SubScreen = 'lobby' | 'jakenpoy';
+
 interface Props {
   mode: LobbyMode;
   pet: PetState;
@@ -27,7 +30,11 @@ interface Props {
 
 export function PlayroomLobby({ mode, pet, onExit }: Props) {
   const [state, setState] = useState<LobbyState>({ kind: 'starting' });
+  const [peerPet, setPeerPet] = useState<PetState | null>(null);
+  const [subscreen, setSubscreen] = useState<SubScreen>('lobby');
   const sidecarRef = useRef<PlayroomSidecar | null>(null);
+  const petRef = useRef(pet);
+  petRef.current = pet;
 
   useEffect(() => {
     const sidecar = new PlayroomSidecar();
@@ -38,9 +45,18 @@ export function PlayroomLobby({ mode, pet, onExit }: Props) {
     });
     const offConnected = sidecar.on('peer_connected', ({ from }) => {
       setState({ kind: 'connected', peer: from });
+      // Hello exchange: send our pet state as soon as the channel is up.
+      // Both sides do this; receive handler below stores the peer pet.
+      sidecar.send(encodeMessage({ type: 'hello', pet: petRef.current })).catch(() => {});
     });
     const offDisconnected = sidecar.on('peer_disconnected', () => {
+      setPeerPet(null);
       setState({ kind: 'error', msg: 'Peer disconnected. Press esc to leave.' });
+    });
+    const offMessage = sidecar.on('peer_message', ({ line }) => {
+      const msg = parseGameMessage(line);
+      if (!msg) return;
+      if (msg.type === 'hello') setPeerPet(msg.pet);
     });
     const offError = sidecar.on('error', ({ msg }) => {
       setState({ kind: 'error', msg });
@@ -69,6 +85,7 @@ export function PlayroomLobby({ mode, pet, onExit }: Props) {
       offAuth();
       offConnected();
       offDisconnected();
+      offMessage();
       offError();
       sidecar.leave().catch(() => {});
       sidecar.close().catch(() => {});
@@ -76,17 +93,20 @@ export function PlayroomLobby({ mode, pet, onExit }: Props) {
   }, [mode]);
 
   useInput((input, key) => {
-    if (key.escape) {
-      onExit();
+    // Subscreen owns its own input.
+    if (subscreen !== 'lobby') return;
+
+    if (key.escape) { onExit(); return; }
+
+    if (state.kind === 'connected') {
+      if (input === 'j') { setSubscreen('jakenpoy'); return; }
       return;
     }
+
     if (state.kind !== 'join_input') return;
     if (key.return) {
       const trimmed = state.value.trim();
-      if (!trimmed) {
-        setState({ ...state, error: 'address is required' });
-        return;
-      }
+      if (!trimmed) { setState({ ...state, error: 'address is required' }); return; }
       setState({ kind: 'joining', address: trimmed });
       sidecarRef.current?.join(trimmed).catch(err => {
         setState({ kind: 'error', msg: err instanceof Error ? err.message : String(err) });
@@ -103,11 +123,22 @@ export function PlayroomLobby({ mode, pet, onExit }: Props) {
     }
   });
 
+  if (subscreen === 'jakenpoy' && state.kind === 'connected' && peerPet && sidecarRef.current) {
+    return (
+      <Jakenpoy
+        pet={pet}
+        peerPet={peerPet}
+        sidecar={sidecarRef.current}
+        onExit={() => setSubscreen('lobby')}
+      />
+    );
+  }
+
   return (
     <Box flexDirection="column" paddingX={1} paddingY={0}>
       <Header state={state} />
       <Box flexDirection="column" marginY={1} paddingX={2} minHeight={14}>
-        <Body state={state} pet={pet} />
+        <Body state={state} pet={pet} peerPet={peerPet} />
       </Box>
       <Box paddingX={1}>
         <Text color="gray">esc  {state.kind === 'waiting' || state.kind === 'connected' ? 'leave room' : 'cancel'}</Text>
@@ -140,7 +171,7 @@ function headerStatus(state: LobbyState): string {
   }
 }
 
-function Body({ state, pet }: { state: LobbyState; pet: PetState }) {
+function Body({ state, pet, peerPet }: { state: LobbyState; pet: PetState; peerPet: PetState | null }) {
   switch (state.kind) {
     case 'starting':
     case 'creating':
@@ -163,7 +194,7 @@ function Body({ state, pet }: { state: LobbyState; pet: PetState }) {
     case 'waiting':
       return (
         <Box flexDirection="column">
-          <PetPair pet={pet} peerPresent={false} />
+          <PetPair pet={pet} peerPet={null} />
           <Text> </Text>
           <Text>Share this with your friend so they can join:</Text>
           <Text> </Text>
@@ -189,9 +220,9 @@ function Body({ state, pet }: { state: LobbyState; pet: PetState }) {
     case 'connected':
       return (
         <Box flexDirection="column">
-          <PetPair pet={pet} peerPresent={true} peerLabel={state.peer} />
+          <PetPair pet={pet} peerPet={peerPet} />
           <Text> </Text>
-          <Text color="gray">/pet play jakenpoy   /pet play race   /pet play space-impact</Text>
+          <Text color="gray">j  jakenpoy   r  race (soon)   s  space impact (soon)</Text>
         </Box>
       );
 
@@ -200,26 +231,27 @@ function Body({ state, pet }: { state: LobbyState; pet: PetState }) {
   }
 }
 
-function PetPair({ pet, peerPresent, peerLabel }: { pet: PetState; peerPresent: boolean; peerLabel?: string }) {
-  // Phase 1: real sprite for self; friend slot is a placeholder until phase 2
-  // adds pet-state exchange over the data channel.
-  const sprite = petSprite(pet);
+export function PetPair({ pet, peerPet }: { pet: PetState; peerPet: PetState | null }) {
+  const mineSprite = petSprite(pet);
+  const peerSprite = peerPet ? petSprite(peerPet) : null;
   const yourName = pet.name ?? 'motchi';
+  const peerName = peerPet?.name ?? (peerPet ? 'unnamed' : null);
+
   return (
     <Box flexDirection="row">
       <Box flexDirection="column" width={20}>
         <Text>you</Text>
         <Text> </Text>
-        {sprite.map((line, i) => <PetSpriteLine key={i} line={line} />)}
+        {mineSprite.map((line, i) => <PetSpriteLine key={i} line={line} />)}
         <Text>{yourName}</Text>
       </Box>
       <Box flexDirection="column" width={20}>
-        <Text>{peerPresent ? 'friend' : '(empty)'}</Text>
+        <Text>{peerPet ? 'friend' : '(empty)'}</Text>
         <Text> </Text>
-        <Text color="gray">{peerPresent ? '  (•‿•)  ' : '  · · ·  '}</Text>
-        <Text> </Text>
-        <Text> </Text>
-        <Text color="gray">{peerPresent ? (peerLabel ?? 'connected') : ' '}</Text>
+        {peerSprite
+          ? peerSprite.map((line, i) => <PetSpriteLine key={i} line={line} />)
+          : <Text color="gray">  · · ·  </Text>}
+        <Text>{peerName ?? ' '}</Text>
       </Box>
     </Box>
   );

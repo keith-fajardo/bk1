@@ -96,6 +96,20 @@ func dispatch(ctx context.Context, req Request) {
 		}
 		respondOK(req.ID, map[string]bool{"joined": true})
 
+	case "send":
+		var p struct {
+			Data string `json:"data"`
+		}
+		if err := json.Unmarshal(req.Params, &p); err != nil {
+			respondErr(req.ID, fmt.Sprintf("bad params: %v", err))
+			return
+		}
+		if err := tn.send(p.Data); err != nil {
+			respondErr(req.ID, err.Error())
+			return
+		}
+		respondOK(req.ID, map[string]bool{"sent": true})
+
 	case "leave":
 		tn.leave()
 		respondOK(req.ID, map[string]bool{"left": true})

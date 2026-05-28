@@ -9,6 +9,7 @@ import type {
   CreateResult,
   JoinResult,
   LeaveResult,
+  SendResult,
 } from './protocol';
 
 // Lazy-spawned long-lived child process. Speaks newline-delimited JSON
@@ -62,6 +63,7 @@ export class PlayroomSidecar {
   create(): Promise<CreateResult> { return this.request('create'); }
   join(address: string): Promise<JoinResult> { return this.request('join', { address }); }
   leave(): Promise<LeaveResult> { return this.request('leave'); }
+  send(data: string): Promise<SendResult> { return this.request('send', { data }); }
 
   // Event subscription ───────────────────────────────────────────────────────
   on<N extends PlayroomEventName>(

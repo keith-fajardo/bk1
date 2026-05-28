@@ -250,7 +250,7 @@ function HintBar({ isRunning, terminalMode }: { isRunning: boolean; terminalMode
         ? <Text color="#3D6650">t  toggle output   Esc  stop agent   Ctrl+C  exit</Text>
         : terminalMode
           ? <Text color="#7DD3FC">TERMINAL MODE — input runs as shell   ? prefix  ask agent   Ctrl+T  back to prompt   Ctrl+C exit</Text>
-          : <Text color="#3D6650">↵ send   Tab switch mode   ! prefix  shell   Ctrl+T  terminal mode   Ctrl+C exit</Text>
+          : <Text color="#B9FECF">PROMPT MODE — input sent to agent   ! prefix  run shell   Tab switch mode   Ctrl+T  terminal mode   Ctrl+C exit</Text>
       }
     </Box>
   );
@@ -1339,10 +1339,37 @@ function UsageTab({ adminKey }: { adminKey: string }) {
   return (
     <Box flexDirection="column">
       {(text ?? '').split('\n').map((line, i) => (
-        <Text key={i} color="#C0FAD2">{line || ' '}</Text>
+        <UsageLine key={i} line={line} />
       ))}
     </Box>
   );
+}
+
+// Splits a `Label: value` line into muted-label / bright-value spans so the
+// eye can lock onto the numbers. Section headers, model-name sub-headers,
+// and prose sentences (no `label: value` pair) fall through as default green.
+// The regex requires a multi-word-capable label followed by `:`, whitespace,
+// then a single non-whitespace value token — anything after the value (e.g.
+// parenthetical context like "(27 days of data)") stays muted.
+function UsageLine({ line }: { line: string }) {
+  if (!line) return <Text> </Text>;
+  const re = /([A-Za-z][\w-]*(?:[ -][\w-]+)*):(\s+)(\S+)/g;
+  const parts: React.ReactNode[] = [];
+  let lastIdx = 0;
+  let m: RegExpExecArray | null;
+  let key = 0;
+  while ((m = re.exec(line)) !== null) {
+    if (m.index > lastIdx) {
+      parts.push(<Text key={key++} color="#C0FAD2">{line.slice(lastIdx, m.index)}</Text>);
+    }
+    parts.push(<Text key={key++} color="#5A8060">{m[1]}:{m[2]}</Text>);
+    parts.push(<Text key={key++} color="#FFFFFF" bold>{m[3]}</Text>);
+    lastIdx = m.index + m[0].length;
+  }
+  if (lastIdx < line.length) {
+    parts.push(<Text key={key++} color="#C0FAD2">{line.slice(lastIdx)}</Text>);
+  }
+  return <Text>{parts}</Text>;
 }
 
 function StatsTab({
@@ -1523,6 +1550,9 @@ function UsageBars({
   // we're using. Heights are tuned for terminals that are typically 24 rows
   // tall with chrome above + below the chart.
   const chartH    = 12;
+  // Bars are scaled to one row shorter than the chart so the tallest bar
+  // always leaves an empty row above its tip for its value label.
+  const barMaxH   = chartH - 1;
   const yLabelW   = 9;
   const cols      = process.stdout.columns ?? 80;
   const availW    = Math.max(20, cols - yLabelW - 6);
@@ -1533,10 +1563,10 @@ function UsageBars({
 
   const bars = series.buckets.map(b => {
     const value = metric === 'cost' ? b.totalUsd : b.totalTokens;
-    const rawFilled = Math.round((value / maxVal) * chartH);
+    const rawFilled = Math.round((value / maxVal) * barMaxH);
     // Non-zero buckets get at least one row so a small day next to a huge
     // day doesn't vanish (same reasoning as the old horizontal version).
-    const filled = value > 0 ? Math.max(1, rawFilled) : 0;
+    const filled = value > 0 ? Math.max(1, Math.min(barMaxH, rawFilled)) : 0;
     const segments: { family: string; cells: number }[] = [];
     if (filled > 0 && value > 0) {
       const raw = USAGE_FAMILY_ORDER.map(fam => {
@@ -2288,11 +2318,16 @@ function App({ onLogout }: { onLogout: () => void }) {
         // No arg → launch whatever the GamePicker is currently highlighting.
         // Happiness is credited inside each game's onExit (it accumulates
         // per-click), so launching does not tap stats by itself.
-        if (arg && GAMES[arg]) {
+        if (arg === 'jakenpoy' || arg === 'race' || arg === 'space-impact') {
+          // Multiplayer games live inside the playroom modal and are launched
+          // by single-key shortcuts from the connected state. Surfacing the
+          // command here gives an actionable error when the user tries from
+          // outside a room.
+          note = `${arg} is multiplayer. Open a room first: /pet playroom create  or  /pet playroom join <address>.`;
+        } else if (arg && GAMES[arg]) {
           setActiveGame(arg);
           return;
-        }
-        if (arg) {
+        } else if (arg) {
           const ids = Object.keys(GAMES).map(id => `/pet play ${id}`).join(' · ');
           note = `Unknown game "${arg}". Try: ${ids}`;
         } else {
