@@ -194,11 +194,21 @@ function Body({ state, pet, peerPet }: { state: LobbyState; pet: PetState; peerP
     case 'auth_required':
       return (
         <Box flexDirection="column">
-          <Text>First-time setup: authorize this device with Tailscale so your pet can reach the playroom mesh.</Text>
+          <Text>First-time setup: authorize this device with Tailscale.</Text>
+          <Text color="gray">Tailscale is the private mesh network bk1 uses to connect pets directly,</Text>
+          <Text color="gray">without exposing your machine to the public internet. Free for personal use.</Text>
           <Text> </Text>
-          <Text>Open this URL in your browser:</Text>
+          <Text>1. Open this URL in your browser:</Text>
           <Text> </Text>
-          <Text color="cyan">    {state.url}</Text>
+          <Text color="cyan">     {state.url}</Text>
+          <Text> </Text>
+          <Text>2. Sign in with Google / GitHub / Microsoft / email (creates a free account</Text>
+          <Text>   if you don't have one).</Text>
+          <Text> </Text>
+          <Text>3. Click "Connect" to authorize this bk1 device. You won't be asked again.</Text>
+          <Text> </Text>
+          <Text color="gray">To play with a friend later: both of you do the steps above, then one</Text>
+          <Text color="gray">of you shares this device from login.tailscale.com/admin/machines.</Text>
           <Text> </Text>
           <Text color="gray">Waiting for authorization...</Text>
         </Box>
