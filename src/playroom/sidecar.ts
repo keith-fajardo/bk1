@@ -32,6 +32,9 @@ export class PlayroomSidecar {
   private nextId = 1;
   private readBuf = '';
   private exited = false;
+  // Ring of recent stderr lines, surfaced if the sidecar dies — without this,
+  // a crash inside the Go process looks like an opaque "sidecar exited" error.
+  private stderrTail: string[] = [];
 
   static binaryAvailable(): boolean {
     return existsSync(BINARY_PATH);
@@ -50,9 +53,14 @@ export class PlayroomSidecar {
       stderr: 'pipe',
     });
     this.consumeStdout();
-    this.proc.exited.then(() => {
+    this.consumeStderr();
+    this.proc.exited.then(exitCode => {
       this.exited = true;
-      const err = new Error('bk1-playroom sidecar exited');
+      const tail = this.stderrTail.slice(-10).join('\n');
+      const msg = tail
+        ? `bk1-playroom sidecar exited (code ${exitCode}). recent stderr:\n${tail}`
+        : `bk1-playroom sidecar exited (code ${exitCode}). no stderr captured.`;
+      const err = new Error(msg);
       for (const p of this.pending.values()) p.reject(err);
       this.pending.clear();
     });
@@ -97,6 +105,28 @@ export class PlayroomSidecar {
     return new Promise((resolve, reject) => {
       this.pending.set(id, { resolve, reject });
     });
+  }
+
+  private async consumeStderr(): Promise<void> {
+    if (!this.proc) return;
+    const reader = (this.proc.stderr as ReadableStream<Uint8Array>).getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) return;
+      buf += decoder.decode(value, { stream: true });
+      let nl = buf.indexOf('\n');
+      while (nl >= 0) {
+        const line = buf.slice(0, nl).trimEnd();
+        buf = buf.slice(nl + 1);
+        if (line) {
+          this.stderrTail.push(line);
+          if (this.stderrTail.length > 50) this.stderrTail.shift();
+        }
+        nl = buf.indexOf('\n');
+      }
+    }
   }
 
   private async consumeStdout(): Promise<void> {
