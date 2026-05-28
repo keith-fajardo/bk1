@@ -107,8 +107,16 @@ export class PlayroomRelay {
         : new TextDecoder().decode(event.data as ArrayBuffer);
       this.handle(server, raw);
     });
-    server.addEventListener('close', () => { this.disconnect(server); });
-    server.addEventListener('error', () => { this.disconnect(server); });
+    server.addEventListener('close', (ev: CloseEvent) => {
+      const peer = this.peerByWs.get(server);
+      console.log(`[close] role=${peer?.role ?? '?'} pin=${peer?.pin ?? '?'} code=${ev.code} reason="${ev.reason}" wasClean=${ev.wasClean}`);
+      this.disconnect(server);
+    });
+    server.addEventListener('error', (ev) => {
+      const peer = this.peerByWs.get(server);
+      console.log(`[error] role=${peer?.role ?? '?'} pin=${peer?.pin ?? '?'} event=${JSON.stringify(ev)}`);
+      this.disconnect(server);
+    });
 
     return new Response(null, { status: 101, webSocket: client });
   }
@@ -155,6 +163,7 @@ export class PlayroomRelay {
         this.rooms.set(pin, room);
         this.peerByWs.set(ws, peer);
         this.send(ws, { op: 'created', pin });
+        console.log(`[create] pin=${pin}`);
         return;
       }
       case 'join': {
@@ -169,6 +178,7 @@ export class PlayroomRelay {
           this.send(ws, { op: 'joined' });
           this.send(room.host.ws, { op: 'paired' });
           this.send(room.joiner.ws, { op: 'paired' });
+          console.log(`[join joiner] pin=${msg.pin}`);
           return;
         }
         const peer: Peer = { ws, role: 'spectator', pin: msg.pin };
@@ -177,6 +187,7 @@ export class PlayroomRelay {
         this.send(ws, { op: 'joined_as_spectator', pin: msg.pin });
         const count = room.spectators.size;
         this.broadcastToPlayers(room, { op: 'spectator_joined', count });
+        console.log(`[join spectator] pin=${msg.pin} watchers=${count}`);
         return;
       }
       case 'data': {
@@ -184,7 +195,14 @@ export class PlayroomRelay {
         if (!peer) { this.send(ws, { op: 'error', msg: 'not in a room' }); return; }
         const room = this.rooms.get(peer.pin);
         if (!room) return;
-        if (peer.role === 'spectator') return;
+        if (peer.role === 'spectator') {
+          console.log(`[data dropped: spectator] pin=${peer.pin} payload=${msg.payload.slice(0, 80)}`);
+          return;
+        }
+        // Sample only the message type for log brevity — payloads can be long.
+        let typeHint = '?';
+        try { typeHint = (JSON.parse(msg.payload) as { type?: string }).type ?? '?'; } catch {}
+        console.log(`[data] from=${peer.role} pin=${peer.pin} type=${typeHint}`);
         this.forwardData(room, peer.role as 'host' | 'joiner', msg.payload);
         return;
       }
