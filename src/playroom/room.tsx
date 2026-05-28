@@ -420,7 +420,7 @@ function Body({
             rightPet={peerPet} rightLabel={peerPet ? 'friend' : '(empty)'}
           />
           <Text> </Text>
-          <Text>actions:</Text>
+          <Text>games:</Text>
           {CONNECTED_ACTIONS.map((a, i) => {
             const active = i === actionIdx;
             const color = a.disabled
@@ -430,7 +430,7 @@ function Body({
               <Box key={a.id}>
                 <Text color={color}>{active ? '  > ' : '    '}</Text>
                 <Text color={color} bold={active && !a.disabled}>
-                  [{a.shortcut}] {a.label}
+                  {a.label}
                 </Text>
               </Box>
             );
