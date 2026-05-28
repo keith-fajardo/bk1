@@ -15,7 +15,7 @@ export const GAMES: Record<string, Game> = {
   },
   exam: {
     id: 'exam',
-    description: '5 dbt-cert questions, 5s each. Perfect = +10 🪙 , anything less = −20 🪙 .',
+    description: '5 dbt-cert questions, 5s each. Perfect = +10 💰 , anything less = −20 💰 .',
     component: ExamGame,
   },
 };

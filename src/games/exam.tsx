@@ -150,7 +150,7 @@ export function ExamGame({ pet, onExit }: GameProps) {
             {perfect ? '  🎉' : ''}
           </Text>
           <Text color={coins > 0 ? CORRECT_FG : WRONG_FG} bold>
-            {coins > 0 ? `+${coins}` : coins} 🪙 
+            {coins > 0 ? `+${coins}` : coins} 💰 
           </Text>
         </Box>
         <Box flexDirection="column" marginTop={1}>
