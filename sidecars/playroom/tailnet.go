@@ -23,9 +23,11 @@ import (
 type tailnet struct {
 	mu       sync.Mutex
 	srv      *tsnet.Server
-	hostname string
+	hostname string // short hostname passed to tsnet (e.g. "keithfajardo-bk1")
+	dnsName  string // full tailnet DNS name resolved after up() (e.g. "keithfajardo-bk1.tail-corp.ts.net")
 
 	listener net.Listener // non-nil when this side created the room
+	listenPort int         // port the listener bound to; tsnet.addr doesn't expose it cleanly
 	conn     net.Conn     // active peer connection (incoming or outgoing)
 }
 
@@ -105,10 +107,14 @@ func (t *tailnet) up(ctx context.Context) (string, error) {
 	if st.Self == nil || len(st.Self.TailscaleIPs) == 0 {
 		return "", fmt.Errorf("no tailscale ip assigned yet")
 	}
-	return st.Self.DNSName, nil
+	t.dnsName = strings.TrimSuffix(st.Self.DNSName, ".")
+	return t.dnsName, nil
 }
 
-// Open a random-port listener within the tailnet. Returns the dial string a peer needs.
+// Open a tailnet listener on a known port. tsnet's Listener.Addr() doesn't
+// report the bound port the way standard net.Listen does (it returns the
+// literal listen spec), so we pick the port ourselves and try a small range
+// in case one's already taken in the userspace stack.
 func (t *tailnet) createRoom(ctx context.Context) (string, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -116,22 +122,40 @@ func (t *tailnet) createRoom(ctx context.Context) (string, error) {
 	if t.listener != nil {
 		return "", fmt.Errorf("room already created")
 	}
-	ln, err := t.srv.Listen("tcp", ":0")
-	if err != nil {
-		return "", fmt.Errorf("listen: %w", err)
+
+	const (
+		basePort  = 47800
+		portRange = 100
+	)
+	var ln net.Listener
+	var port int
+	var lastErr error
+	for i := 0; i < portRange; i++ {
+		p := basePort + i
+		l, err := t.srv.Listen("tcp", fmt.Sprintf(":%d", p))
+		if err == nil {
+			ln = l
+			port = p
+			break
+		}
+		lastErr = err
+	}
+	if ln == nil {
+		return "", fmt.Errorf("listen: exhausted %d ports starting at %d, last err: %w", portRange, basePort, lastErr)
 	}
 	t.listener = ln
+	t.listenPort = port
 
 	go t.acceptLoop(ln)
 
-	// tsnet's listener returns a tsnet.addr, not *net.TCPAddr — type-asserting
-	// to *net.TCPAddr panics. Parse the port out of the string form instead.
-	_, portStr, err := net.SplitHostPort(ln.Addr().String())
-	if err != nil {
-		return "", fmt.Errorf("parse listener addr %q: %w", ln.Addr().String(), err)
+	// Prefer the full tailnet DNS name (resolved during up()), since that's what
+	// the peer can actually dial via MagicDNS. Fall back to the short hostname
+	// only as a defensive measure — shouldn't happen in practice.
+	host := t.dnsName
+	if host == "" {
+		host = t.hostname
 	}
-	host := strings.TrimSuffix(t.hostname, ".")
-	return fmt.Sprintf("%s:%s", host, portStr), nil
+	return fmt.Sprintf("%s:%d", host, port), nil
 }
 
 func (t *tailnet) acceptLoop(ln net.Listener) {
