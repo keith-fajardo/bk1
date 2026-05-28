@@ -26,6 +26,16 @@ import {
 } from './pet';
 import { disableMouseTracking, parseMouseEvents } from './mouse';
 import { GAMES } from './games';
+
+// Multiplayer games live inside the playroom modal (not in GAMES), but should
+// still appear in the /pet play picker so users can discover them. Picking
+// one opens the playroom in create mode; the actual game is launched from
+// within the lobby via a key shortcut (j for jakenpoy, r for race).
+const MULTIPLAYER_GAMES = [
+  { id: 'jakenpoy', description: 'Filipino rock-paper-scissors — opens playroom' },
+  { id: 'race',     description: '40-col mash sprint — opens playroom' },
+] as const;
+const MULTIPLAYER_GAME_IDS = new Set<string>(MULTIPLAYER_GAMES.map(g => g.id));
 import { registerCoinEventHandler, emitCoinEvent, COIN_REWARDS, PASSIVE_SESSION_CAP, type CoinEvent } from './coin-events';
 import { PlayroomLobby, type LobbyMode } from './playroom/room';
 
@@ -130,10 +140,11 @@ function ModelPicker({ currentIdx }: { currentIdx: number }) {
 // ModelPicker so the UX is consistent with /model. The selected entry is
 // launched on Enter via the /pet play submit branch.
 function GamePicker({ currentIdx }: { currentIdx: number }) {
-  const entries = Object.values(GAMES);
-  // Labels are "/pet play <id>" + " ●" — wider than CMD_COL_WIDTH (sized for
-  // short model names). Size the column to the longest registered label so
-  // game ids never truncate as new games are added.
+  // Combined list: single-player games (from GAMES) followed by multiplayer
+  // games. Single index space so the existing currentIdx cycle just works.
+  const single = Object.values(GAMES).map(g => ({ id: g.id, description: g.description, multiplayer: false }));
+  const multi = MULTIPLAYER_GAMES.map(g => ({ id: g.id, description: g.description, multiplayer: true }));
+  const entries = [...single, ...multi];
   const labelWidth = Math.max(
     CMD_COL_WIDTH,
     ...entries.map(g => `/pet play ${g.id}`.length + 2),
@@ -148,6 +159,9 @@ function GamePicker({ currentIdx }: { currentIdx: number }) {
               <Text color={active ? '#C0FAD2' : '#5A8060'} bold={active}>/pet play {g.id}</Text>
               <Text color="#B9FECF">{active ? ' ●' : '  '}</Text>
             </Box>
+            {g.multiplayer && (
+              <Text color={active ? '#7AB890' : '#3D6650'}>2P</Text>
+            )}
             <Text color={active ? '#7AB890' : '#3D6650'}>{g.description}</Text>
           </Box>
         );
@@ -2318,23 +2332,34 @@ function App({ onLogout }: { onLogout: () => void }) {
         // No arg → launch whatever the GamePicker is currently highlighting.
         // Happiness is credited inside each game's onExit (it accumulates
         // per-click), so launching does not tap stats by itself.
-        if (arg === 'jakenpoy' || arg === 'race' || arg === 'space-impact') {
-          // Multiplayer games live inside the playroom modal and are launched
-          // by single-key shortcuts from the connected state. Surfacing the
-          // command here gives an actionable error when the user tries from
-          // outside a room.
-          note = `${arg} is multiplayer. Open a room first: /pet playroom create  or  /pet playroom join <address>.`;
+        if (MULTIPLAYER_GAME_IDS.has(arg)) {
+          // Multiplayer games live inside the playroom modal. Opening the
+          // lobby in create mode drops the user into the share-address flow;
+          // once their peer joins, the chosen game can be launched with its
+          // key shortcut (j for jakenpoy, r for race).
+          setPlayroom({ kind: 'create' });
+          return;
+        } else if (arg === 'space-impact') {
+          note = `space-impact is not yet implemented. Try /pet play jakenpoy or /pet play race for multiplayer games.`;
         } else if (arg && GAMES[arg]) {
           setActiveGame(arg);
           return;
         } else if (arg) {
-          const ids = Object.keys(GAMES).map(id => `/pet play ${id}`).join(' · ');
-          note = `Unknown game "${arg}". Try: ${ids}`;
+          const all = [...Object.keys(GAMES), ...MULTIPLAYER_GAMES.map(g => g.id)].map(id => `/pet play ${id}`).join(' · ');
+          note = `Unknown game "${arg}". Try: ${all}`;
         } else {
-          const ids = Object.keys(GAMES);
-          const picked = ids[petPlayIdxRef.current] ?? ids[0];
+          // No-arg submit from the picker — `petPlayIdxRef.current` indexes
+          // into the combined [single, ...multi] list rendered by GamePicker.
+          const singleIds = Object.keys(GAMES);
+          const multiIds = MULTIPLAYER_GAMES.map(g => g.id);
+          const allIds = [...singleIds, ...multiIds];
+          const picked = allIds[petPlayIdxRef.current] ?? allIds[0];
           if (picked) {
-            setActiveGame(picked);
+            if (MULTIPLAYER_GAME_IDS.has(picked)) {
+              setPlayroom({ kind: 'create' });
+            } else {
+              setActiveGame(picked);
+            }
             return;
           }
           note = 'No games are registered.';
@@ -2767,7 +2792,7 @@ function App({ onLogout }: { onLogout: () => void }) {
     // and so the user can still edit the input.
     if ((inputRef.current === '/pet play' || inputRef.current.startsWith('/pet play '))
         && (key.upArrow || key.downArrow)) {
-      const total = Object.keys(GAMES).length;
+      const total = Object.keys(GAMES).length + MULTIPLAYER_GAMES.length;
       if (total > 0) {
         if (key.upArrow) setPetPlayIdx(i => (i - 1 + total) % total);
         else             setPetPlayIdx(i => (i + 1) % total);
