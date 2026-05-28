@@ -9,7 +9,7 @@ import { PROJECT_DIR } from './tools';
 import { LINT_REPORT_PATH } from './state';
 import { readIdeContextBlock } from './ide-context';
 import { SKILLS, expandSkill } from './skills';
-import { getStoredKey, storeKey, clearStoredKey, isValidKeyShape, authFilePath, getStoredAdminKey, storeAdminKey, adminAuthFilePath } from './auth';
+import { getStoredKey, storeKey, clearStoredKey, isValidKeyShape, authFilePath, getStoredAdminKey, storeAdminKey } from './auth';
 import { estimateCostUsd, formatUsd } from './pricing';
 import { createUsageState, recordUsage, buildReport, renderReport, classifyTurnLabel, fetchOrgUsage } from './usage';
 import {
@@ -218,14 +218,16 @@ function ConfirmBar({ question, selectedIdx }: { question: string; selectedIdx: 
   );
 }
 
-function HintBar({ isRunning, paneMode }: { isRunning: boolean; paneMode: boolean }) {
+function HintBar({ isRunning, paneMode, terminalMode }: { isRunning: boolean; paneMode: boolean; terminalMode: boolean }) {
   return (
     <Box paddingX={2} paddingBottom={1}>
       {isRunning
         ? <Text color="#3D6650">t  toggle output   Esc  stop agent   Ctrl+C  exit</Text>
         : paneMode
-          ? <Text color="#FCD34D">PANE MODE — wheel/click the dbt pane   Ctrl+P  back to terminal mode   Ctrl+C exit</Text>
-          : <Text color="#3D6650">↵ send   Tab switch mode   ↑↓ navigate   Ctrl+P  pane mode (mouse on dbt pane)   Ctrl+C exit</Text>
+          ? <Text color="#FCD34D">PANE MODE — wheel/click the dbt pane   Ctrl+P  back to input mode   Ctrl+C exit</Text>
+          : terminalMode
+            ? <Text color="#7DD3FC">TERMINAL MODE — input runs as shell   ? prefix  ask agent   Ctrl+T  back to prompt   Ctrl+C exit</Text>
+            : <Text color="#3D6650">↵ send   Tab switch mode   ! prefix  shell   Ctrl+T  terminal mode   Ctrl+P  pane mode   Ctrl+C exit</Text>
       }
     </Box>
   );
@@ -294,20 +296,25 @@ function nextMode(m: Mode): Mode {
   return MODE_ORDER[(MODE_ORDER.indexOf(m) + 1) % MODE_ORDER.length]!;
 }
 
-function InputBar({ input, isRunning, mode, modelLabel }: {
-  input: string; isRunning: boolean; mode: Mode; modelLabel: string;
+function InputBar({ input, isRunning, mode, modelLabel, maskInput, terminalMode }: {
+  input: string; isRunning: boolean; mode: Mode; modelLabel: string; maskInput?: boolean; terminalMode?: boolean;
 }) {
   const theme = MODE_THEME[mode];
-  const accent = isRunning ? '#5A8060' : theme.accent;
-  const text   = isRunning ? '#5A8060' : theme.text;
+  const termAccent = '#7DD3FC';
+  const accent = isRunning ? '#5A8060' : (terminalMode ? termAccent : theme.accent);
+  const text   = isRunning ? '#5A8060' : (terminalMode ? termAccent : theme.text);
+  const badgeColor = terminalMode ? termAccent : theme.badge;
+  const badgeLabel = terminalMode ? 'TERM' : theme.label;
+  const promptChar = terminalMode ? '$' : '>';
+  const display = maskInput ? '*'.repeat(input.length) : input;
   // Cursor is a static block — no blink. Blinking would fire setState on an
   // interval, forcing Ink to repaint the dynamic frame and wiping any
   // in-progress terminal selection. Static cursor = no repaint pressure.
   return (
     <Box paddingX={2} gap={1}>
-      <Text color={theme.badge} bold>{theme.label}</Text>
-      <Text color={accent}>{'>'}</Text>
-      <Text color={text}>{input}</Text>
+      <Text color={badgeColor} bold>{badgeLabel}</Text>
+      <Text color={accent}>{promptChar}</Text>
+      <Text color={text}>{display}</Text>
       <Text color={accent}>█</Text>
       <Text color="#3D6650">  {modelLabel}</Text>
     </Box>
@@ -1627,6 +1634,12 @@ function App({ onLogout }: { onLogout: () => void }) {
   // of the terminal's native scroll/select. When OFF (default), no mouse
   // tracking, native terminal everything. Toggled via Ctrl+P in useInput.
   const [paneMode, setPaneMode] = useState(false);
+  // Terminal mode toggle. When ON, lines submitted at the prompt run as shell
+  // commands via runShellCommand (no LLM, no tokens) — prefix with `?` to ask
+  // the agent. When OFF (default), submitted lines go to the agent — prefix
+  // with `!` to shell out for a single command. Toggled via Ctrl+T.
+  const [terminalMode, setTerminalMode] = useState(false);
+  const terminalModeRef = useRef(false);
 
   // Unified mouse-tracking lifecycle. Tracking is ON if EITHER a pet mini-game
   // is active (fetch needs to receive clicks) OR pane mode is on (dbt pane
@@ -1856,7 +1869,7 @@ function App({ onLogout }: { onLogout: () => void }) {
   }, [input, isModelPicker, isPetPlayPicker, isPetFeedPicker]);
 
   const submit = useCallback(async () => {
-    const raw = inputRef.current.trim();
+    let raw = inputRef.current.trim();
     if (!raw || isRunningRef.current) return;
     setConfirmPrompt(null);
     // Push to prompt history (shell-style, with HIST_IGNOREDUPS — skip if identical
@@ -1890,6 +1903,27 @@ function App({ onLogout }: { onLogout: () => void }) {
         { role: 'assistant', content: orgReport + '\n\n---\n\n' + sessionReport },
       ]);
       return;
+    }
+
+    // Terminal-mode routing. `!cmd` always shells out (one-shot from prompt
+    // mode); in terminal mode, anything that isn't a `?`-prefixed agent query
+    // or a `/`-prefixed skill shells out by default. Routed BEFORE local UI
+    // commands so `/plan`, `/model`, etc. still work from terminal mode.
+    const inTerm = terminalModeRef.current;
+    if (raw.startsWith('!') || (inTerm && !raw.startsWith('?') && !raw.startsWith('/'))) {
+      const cmd = (raw.startsWith('!') ? raw.slice(1) : raw).trim();
+      setInput(''); inputRef.current = ''; setSuggestionIndex(-1);
+      if (!cmd) return;
+      setMessages(prev => [...prev, { role: 'user', content: (raw.startsWith('!') ? '!' : '') + cmd }]);
+      void runInlineShell(cmd);
+      return;
+    }
+    // In terminal mode, `?prompt` strips the prefix and falls through to the
+    // normal agent flow.
+    if (inTerm && raw.startsWith('?')) {
+      const rest = raw.slice(1).trim();
+      if (!rest) { setInput(''); inputRef.current = ''; setSuggestionIndex(-1); return; }
+      raw = rest;
     }
 
     // Local UI commands — handled here, never sent to the agent
@@ -1944,7 +1978,7 @@ function App({ onLogout }: { onLogout: () => void }) {
         setMessages(prev => [
           ...prev,
           { role: 'user',      content: raw },
-          { role: 'assistant', content: `Enter your Claude Admin API key to fetch organization usage.\nGet one at console.anthropic.com/settings/admin-keys\n\nPaste your key and press Enter (stored at ${adminAuthFilePath()}, chmod 0600):` },
+          { role: 'assistant', content: `Enter your Claude Admin API key to fetch organization usage.\nGet one at console.anthropic.com/settings/admin-keys\n\nPaste your key and press Enter:` },
         ]);
         return;
       }
@@ -2143,7 +2177,7 @@ function App({ onLogout }: { onLogout: () => void }) {
     if (/^dbt(\s|$)/.test(raw)) {
       setInput(''); inputRef.current = ''; setSuggestionIndex(-1);
       setMessages(prev => [...prev, { role: 'user', content: raw }]);
-      void runDbtCommand(raw);
+      void runShellCommand(raw);
       return;
     }
 
@@ -2350,7 +2384,7 @@ function App({ onLogout }: { onLogout: () => void }) {
     // auto-tailing — leave it alone so the next render shows the new tail.
     setDbtScrollV(v => v === 0 ? 0 : v + lines.length);
   }, []);
-  const runDbtCommand = useCallback(async (raw: string) => {
+  const runShellCommand = useCallback(async (raw: string) => {
     // Each new run starts with a clean pane — prior output is dropped (still
     // available via the [copy] button before the user triggers another run).
     setDbtLogs([`$ ${raw}`]);
@@ -2383,16 +2417,18 @@ function App({ onLogout }: { onLogout: () => void }) {
                          pump(proc.stderr as ReadableStream<Uint8Array>)]);
       const code = await proc.exited;
       appendDbtLines([`[exit ${code}]`, '']);
-      // Award coins on successful run. Parse the leading subcommand: dbt run / build
-      // → dbtRun reward (+2); dbt test → dbtTest reward (+1). Anything else (compile,
-      // ls, debug, source freshness, etc.) is a no-op — those aren't "real work."
+      // Award coins on successful run. Only `dbt run / build / test` count as
+      // "real work"; arbitrary shell commands (`ls`, `git status`, etc.) routed
+      // through here from terminal mode or `!`-escape do not.
       if (code === 0) {
         const tokens = raw.trim().split(/\s+/);
-        const sub = tokens[0] === 'dbt' ? tokens[1] : tokens[0];
-        if (sub === 'run' || sub === 'build') {
-          emitCoinEvent({ type: 'dbt_run',  delta: COIN_REWARDS.dbtRun,  reason: `dbt ${sub}` });
-        } else if (sub === 'test') {
-          emitCoinEvent({ type: 'dbt_test', delta: COIN_REWARDS.dbtTest, reason: 'dbt test' });
+        if (tokens[0] === 'dbt') {
+          const sub = tokens[1];
+          if (sub === 'run' || sub === 'build') {
+            emitCoinEvent({ type: 'dbt_run',  delta: COIN_REWARDS.dbtRun,  reason: `dbt ${sub}` });
+          } else if (sub === 'test') {
+            emitCoinEvent({ type: 'dbt_test', delta: COIN_REWARDS.dbtTest, reason: 'dbt test' });
+          }
         }
       }
     } catch (err) {
@@ -2402,6 +2438,33 @@ function App({ onLogout }: { onLogout: () => void }) {
       setDbtRunning(false);
     }
   }, [appendDbtLines]);
+
+  // Inline shell runner — for `!cmd` escapes and terminal-mode lines. Output
+  // is captured to a single string and pushed into the chat as an assistant
+  // message so it appears where the user typed (terminal mental model),
+  // instead of in the dbt log pane which is reserved for `dbt …` runs.
+  const runInlineShell = useCallback(async (cmd: string) => {
+    try {
+      const proc = Bun.spawn(['bash', '-c', cmd], {
+        cwd: PROJECT_DIR,
+        stdout: 'pipe',
+        stderr: 'pipe',
+      });
+      const [stdout, stderr] = await Promise.all([
+        new Response(proc.stdout as ReadableStream<Uint8Array>).text(),
+        new Response(proc.stderr as ReadableStream<Uint8Array>).text(),
+      ]);
+      const code = await proc.exited;
+      const ansi = /\x1b\[[\d;?]*[A-Za-z~]/g;
+      const out = (stdout + stderr).replace(ansi, '').replace(/\s+$/, '');
+      const content = out
+        ? (code === 0 ? out : `${out}\n[exit ${code}]`)
+        : (code === 0 ? '(no output)' : `[exit ${code}]`);
+      setMessages(prev => [...prev, { role: 'assistant', content }]);
+    } catch (err) {
+      setMessages(prev => [...prev, { role: 'assistant', content: `error: ${err instanceof Error ? err.message : String(err)}` }]);
+    }
+  }, []);
 
   useInput((inputChar, key) => {
     // When a pet mini-game is active, it owns input — bail out so App's
@@ -2516,6 +2579,12 @@ function App({ onLogout }: { onLogout: () => void }) {
     // and enables/disables xterm mouse tracking accordingly.
     if (key.ctrl && inputChar === 'p') {
       setPaneMode(prev => !prev);
+      return;
+    }
+    // Ctrl+T: toggle terminal mode (shell-passthrough at the prompt).
+    if (key.ctrl && inputChar === 't') {
+      terminalModeRef.current = !terminalModeRef.current;
+      setTerminalMode(terminalModeRef.current);
       return;
     }
     if (key.escape) {
@@ -2782,11 +2851,11 @@ function App({ onLogout }: { onLogout: () => void }) {
                 : <Suggestions suggestions={suggestions} selectedIndex={suggestionIndex} input={input} />
           }
           <HRule />
-          <InputBar input={input} isRunning={isRunning} mode={mode} modelLabel={MODELS[modelIdx]!.label} />
+          <InputBar input={input} isRunning={isRunning} mode={mode} modelLabel={MODELS[modelIdx]!.label} maskInput={awaitingAdminKey} terminalMode={terminalMode} />
           <HRule />
           <StatusFooter sessionUsd={sessionUsd} pet={pet} renderHeight={renderHeight} coinToast={coinToast} />
           <HRule />
-          <HintBar isRunning={isRunning} paneMode={paneMode} />
+          <HintBar isRunning={isRunning} paneMode={paneMode} terminalMode={terminalMode} />
         </Box>
       </Box>
     );
@@ -2954,7 +3023,7 @@ function App({ onLogout }: { onLogout: () => void }) {
       <HRule />
       {confirmPrompt
         ? <ConfirmBar question={confirmPrompt} selectedIdx={confirmSelected} />
-        : <InputBar input={input} isRunning={isRunning} mode={mode} modelLabel={MODELS[modelIdx]!.label} />
+        : <InputBar input={input} isRunning={isRunning} mode={mode} modelLabel={MODELS[modelIdx]!.label} maskInput={awaitingAdminKey} terminalMode={terminalMode} />
       }
       {/* Eye-tracking anchor: `terminalRows - 5`. Once a conversation has enough
           Static scrollback to push the dynamic frame down, the cursor lands at the
@@ -2965,7 +3034,7 @@ function App({ onLogout }: { onLogout: () => void }) {
           stdout.on('resize') listener at the top of App. */}
       <StatusFooter sessionUsd={sessionUsd} pet={pet} renderHeight={terminalRows} coinToast={coinToast} />
       <HRule />
-      <HintBar isRunning={isRunning} paneMode={paneMode} />
+      <HintBar isRunning={isRunning} paneMode={paneMode} terminalMode={terminalMode} />
     </Box>
   );
 }
