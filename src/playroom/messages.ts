@@ -11,7 +11,11 @@ export type JakenpoyChoice = 'bato' | 'gunting' | 'papel';
 export type GameMessage =
   | { type: 'hello'; pet: PetState }
   | { type: 'jakenpoy_choice'; round: number; choice: JakenpoyChoice }
-  | { type: 'jakenpoy_quit' };
+  | { type: 'jakenpoy_quit' }
+  | { type: 'race_ready' }
+  | { type: 'race_position'; col: number }
+  | { type: 'race_finished'; elapsed_ms: number }
+  | { type: 'race_quit' };
 
 export function encodeMessage(msg: GameMessage): string {
   return JSON.stringify(msg);
@@ -41,6 +45,20 @@ export function parseGameMessage(line: string): GameMessage | null {
     }
     case 'jakenpoy_quit':
       return { type: 'jakenpoy_quit' };
+    case 'race_ready':
+      return { type: 'race_ready' };
+    case 'race_position': {
+      const col = (raw as { col?: unknown }).col;
+      if (typeof col !== 'number' || !Number.isFinite(col)) return null;
+      return { type: 'race_position', col: Math.max(0, Math.floor(col)) };
+    }
+    case 'race_finished': {
+      const e = (raw as { elapsed_ms?: unknown }).elapsed_ms;
+      if (typeof e !== 'number' || !Number.isFinite(e) || e < 0) return null;
+      return { type: 'race_finished', elapsed_ms: Math.floor(e) };
+    }
+    case 'race_quit':
+      return { type: 'race_quit' };
     default:
       return null;
   }
