@@ -64,6 +64,12 @@ export function Jakenpoy({ pet, peerPet, sidecar, onExit }: Props) {
   const [pickerIdx, setPickerIdx] = useState(0);
   const roundRef = useRef(round);
   roundRef.current = round;
+  // Buffer for the peer's choice when it arrives BEFORE we've advanced to
+  // the same round. Without this, the peer-message handler dropped any
+  // future-round choice on the floor and we'd deadlock waiting for the peer's
+  // current-round choice — the symptom users hit at the round-2 transition.
+  // When we advance past reveal, we drain this buffer if it matches the new round.
+  const pendingPeerChoiceRef = useRef<{ round: number; choice: JakenpoyChoice } | null>(null);
   // scoreRef tracks the same value as the `score` state. Critical: tryResolve
   // is captured by the useEffect([]) peer_message handler at mount time. If
   // we read `score` (the closure variable) inside tryResolve, the handler
@@ -104,7 +110,17 @@ export function Jakenpoy({ pet, peerPet, sidecar, onExit }: Props) {
         onExit();
         return;
       }
-      if (msg.type === 'jakenpoy_choice' && msg.round === roundRef.current) {
+      if (msg.type === 'jakenpoy_choice') {
+        // Stale (peer is somehow behind us) — drop.
+        if (msg.round < roundRef.current) return;
+        // Future round — peer has advanced before we have. Buffer the choice
+        // so we can apply it when we catch up via reveal-Enter. Without this
+        // the message is dropped and both sides deadlock.
+        if (msg.round > roundRef.current) {
+          pendingPeerChoiceRef.current = { round: msg.round, choice: msg.choice };
+          return;
+        }
+        // Current round — apply now.
         theirChoiceRef.current = msg.choice;
         setTheirLocked(true);
         tryResolve();
@@ -150,13 +166,25 @@ export function Jakenpoy({ pet, peerPet, sidecar, onExit }: Props) {
       if (key.return) {
         // Tie: stay on same round number, just reset choices.
         const wasTie = phase.mine === phase.theirs;
-        if (!wasTie) setRound(r => r + 1);
+        const newRound = wasTie ? roundRef.current : roundRef.current + 1;
+        if (!wasTie) setRound(newRound);
+        roundRef.current = newRound;
         myChoiceRef.current = null;
         theirChoiceRef.current = null;
         setMyChoiceDisplay(null);
         setTheirLocked(false);
         setPickerIdx(0);
         setPhase({ kind: 'choosing' });
+
+        // Drain the buffer: if the peer already sent their choice for the
+        // round we're now entering, apply it so we don't deadlock waiting
+        // for a message that already arrived.
+        const pending = pendingPeerChoiceRef.current;
+        if (pending && pending.round === newRound) {
+          pendingPeerChoiceRef.current = null;
+          theirChoiceRef.current = pending.choice;
+          setTheirLocked(true);
+        }
       }
       return;
     }
