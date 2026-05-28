@@ -4,9 +4,11 @@ import { PlayroomSidecar } from './sidecar';
 import { PetSpriteLine } from '../app';
 import { petSprite, petColorHex, type PetState } from '../pet';
 import { encodeMessage, parseGameMessage } from './messages';
-import { isValidPin, PIN_LENGTH } from './relay-protocol';
+import { isValidPin, PIN_LENGTH, type PlayerRole } from './relay-protocol';
 import { Jakenpoy } from './jakenpoy';
+import { JakenpoySpectator } from './jakenpoy-spectator';
 import { Race } from './race';
+import { RaceSpectator } from './race-spectator';
 
 type LobbyState =
   | { kind: 'starting' }
@@ -15,6 +17,7 @@ type LobbyState =
   | { kind: 'join_input'; value: string; error: string | null }
   | { kind: 'joining'; pin: string }
   | { kind: 'connected' }
+  | { kind: 'spectating'; pin: string }
   | { kind: 'error'; msg: string };
 
 export type LobbyMode =
@@ -32,30 +35,76 @@ interface Props {
 
 export function PlayroomLobby({ mode, pet, onExit, onCycleColor }: Props) {
   const [state, setState] = useState<LobbyState>({ kind: 'starting' });
-  const [peerPet, setPeerPet] = useState<PetState | null>(null);
+  const [role, setRole] = useState<PlayerRole | null>(null);
   const [subscreen, setSubscreen] = useState<SubScreen>('lobby');
+  const [watchers, setWatchers] = useState(0);
+
+  // Player-side pets (used in player mode).
+  const [peerPet, setPeerPet] = useState<PetState | null>(null);
+  // Spectator-side pets — tracked separately because the spectator sees both
+  // players from the outside; `from` on incoming data attributes the hello.
+  const [hostPet, setHostPet] = useState<PetState | null>(null);
+  const [joinerPet, setJoinerPet] = useState<PetState | null>(null);
+
   const sidecarRef = useRef<PlayroomSidecar | null>(null);
   const petRef = useRef(pet);
   petRef.current = pet;
+  const roleRef = useRef<PlayerRole | null>(null);
+  roleRef.current = role;
 
   useEffect(() => {
     const sidecar = new PlayroomSidecar();
     sidecarRef.current = sidecar;
 
     const offConnected = sidecar.on('peer_connected', () => {
+      setRole(sidecar.role);
+      roleRef.current = sidecar.role;
       setState({ kind: 'connected' });
       // Hello exchange: send our pet state as soon as the channel is up.
-      // Both sides do this; receive handler below stores the peer pet.
       sidecar.send(encodeMessage({ type: 'hello', pet: petRef.current })).catch(() => {});
+    });
+    const offSpectated = sidecar.on('joined_as_spectator', ({ pin }) => {
+      setRole('spectator');
+      roleRef.current = 'spectator';
+      setState({ kind: 'spectating', pin });
     });
     const offDisconnected = sidecar.on('peer_disconnected', () => {
       setPeerPet(null);
-      setState({ kind: 'error', msg: 'Peer left the room. Press esc to leave.' });
+      setHostPet(null);
+      setJoinerPet(null);
+      setSubscreen('lobby');
+      setState({ kind: 'error', msg: 'Room ended. Press esc to leave.' });
     });
-    const offMessage = sidecar.on('peer_message', ({ line }) => {
+    const offSpectatorJoined = sidecar.on('spectator_joined', ({ count }) => {
+      setWatchers(count);
+      // Re-broadcast hello so the new spectator sees our pet sprite.
+      if (roleRef.current === 'host' || roleRef.current === 'joiner') {
+        sidecar.send(encodeMessage({ type: 'hello', pet: petRef.current })).catch(() => {});
+      }
+    });
+    const offSpectatorLeft = sidecar.on('spectator_left', ({ count }) => {
+      setWatchers(count);
+    });
+    const offMessage = sidecar.on('peer_message', ({ line, from }) => {
       const msg = parseGameMessage(line);
       if (!msg) return;
-      if (msg.type === 'hello') setPeerPet(msg.pet);
+      if (msg.type === 'hello') {
+        if (roleRef.current === 'spectator') {
+          if (from === 'host') setHostPet(msg.pet);
+          else if (from === 'joiner') setJoinerPet(msg.pet);
+        } else {
+          setPeerPet(msg.pet);
+        }
+        return;
+      }
+      if (msg.type === 'game_started') {
+        setSubscreen(msg.game);
+        return;
+      }
+      if (msg.type === 'game_ended') {
+        setSubscreen('lobby');
+        return;
+      }
     });
     const offError = sidecar.on('error', ({ msg }) => {
       setState({ kind: 'error', msg });
@@ -67,6 +116,8 @@ export function PlayroomLobby({ mode, pet, onExit, onCycleColor }: Props) {
         if (mode.kind === 'create') {
           setState({ kind: 'creating' });
           const { pin } = await sidecar.create();
+          setRole('host');
+          roleRef.current = 'host';
           setState({ kind: 'waiting', pin });
         } else if (mode.pin) {
           setState({ kind: 'joining', pin: mode.pin });
@@ -81,7 +132,10 @@ export function PlayroomLobby({ mode, pet, onExit, onCycleColor }: Props) {
 
     return () => {
       offConnected();
+      offSpectated();
       offDisconnected();
+      offSpectatorJoined();
+      offSpectatorLeft();
       offMessage();
       offError();
       sidecar.close().catch(() => {});
@@ -90,24 +144,43 @@ export function PlayroomLobby({ mode, pet, onExit, onCycleColor }: Props) {
 
   // Re-send hello whenever our pet color changes mid-session, so the peer
   // re-renders our sprite in the new color. Skipped on the initial connect
-  // because the connect handler already sends hello once.
+  // because the connect handler already sends hello once. Spectators don't
+  // send hellos (they have no pet identity in the room).
   const firstColorRef = useRef(true);
   useEffect(() => {
     if (firstColorRef.current) { firstColorRef.current = false; return; }
     if (state.kind !== 'connected') return;
+    if (roleRef.current === 'spectator') return;
     sidecarRef.current?.send(encodeMessage({ type: 'hello', pet: petRef.current })).catch(() => {});
   }, [pet.color, state.kind]);
+
+  const launchGame = (game: 'jakenpoy' | 'race') => {
+    sidecarRef.current?.send(encodeMessage({ type: 'game_started', game })).catch(() => {});
+    setSubscreen(game);
+  };
+  const exitGame = () => {
+    // Either player exiting tears down the match for everyone, including spectators.
+    if (roleRef.current === 'host' || roleRef.current === 'joiner') {
+      sidecarRef.current?.send(encodeMessage({ type: 'game_ended' })).catch(() => {});
+    }
+    setSubscreen('lobby');
+  };
 
   useInput((input, key) => {
     if (subscreen !== 'lobby') return;
     if (key.escape) { onExit(); return; }
 
-    if (state.kind === 'connected' || state.kind === 'waiting') {
-      if (input === 'c' && onCycleColor) { onCycleColor(); return; }
-    }
-    if (state.kind === 'connected') {
-      if (input === 'j') { setSubscreen('jakenpoy'); return; }
-      if (input === 'r') { setSubscreen('race'); return; }
+    const isSpectator = roleRef.current === 'spectator';
+    const inRoom = state.kind === 'connected' || state.kind === 'waiting';
+
+    // Color cycle works for players in any in-room state (broadcasts as hello
+    // re-send via the color useEffect). Spectators have no pet identity to
+    // change — color key is a no-op for them.
+    if (inRoom && !isSpectator && input === 'c' && onCycleColor) { onCycleColor(); return; }
+
+    if (state.kind === 'connected' && !isSpectator) {
+      if (input === 'j') { launchGame('jakenpoy'); return; }
+      if (input === 'r') { launchGame('race'); return; }
       return;
     }
 
@@ -129,7 +202,6 @@ export function PlayroomLobby({ mode, pet, onExit, onCycleColor }: Props) {
       return;
     }
     if (input && !key.ctrl && !key.meta) {
-      // Pins are case-insensitive in display; normalize as we go.
       const cleaned = input.replace(/[^A-Za-z0-9]/g, '').toUpperCase();
       if (cleaned) {
         const next = (state.value + cleaned).slice(0, PIN_LENGTH);
@@ -138,65 +210,100 @@ export function PlayroomLobby({ mode, pet, onExit, onCycleColor }: Props) {
     }
   });
 
-  if (subscreen === 'jakenpoy' && state.kind === 'connected' && peerPet && sidecarRef.current) {
-    return (
-      <Jakenpoy
-        pet={pet}
-        peerPet={peerPet}
-        sidecar={sidecarRef.current}
-        onExit={() => setSubscreen('lobby')}
-      />
-    );
+  // Subscreen routing — when a game is active, render its UI. Spectators get
+  // the view-only variant; players get the interactive one.
+  const sidecar = sidecarRef.current;
+  if (subscreen === 'jakenpoy' && sidecar) {
+    if (role === 'spectator') {
+      return (
+        <JakenpoySpectator
+          hostPet={hostPet}
+          joinerPet={joinerPet}
+          sidecar={sidecar}
+          onExit={exitGame}
+        />
+      );
+    }
+    if (state.kind === 'connected' && peerPet) {
+      return <Jakenpoy pet={pet} peerPet={peerPet} sidecar={sidecar} onExit={exitGame} />;
+    }
   }
 
-  if (subscreen === 'race' && state.kind === 'connected' && peerPet && sidecarRef.current) {
-    return (
-      <Race
-        pet={pet}
-        peerPet={peerPet}
-        sidecar={sidecarRef.current}
-        onExit={() => setSubscreen('lobby')}
-      />
-    );
+  if (subscreen === 'race' && sidecar) {
+    if (role === 'spectator') {
+      return (
+        <RaceSpectator
+          hostPet={hostPet}
+          joinerPet={joinerPet}
+          sidecar={sidecar}
+          onExit={exitGame}
+        />
+      );
+    }
+    if (state.kind === 'connected' && peerPet) {
+      return <Race pet={pet} peerPet={peerPet} sidecar={sidecar} onExit={exitGame} />;
+    }
   }
 
   return (
     <Box flexDirection="column" paddingX={1} paddingY={0}>
-      <Header state={state} />
+      <Header state={state} watchers={watchers} role={role} />
       <Box flexDirection="column" marginY={1} paddingX={2} minHeight={12}>
-        <Body state={state} pet={pet} peerPet={peerPet} />
+        <Body
+          state={state}
+          pet={pet}
+          peerPet={peerPet}
+          hostPet={hostPet}
+          joinerPet={joinerPet}
+          role={role}
+          watchers={watchers}
+        />
       </Box>
       <Box paddingX={1}>
-        <Text color="gray">esc  {state.kind === 'waiting' || state.kind === 'connected' ? 'leave room' : 'cancel'}</Text>
+        <Text color="gray">esc  {state.kind === 'waiting' || state.kind === 'connected' || state.kind === 'spectating' ? 'leave room' : 'cancel'}</Text>
       </Box>
     </Box>
   );
 }
 
-function Header({ state }: { state: LobbyState }) {
-  const status = headerStatus(state);
+function Header({ state, watchers, role }: { state: LobbyState; watchers: number; role: PlayerRole | null }) {
+  const status = headerStatus(state, role);
   return (
     <Box>
       <Text color="cyan" bold>playroom</Text>
       <Box flexGrow={1} />
+      {watchers > 0 && (role === 'host' || role === 'joiner') && (
+        <Text color="gray">{watchers} watching · </Text>
+      )}
       <Text color="gray">{status}</Text>
     </Box>
   );
 }
 
-function headerStatus(state: LobbyState): string {
+function headerStatus(state: LobbyState, role: PlayerRole | null): string {
   switch (state.kind) {
     case 'starting':   return 'connecting to relay...';
     case 'creating':   return 'creating room...';
     case 'waiting':    return 'waiting for peer';
     case 'join_input': return 'enter pin';
     case 'joining':    return 'joining...';
-    case 'connected':  return 'connected';
+    case 'connected':  return role === 'spectator' ? 'spectating' : 'connected';
+    case 'spectating': return 'spectating';
     case 'error':      return 'error';
   }
 }
 
-function Body({ state, pet, peerPet }: { state: LobbyState; pet: PetState; peerPet: PetState | null }) {
+function Body({
+  state, pet, peerPet, hostPet, joinerPet, role, watchers,
+}: {
+  state: LobbyState;
+  pet: PetState;
+  peerPet: PetState | null;
+  hostPet: PetState | null;
+  joinerPet: PetState | null;
+  role: PlayerRole | null;
+  watchers: number;
+}) {
   switch (state.kind) {
     case 'starting':
     case 'creating':
@@ -212,7 +319,10 @@ function Body({ state, pet, peerPet }: { state: LobbyState; pet: PetState; peerP
     case 'waiting':
       return (
         <Box flexDirection="column">
-          <PetPair pet={pet} peerPet={null} />
+          <PetPair
+            leftPet={pet} leftLabel="you"
+            rightPet={null} rightLabel="(empty)"
+          />
           <Text> </Text>
           <Text>Send this pin to your friend so they can join:</Text>
           <Text> </Text>
@@ -220,6 +330,12 @@ function Body({ state, pet, peerPet }: { state: LobbyState; pet: PetState; peerP
           <Text> </Text>
           <Text color="gray">In their bk1, they type:  /pet playroom join</Text>
           <Text color="gray">Then paste the pin and hit ↵.</Text>
+          {watchers > 0 && (
+            <>
+              <Text> </Text>
+              <Text color="gray">{watchers} {watchers === 1 ? 'person is' : 'people are'} watching.</Text>
+            </>
+          )}
           <Text> </Text>
           <Text color="gray">c  cycle color</Text>
         </Box>
@@ -230,6 +346,7 @@ function Body({ state, pet, peerPet }: { state: LobbyState; pet: PetState; peerP
         <Box flexDirection="column">
           <Text>Enter the {PIN_LENGTH}-character pin your friend sent you.</Text>
           <Text color="gray">Letters and digits, case-insensitive. Example:  EMCQG4</Text>
+          <Text color="gray">If the room is already full, you'll join as a spectator.</Text>
           <Text> </Text>
           <Box>
             <Text color="gray">pin › </Text>
@@ -242,11 +359,48 @@ function Body({ state, pet, peerPet }: { state: LobbyState; pet: PetState; peerP
       );
 
     case 'connected':
+      if (role === 'spectator') {
+        return (
+          <Box flexDirection="column">
+            <PetPair
+              leftPet={hostPet}  leftLabel="host"
+              rightPet={joinerPet} rightLabel="joiner"
+            />
+            <Text> </Text>
+            <Text color="gray">spectating — you can see the match but can't play.</Text>
+            <Text color="gray">When the players start a game, you'll see it too.</Text>
+          </Box>
+        );
+      }
       return (
         <Box flexDirection="column">
-          <PetPair pet={pet} peerPet={peerPet} />
+          <PetPair
+            leftPet={pet} leftLabel="you"
+            rightPet={peerPet} rightLabel={peerPet ? 'friend' : '(empty)'}
+          />
           <Text> </Text>
           <Text color="gray">j  jakenpoy   r  race   s  space impact (soon)   c  cycle color</Text>
+          {watchers > 0 && (
+            <>
+              <Text> </Text>
+              <Text color="gray">{watchers} {watchers === 1 ? 'person is' : 'people are'} watching.</Text>
+            </>
+          )}
+        </Box>
+      );
+
+    case 'spectating':
+      // Brief state between joined_as_spectator and the host/joiner's hello
+      // re-broadcast. Pets render once hellos arrive.
+      return (
+        <Box flexDirection="column">
+          <PetPair
+            leftPet={hostPet}  leftLabel="host"
+            rightPet={joinerPet} rightLabel="joiner"
+          />
+          <Text> </Text>
+          <Text>Joined room {state.pin} as a spectator.</Text>
+          <Text color="gray">{hostPet && joinerPet ? 'waiting for the players to start a game...' : 'waiting for player pets to load...'}</Text>
         </Box>
       );
 
@@ -255,30 +409,34 @@ function Body({ state, pet, peerPet }: { state: LobbyState; pet: PetState; peerP
   }
 }
 
-export function PetPair({ pet, peerPet }: { pet: PetState; peerPet: PetState | null }) {
-  const mineSprite = petSprite(pet);
-  const peerSprite = peerPet ? petSprite(peerPet) : null;
-  const yourName = pet.name ?? 'motchi';
-  const peerName = peerPet?.name ?? (peerPet ? 'unnamed' : null);
-  const myColor = petColorHex(pet);
-  const peerColor = peerPet ? petColorHex(peerPet) : undefined;
-
+export function PetPair({
+  leftPet, leftLabel, rightPet, rightLabel,
+}: {
+  leftPet: PetState | null;
+  leftLabel: string;
+  rightPet: PetState | null;
+  rightLabel: string;
+}) {
   return (
     <Box flexDirection="row">
-      <Box flexDirection="column" width={20}>
-        <Text>you</Text>
-        <Text> </Text>
-        {mineSprite.map((line, i) => <PetSpriteLine key={i} line={line} bodyColor={myColor} />)}
-        <Text>{yourName}</Text>
-      </Box>
-      <Box flexDirection="column" width={20}>
-        <Text>{peerPet ? 'friend' : '(empty)'}</Text>
-        <Text> </Text>
-        {peerSprite
-          ? peerSprite.map((line, i) => <PetSpriteLine key={i} line={line} bodyColor={peerColor} />)
-          : <Text color="gray">  · · ·  </Text>}
-        <Text>{peerName ?? ' '}</Text>
-      </Box>
+      <Slot pet={leftPet} label={leftLabel} />
+      <Slot pet={rightPet} label={rightLabel} />
+    </Box>
+  );
+}
+
+function Slot({ pet, label }: { pet: PetState | null; label: string }) {
+  const sprite = pet ? petSprite(pet) : null;
+  const name = pet?.name ?? (pet ? 'unnamed' : null);
+  const color = pet ? petColorHex(pet) : undefined;
+  return (
+    <Box flexDirection="column" width={20}>
+      <Text>{label}</Text>
+      <Text> </Text>
+      {sprite
+        ? sprite.map((line, i) => <PetSpriteLine key={i} line={line} bodyColor={color} />)
+        : <Text color="gray">  · · ·  </Text>}
+      <Text>{name ?? ' '}</Text>
     </Box>
   );
 }

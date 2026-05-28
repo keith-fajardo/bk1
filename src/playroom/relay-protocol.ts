@@ -8,11 +8,19 @@ export type RelayClientMsg =
   | { op: 'join'; pin: string }
   | { op: 'data'; payload: string };
 
+export type PlayerRole = 'host' | 'joiner' | 'spectator';
+
 export type RelayServerMsg =
   | { op: 'created'; pin: string }
   | { op: 'joined' }
+  | { op: 'joined_as_spectator'; pin: string }
   | { op: 'paired' }
-  | { op: 'data'; payload: string }
+  | { op: 'spectator_joined'; count: number }
+  | { op: 'spectator_left'; count: number }
+  // `from` identifies which player sent the message. Always set on data the
+  // relay forwards (so spectators can attribute it to host vs joiner);
+  // omitted on data sent BY clients.
+  | { op: 'data'; payload: string; from?: 'host' | 'joiner' }
   | { op: 'peer_left' }
   | { op: 'error'; msg: string };
 
