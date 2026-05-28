@@ -136,6 +136,41 @@ function ModelPicker({ currentIdx }: { currentIdx: number }) {
   );
 }
 
+// Playroom picker — shown when input starts with "/pet playroom". Mirrors the
+// GamePicker shape so the input model is consistent across /pet * subcommands.
+// Selected entry is dispatched on Enter via the /pet playroom submit branch.
+const PLAYROOM_ACTIONS = [
+  { id: 'create' as const, description: 'Create a new room — generates a pin you share with a friend' },
+  { id: 'join'   as const, description: 'Join an existing room — paste the pin your friend sent you' },
+] as const;
+type PlayroomActionId = (typeof PLAYROOM_ACTIONS)[number]['id'];
+
+function PlayroomPicker({ currentIdx }: { currentIdx: number }) {
+  const labelWidth = Math.max(
+    CMD_COL_WIDTH,
+    ...PLAYROOM_ACTIONS.map(a => `/pet playroom ${a.id}`.length + 2),
+  );
+  return (
+    <Box flexDirection="column" marginBottom={0}>
+      {PLAYROOM_ACTIONS.map((a, i) => {
+        const active = i === currentIdx;
+        return (
+          <Box key={a.id} paddingX={2} gap={1}>
+            <Box width={labelWidth} flexShrink={0}>
+              <Text color={active ? '#C0FAD2' : '#5A8060'} bold={active}>/pet playroom {a.id}</Text>
+              <Text color="#B9FECF">{active ? ' ●' : '  '}</Text>
+            </Box>
+            <Text color={active ? '#7AB890' : '#3D6650'}>{a.description}</Text>
+          </Box>
+        );
+      })}
+      <Box paddingX={2} marginTop={0}>
+        <Text color="#5A8060">↑↓ navigate · Enter open · Esc cancel</Text>
+      </Box>
+    </Box>
+  );
+}
+
 // Mini-game picker — shown when input starts with "/pet play". Same shape as
 // ModelPicker so the UX is consistent with /model. The selected entry is
 // launched on Enter via the /pet play submit branch.
@@ -1868,6 +1903,7 @@ function App({ onLogout }: { onLogout: () => void }) {
   const [modelIdx, setModelIdx] = useState(DEFAULT_MODEL_IDX);
   const [petPlayIdx, setPetPlayIdx] = useState(0);
   const [petFeedIdx, setPetFeedIdx] = useState(0);
+  const [petPlayroomIdx, setPetPlayroomIdx] = useState(0);
   const [semanticProgress, setSemanticProgress] = useState<SemanticProgress | null>(null);
   const [lintProgress, setLintProgress] = useState<LintProgress | null>(null);
   const [confirmPrompt, setConfirmPrompt] = useState<string | null>(null);
@@ -1928,10 +1964,12 @@ function App({ onLogout }: { onLogout: () => void }) {
   // the first food.
   const petPlayIdxRef = useRef(0);
   const petFeedIdxRef = useRef(0);
+  const petPlayroomIdxRef = useRef(0);
   useEffect(() => { modelIdxRef.current = modelIdx; }, [modelIdx]);
   useEffect(() => { modeRef.current = mode; }, [mode]);
   useEffect(() => { petPlayIdxRef.current = petPlayIdx; }, [petPlayIdx]);
   useEffect(() => { petFeedIdxRef.current = petFeedIdx; }, [petFeedIdx]);
+  useEffect(() => { petPlayroomIdxRef.current = petPlayroomIdx; }, [petPlayroomIdx]);
   // Lint phase tracking refs — readable inside the memoised submit callback
   const lintProgressRef = useRef<LintProgress | null>(null);
   const lastModelStateActionRef = useRef<string | null>(null);
@@ -2115,13 +2153,17 @@ function App({ onLogout }: { onLogout: () => void }) {
   // of a game id keeps the picker visible.
   const isPetPlayPicker = input === '/pet play' || input.startsWith('/pet play ');
   const isPetFeedPicker = input === '/pet feed' || input.startsWith('/pet feed ');
+  // /pet playroom (with or without trailing chars) → Create / Join picker.
+  // The startsWith check uses a trailing space so `/pet play` doesn't get
+  // misclassified as a playroom intent while the user is still typing.
+  const isPetPlayroomPicker = input === '/pet playroom' || input.startsWith('/pet playroom ');
 
   const suggestions = useMemo(() => {
-    if (isModelPicker || isPetPlayPicker || isPetFeedPicker) return [] as [string, typeof SKILLS[string]][];
+    if (isModelPicker || isPetPlayPicker || isPetFeedPicker || isPetPlayroomPicker) return [] as [string, typeof SKILLS[string]][];
     if (!input.startsWith('/')) return [] as [string, typeof SKILLS[string]][];
     const partial = input.slice(1).split(' ')[0]?.toLowerCase() ?? '';
     return Object.entries(SKILLS).filter(([cmd]) => cmd.startsWith(partial)) as [string, typeof SKILLS[string]][];
-  }, [input, isModelPicker, isPetPlayPicker, isPetFeedPicker]);
+  }, [input, isModelPicker, isPetPlayPicker, isPetFeedPicker, isPetPlayroomPicker]);
 
   const submit = useCallback(async () => {
     let raw = inputRef.current.trim();
@@ -2399,6 +2441,13 @@ function App({ onLogout }: { onLogout: () => void }) {
         // the `playroom` state gate above. No pet state change.
         const [action, ...joinRest] = rest;
         const joinPin = joinRest.join(' ').trim().toUpperCase();
+        if (!action) {
+          // No-arg submit from the picker — `petPlayroomIdxRef.current` is the
+          // highlighted entry in PLAYROOM_ACTIONS.
+          const picked: PlayroomActionId = PLAYROOM_ACTIONS[petPlayroomIdxRef.current]?.id ?? 'create';
+          setPlayroom(picked === 'create' ? { kind: 'create' } : { kind: 'join' });
+          return;
+        }
         if (action === 'create') {
           setPlayroom({ kind: 'create' });
         } else if (action === 'join') {
@@ -2406,7 +2455,7 @@ function App({ onLogout }: { onLogout: () => void }) {
         } else if (action === 'leave') {
           setPlayroom(null);
         } else {
-          note = `Usage: /pet playroom create · /pet playroom join [<pin>] · /pet playroom leave`;
+          note = `Usage: /pet playroom · /pet playroom create · /pet playroom join [<pin>] · /pet playroom leave`;
         }
         if (!note) return;
       } else {
@@ -2647,6 +2696,10 @@ function App({ onLogout }: { onLogout: () => void }) {
       const proc = Bun.spawn(['bash', '-c', `${cmd} 2>&1`], {
         cwd: PROJECT_DIR,
         stdout: 'pipe',
+        // Put bash in its own process group so Esc can signal the whole group
+        // (bash + dbt + any adapter subprocesses) instead of just bash, which
+        // otherwise swallows SIGTERM without forwarding it to its children.
+        detached: true,
       });
       shellProcRef.current = proc;
       const reader = (proc.stdout as ReadableStream<Uint8Array>).getReader();
@@ -2738,7 +2791,12 @@ function App({ onLogout }: { onLogout: () => void }) {
       // (that's the `Sonnet 4.et` glitch where typed letters bled into the model badge).
       lastEscapeAtRef.current = Date.now();
       if (isRunningRef.current) abortRef.current?.abort();
-      if (shellProcRef.current) { try { shellProcRef.current.kill(); } catch { /* already exited */ } }
+      if (shellProcRef.current) {
+        const pid = shellProcRef.current.pid;
+        try { process.kill(-pid, 'SIGINT'); } catch {
+          try { shellProcRef.current.kill(); } catch { /* already exited */ }
+        }
+      }
       // When nothing's running, Esc clears the input — dismisses any open
       // picker (/model, /pet play, /pet feed) and acts as a general
       // "cancel current entry" affordance.
@@ -2817,6 +2875,15 @@ function App({ onLogout }: { onLogout: () => void }) {
         if (key.upArrow) setPetFeedIdx(i => (i - 1 + total) % total);
         else             setPetFeedIdx(i => (i + 1) % total);
       }
+      return;
+    }
+
+    // /pet playroom arrow cycling — Create / Join entries.
+    if ((inputRef.current === '/pet playroom' || inputRef.current.startsWith('/pet playroom '))
+        && (key.upArrow || key.downArrow)) {
+      const total = PLAYROOM_ACTIONS.length;
+      if (key.upArrow) setPetPlayroomIdx(i => (i - 1 + total) % total);
+      else             setPetPlayroomIdx(i => (i + 1) % total);
       return;
     }
 
@@ -3027,11 +3094,13 @@ function App({ onLogout }: { onLogout: () => void }) {
         <Box marginTop={1} flexDirection="column">
           {isModelPicker
             ? <ModelPicker currentIdx={modelIdx} />
-            : isPetPlayPicker
-              ? <GamePicker currentIdx={petPlayIdx} />
-              : isPetFeedPicker
-                ? <FoodPicker currentIdx={petFeedIdx} balance={pet.coins} />
-                : <Suggestions suggestions={suggestions} selectedIndex={suggestionIndex} input={input} />
+            : isPetPlayroomPicker
+              ? <PlayroomPicker currentIdx={petPlayroomIdx} />
+              : isPetPlayPicker
+                ? <GamePicker currentIdx={petPlayIdx} />
+                : isPetFeedPicker
+                  ? <FoodPicker currentIdx={petFeedIdx} balance={pet.coins} />
+                  : <Suggestions suggestions={suggestions} selectedIndex={suggestionIndex} input={input} />
           }
           <HRule />
           <IdeContextBar ctx={ideCtx} />
@@ -3158,11 +3227,13 @@ function App({ onLogout }: { onLogout: () => void }) {
 
       {!confirmPrompt && (isModelPicker
         ? <ModelPicker currentIdx={modelIdx} />
-        : isPetPlayPicker
-          ? <GamePicker currentIdx={petPlayIdx} />
-          : isPetFeedPicker
-            ? <FoodPicker currentIdx={petFeedIdx} balance={pet.coins} />
-            : <Suggestions suggestions={suggestions} selectedIndex={suggestionIndex} input={input} />
+        : isPetPlayroomPicker
+          ? <PlayroomPicker currentIdx={petPlayroomIdx} />
+          : isPetPlayPicker
+            ? <GamePicker currentIdx={petPlayIdx} />
+            : isPetFeedPicker
+              ? <FoodPicker currentIdx={petFeedIdx} balance={pet.coins} />
+              : <Suggestions suggestions={suggestions} selectedIndex={suggestionIndex} input={input} />
       )}
       <HRule />
       {!confirmPrompt && <IdeContextBar ctx={ideCtx} />}
