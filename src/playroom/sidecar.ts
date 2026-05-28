@@ -18,7 +18,17 @@
 
 import type { RelayClientMsg, RelayServerMsg, PlayerRole } from './relay-protocol';
 
-const DEFAULT_RELAY_URL = process.env.PLAYROOM_RELAY_URL ?? 'ws://localhost:8787';
+// Default points at the deployed Cloudflare Worker so plain `bun run dev`
+// works out of the box for end users — no env var to set. The PLAYROOM_RELAY_URL
+// env var still wins if present, which is what dev/CI uses to point at a
+// local relay (`bun run relay` → ws://localhost:8787) without rebuilding.
+//
+// The URL is not a secret: it's a public Cloudflare endpoint, and the only
+// access control the relay enforces is "you need a valid pin to join a room."
+// Hard-coding here is intentional and standard practice for clients that
+// point at a known public backend.
+const DEFAULT_RELAY_URL =
+  process.env.PLAYROOM_RELAY_URL ?? 'wss://bk1-playroom-relay.bk1.workers.dev';
 
 type Pending = {
   resolve: (value: any) => void;

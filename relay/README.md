@@ -31,27 +31,38 @@ endpoint is the same URL with `wss://` instead of `https://`.
 
 ## Point bk1 at the deployed relay
 
-Set the env var when launching bk1:
+The bk1 client (`src/playroom/sidecar.ts`) hard-codes
+`wss://bk1-playroom-relay.bk1.workers.dev` as the default. End users
+just run `bun run dev` and the playroom feature points at the deployed
+Worker automatically — no env var required.
 
-```sh
-PLAYROOM_RELAY_URL=wss://bk1-playroom-relay.<your-subdomain>.workers.dev bun run dev
-```
+If you've forked bk1 and deployed your own Worker under a different
+subdomain, either:
 
-Or export it in your shell rc:
-
-```sh
-export PLAYROOM_RELAY_URL=wss://bk1-playroom-relay.<your-subdomain>.workers.dev
-```
+- Edit the `DEFAULT_RELAY_URL` constant in `src/playroom/sidecar.ts`
+  (one-line change, then commit), or
+- Override at launch time with the env var:
+  ```sh
+  PLAYROOM_RELAY_URL=wss://your-relay.your-subdomain.workers.dev bun run dev
+  ```
 
 ## Local development against the Worker (instead of `bun run relay`)
+
+For working on the relay itself without pushing every change:
 
 ```sh
 cd relay
 npx wrangler dev          # serves the worker at http://localhost:8787
 ```
 
-Then in another terminal, `PLAYROOM_RELAY_URL=ws://localhost:8787 bun run dev`
-(or just `bun run dev` — that's the default).
+Then in another terminal, point bk1 at it:
+
+```sh
+PLAYROOM_RELAY_URL=ws://localhost:8787 bun run dev
+```
+
+(`bun run relay` runs the Bun-native variant at the same port — same protocol,
+slightly different runtime. Either one works for client testing.)
 
 ## Costs
 
