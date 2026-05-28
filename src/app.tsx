@@ -11,7 +11,7 @@ import { readIdeContextBlock } from './ide-context';
 import { SKILLS, expandSkill } from './skills';
 import { getStoredKey, storeKey, clearStoredKey, isValidKeyShape, authFilePath, getStoredAdminKey, storeAdminKey } from './auth';
 import { estimateCostUsd, formatUsd } from './pricing';
-import { createUsageState, recordUsage, buildReport, renderReport, classifyTurnLabel, fetchOrgUsage } from './usage';
+import { createUsageState, recordUsage, classifyTurnLabel, fetchOrgUsageSeries } from './usage';
 import {
   loadPet, savePet, newPet, tickPet, petFace, petFaceEating,
   petSprite, petSpriteBlink, petSpriteSleep, petSpriteEating,
@@ -1317,6 +1317,191 @@ function ReviewMode({ messages, onExit }: { messages: Message[]; onExit: () => v
   );
 }
 
+// ─── /usage interactive graph ───────────────────────────────────────────────
+//
+// Fullscreen takeover (like GameComponent) showing organization usage as
+// stacked horizontal bars, segmented by model family. Tab cycles granularity
+// (monthly → daily → hourly); t / $ toggles tokens vs cost; Esc closes.
+//
+// Series are fetched on demand per granularity and cached in a ref so flipping
+// back to a granularity you've already seen doesn't re-hit the Admin API.
+
+const USAGE_FAMILY_ORDER = ['opus', 'sonnet', 'haiku', 'other'] as const;
+const USAGE_FAMILY_LABEL: Record<string, string> = {
+  opus:   'Opus',
+  sonnet: 'Sonnet',
+  haiku:  'Haiku',
+  other:  'Other',
+};
+// Three distinct shades so stacked segments are visually separable while still
+// living within the mangrove-green palette used elsewhere in bk1.
+const USAGE_FAMILY_COLOR: Record<string, string> = {
+  opus:   '#FFD27C',   // warm gold — premium model accent
+  sonnet: '#7CB7E0',   // cool blue — workhorse model
+  haiku:  '#B9FECF',   // brand pale-green — light/cheap model
+  other:  '#5A8060',   // muted moss — fallback bucket
+};
+const USAGE_BAR_WIDTH = 28;
+
+function UsageGraphView({
+  adminKey, onExit,
+}: { adminKey: string; onExit: () => void }) {
+  const [granularity, setGranularity] = useState<import('./usage').UsageGranularity>('daily');
+  const [metric, setMetric] = useState<'cost' | 'tokens'>('cost');
+  const [series, setSeries] = useState<import('./usage').UsageSeries | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const cacheRef = useRef<Partial<Record<import('./usage').UsageGranularity, import('./usage').UsageSeries>>>({});
+
+  useEffect(() => {
+    const cached = cacheRef.current[granularity];
+    if (cached) { setSeries(cached); setLoading(false); setError(null); return; }
+    setLoading(true); setError(null); setSeries(null);
+    let cancelled = false;
+    (async () => {
+      const result = await fetchOrgUsageSeries(adminKey, granularity);
+      if (cancelled) return;
+      if (typeof result === 'string') {
+        setError(result); setLoading(false); return;
+      }
+      cacheRef.current[granularity] = result;
+      setSeries(result); setLoading(false);
+    })();
+    return () => { cancelled = true; };
+  }, [granularity, adminKey]);
+
+  useInput((inputChar, key) => {
+    if (key.escape) { onExit(); return; }
+    if (key.tab) {
+      setGranularity(g => g === 'monthly' ? 'daily' : g === 'daily' ? 'hourly' : 'monthly');
+      return;
+    }
+    if (inputChar === 't') setMetric('tokens');
+    else if (inputChar === '$' || inputChar === 'c') setMetric('cost');
+    else if (inputChar === 'm') setGranularity('monthly');
+    else if (inputChar === 'd') setGranularity('daily');
+    else if (inputChar === 'h') setGranularity('hourly');
+  });
+
+  const granularityLabel =
+    granularity === 'monthly' ? 'Monthly' :
+    granularity === 'daily'   ? 'Daily'   : 'Hourly';
+
+  return (
+    <Box flexDirection="column" paddingX={2} paddingTop={1}>
+      <Box gap={1}>
+        <Text bold color="#B9FECF">Organization Usage</Text>
+        <Text color="#5A8060">·</Text>
+        <Text color="#C0FAD2">{granularityLabel}</Text>
+        {series && <><Text color="#5A8060">·</Text><Text color="#5A8060">{series.rangeLabel}</Text></>}
+        <Text color="#5A8060">·</Text>
+        <Text color="#C0FAD2">{metric === 'cost' ? 'cost ($)' : 'tokens'}</Text>
+      </Box>
+
+      <Box marginTop={1} flexDirection="column">
+        {loading && <Text color="#5A8060">Loading {granularityLabel.toLowerCase()} data…</Text>}
+        {error && <Text color="#E08080">{error}</Text>}
+        {series && !loading && !error && <UsageBars series={series} metric={metric} />}
+      </Box>
+
+      {series && !loading && !error && (
+        <Box marginTop={1} flexDirection="column">
+          <Box gap={2}>
+            <Text color="#5A8060">Total:</Text>
+            <Text color="#C0FAD2">{metric === 'cost' ? formatUsd(series.totalUsd) : fmtTokens(series.totalTokens)}</Text>
+            {series.daysElapsed > 0 && metric === 'cost' && (
+              <>
+                <Text color="#5A8060">·</Text>
+                <Text color="#5A8060">Daily avg:</Text>
+                <Text color="#C0FAD2">{formatUsd(series.totalUsd / series.daysElapsed)}</Text>
+              </>
+            )}
+          </Box>
+          <Box gap={2} marginTop={0}>
+            <Text color="#5A8060">Legend:</Text>
+            {USAGE_FAMILY_ORDER.map(fam => (
+              <Box key={fam} gap={1}>
+                <Text backgroundColor={USAGE_FAMILY_COLOR[fam]}>  </Text>
+                <Text color="#C0FAD2">{USAGE_FAMILY_LABEL[fam]}</Text>
+              </Box>
+            ))}
+          </Box>
+        </Box>
+      )}
+
+      <Box marginTop={1}>
+        <Text color="#3D6650">Tab/m d h granularity · t/$ metric · Esc close</Text>
+      </Box>
+    </Box>
+  );
+}
+
+function UsageBars({
+  series, metric,
+}: { series: import('./usage').UsageSeries; metric: 'cost' | 'tokens' }) {
+  const values = series.buckets.map(b => metric === 'cost' ? b.totalUsd : b.totalTokens);
+  const maxVal = Math.max(0.0000001, ...values);
+  const maxIdx = values.indexOf(Math.max(...values));
+  const labelWidth = Math.max(6, ...series.buckets.map(b => b.label.length));
+  // One cell = maxVal / USAGE_BAR_WIDTH. Surfaced in the footer so the user
+  // can read absolute magnitudes off the bar widths instead of just the
+  // labels.
+  const cellValue = maxVal / USAGE_BAR_WIDTH;
+  const cellLabel = metric === 'cost' ? formatUsd(cellValue) : fmtTokens(cellValue);
+
+  return (
+    <Box flexDirection="column">
+      {series.buckets.map((b, idx) => {
+        const value = metric === 'cost' ? b.totalUsd : b.totalTokens;
+        // Buckets with non-zero spend always get at least one cell, otherwise
+        // a $0.01 day next to a $4 day disappears entirely from the chart.
+        const rawFilled = Math.round((value / maxVal) * USAGE_BAR_WIDTH);
+        const filled = value > 0 ? Math.max(1, rawFilled) : 0;
+        // Per-family segment widths sum to `filled`. Use largest-remainder
+        // rounding so we don't drop a cell when individual families round down.
+        const segments: { family: string; cells: number }[] = [];
+        if (filled > 0 && value > 0) {
+          const raw = USAGE_FAMILY_ORDER.map(fam => {
+            const s = b.perFamily[fam];
+            const famValue = s ? (metric === 'cost' ? s.usd : s.tokens) : 0;
+            return { family: fam, exact: (famValue / value) * filled };
+          });
+          const floors = raw.map(r => ({ family: r.family, cells: Math.floor(r.exact), frac: r.exact - Math.floor(r.exact) }));
+          let used = floors.reduce((s, r) => s + r.cells, 0);
+          const leftovers = [...floors].sort((a, b) => b.frac - a.frac);
+          for (const r of leftovers) {
+            if (used >= filled) break;
+            r.cells += 1; used += 1;
+          }
+          for (const r of floors) if (r.cells > 0) segments.push({ family: r.family, cells: r.cells });
+        }
+        const valueLabel = metric === 'cost' ? formatUsd(value) : fmtTokens(value);
+        const isMax = idx === maxIdx && value > 0;
+
+        return (
+          <Box key={idx} gap={1}>
+            <Box width={labelWidth} flexShrink={0}>
+              <Text color="#5A8060">{b.label}</Text>
+            </Box>
+            <Text>
+              {segments.map((s, i) => (
+                <Text key={i} backgroundColor={USAGE_FAMILY_COLOR[s.family]}>{' '.repeat(s.cells)}</Text>
+              ))}
+              <Text> </Text>
+              <Text color="#C0FAD2">{valueLabel}</Text>
+              {isMax && <Text color="#3D6650">  ◀ max</Text>}
+            </Text>
+          </Box>
+        );
+      })}
+      <Box marginTop={1}>
+        <Box width={labelWidth} flexShrink={0}><Text> </Text></Box>
+        <Text color="#3D6650">{'  '}Scale: each ▪ ≈ {cellLabel}</Text>
+      </Box>
+    </Box>
+  );
+}
+
 function LoginScreen({ onLogin }: { onLogin: (key: string) => void }) {
   const [value, setValue] = useState('');
   const [error, setError] = useState<string | null>(null);
@@ -1634,6 +1819,11 @@ function App({ onLogout }: { onLogout: () => void }) {
   const [reviewMode, setReviewMode] = useState(false);
   const [awaitingAdminKey, setAwaitingAdminKey] = useState(false);
   const awaitingAdminKeyRef = useRef(false);
+  // When set to a non-null string, the render path swaps the conversation view
+  // for the interactive /usage graph (stacked-bar time series). The string IS
+  // the Admin API key — passed to the modal directly so it can fetch series
+  // data without re-reading from disk. Set to null to close.
+  const [usageGraphKey, setUsageGraphKey] = useState<string | null>(null);
   // Pane mode toggle. When ON, bk1 enables xterm mouse tracking so the dbt
   // log pane's wheel/click/scrollbar/copy button respond again — at the cost
   // of the terminal's native scroll/select. When OFF (default), no mouse
@@ -1906,14 +2096,9 @@ function App({ onLogout }: { onLogout: () => void }) {
       storeAdminKey(raw);
       setMessages(prev => [
         ...prev,
-        { role: 'assistant', content: 'Admin key saved. Fetching organization usage...' },
+        { role: 'assistant', content: 'Admin key saved. Opening usage graph…' },
       ]);
-      const orgReport = await fetchOrgUsage(raw);
-      const sessionReport = renderReport(buildReport(usageStateRef.current));
-      setMessages(prev => [
-        ...prev,
-        { role: 'assistant', content: orgReport + '\n\n---\n\n' + sessionReport },
-      ]);
+      setUsageGraphKey(raw);
       return;
     }
 
@@ -1998,17 +2183,7 @@ function App({ onLogout }: { onLogout: () => void }) {
         ]);
         return;
       }
-      setMessages(prev => [
-        ...prev,
-        { role: 'user',      content: raw },
-        { role: 'assistant', content: 'Fetching organization usage...' },
-      ]);
-      const orgReport = await fetchOrgUsage(adminKey);
-      const sessionReport = renderReport(buildReport(usageStateRef.current));
-      setMessages(prev => [
-        ...prev,
-        { role: 'assistant', content: orgReport + '\n\n---\n\n' + sessionReport },
-      ]);
+      setUsageGraphKey(adminKey);
       return;
     }
     if (raw === '/find' || raw.startsWith('/find ')) {
@@ -2854,6 +3029,13 @@ function App({ onLogout }: { onLogout: () => void }) {
       setActiveGame(null);
     };
     return <GameComponent pet={pet} onExit={onGameExit} />;
+  }
+
+  // /usage interactive graph — fullscreen takeover. Same pattern as the
+  // mini-game above: while open, the modal owns the screen and input. Closing
+  // (Esc inside the modal) flips usageGraphKey back to null.
+  if (usageGraphKey) {
+    return <UsageGraphView adminKey={usageGraphKey} onExit={() => setUsageGraphKey(null)} />;
   }
 
   // Welcome screen
