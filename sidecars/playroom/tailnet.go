@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"net"
@@ -190,28 +191,42 @@ func (t *tailnet) leave() {
 	}
 }
 
-// Phase 1: drain incoming bytes and surface as opaque events. No framing yet —
-// that lands when games actually send structured messages in phase 2+.
+// Phase 2: line-framed reader. Each newline-terminated chunk is surfaced as a
+// peer_message event with the line content. Empty lines are skipped.
 func (t *tailnet) readLoop(conn net.Conn) {
-	buf := make([]byte, 4096)
-	for {
-		n, err := conn.Read(buf)
-		if err != nil {
-			t.mu.Lock()
-			same := t.conn == conn
-			if same {
-				t.conn = nil
-			}
-			t.mu.Unlock()
-			if same {
-				emit("peer_disconnected", map[string]string{})
-			}
-			return
+	scanner := bufio.NewScanner(conn)
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			continue
 		}
-		if n > 0 {
-			emit("peer_message", map[string]any{"bytes": n})
-		}
+		emit("peer_message", map[string]string{"line": line})
 	}
+	t.mu.Lock()
+	same := t.conn == conn
+	if same {
+		t.conn = nil
+	}
+	t.mu.Unlock()
+	if same {
+		emit("peer_disconnected", map[string]string{})
+	}
+}
+
+// Send a single line of text to the peer (a newline is appended). Used for
+// the framed game-message protocol on top of the data channel.
+func (t *tailnet) send(data string) error {
+	t.mu.Lock()
+	conn := t.conn
+	t.mu.Unlock()
+	if conn == nil {
+		return fmt.Errorf("no peer connected")
+	}
+	if _, err := conn.Write([]byte(data + "\n")); err != nil {
+		return fmt.Errorf("write peer: %w", err)
+	}
+	return nil
 }
 
 func (t *tailnet) close() {
