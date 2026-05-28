@@ -138,7 +138,8 @@ Install (sideload):
 cd vscode-ext
 npm install
 npm run build
-code --install-extension .
+npx @vscode/vsce package
+code --install-extension bk1-context-*.vsix
 ```
 
 Without the extension installed, bk1 just sends prompts unchanged.

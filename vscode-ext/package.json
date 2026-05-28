@@ -1,16 +1,77 @@
 {
   "name": "bk1-context",
   "displayName": "bk1 IDE Context",
-  "description": "Streams the active editor's file path + selection to ~/.bk1/ide-context.json so the bk1 TUI can read them as per-turn context (mirrors Claude Code's <ide_opened_file>/<ide_selection> behaviour).",
-  "version": "0.1.0",
+  "description": "bk1 dbt coding agent — IDE context bridge + embedded terminal.",
+  "version": "0.3.0",
   "publisher": "mangrove",
   "private": true,
   "engines": {
     "vscode": "^1.80.0"
   },
-  "categories": ["Other"],
-  "activationEvents": ["onStartupFinished"],
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
   "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "bk1",
+          "title": "bk1",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "bk1": [
+        {
+          "id": "bk1.status",
+          "name": "Status"
+        },
+        {
+          "id": "bk1.log",
+          "name": "Activity Log"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "bk1.status",
+        "contents": "Launch bk1 as an editor tab.\n[Open bk1](command:bk1.open)"
+      }
+    ],
+    "commands": [
+      {
+        "command": "bk1.open",
+        "title": "Open bk1",
+        "category": "bk1",
+        "icon": "media/icon.svg"
+      },
+      {
+        "command": "bk1.stop",
+        "title": "Stop bk1",
+        "category": "bk1"
+      }
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "bk1.open",
+          "group": "navigation"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "bk1.open",
+          "when": "view == bk1.status",
+          "group": "navigation"
+        }
+      ]
+    }
+  },
   "scripts": {
     "build": "tsc -p .",
     "watch": "tsc -p . -w"
