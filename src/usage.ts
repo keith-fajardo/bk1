@@ -234,6 +234,239 @@ export async function fetchOrgUsage(adminKey: string): Promise<string> {
   return lines.join('\n');
 }
 
+// ─── Time-series fetch for the interactive /usage graph ─────────────────────
+//
+// fetchOrgUsage above returns a rendered text block. The graph view needs
+// structured per-bucket data instead, optionally grouped by model family, so
+// we re-fetch through a separate path. Three granularities:
+//   - hourly:  last 24h, bucket_width=1h, single API call
+//   - daily:   current month, bucket_width=1d, single API call (limit=31)
+//   - monthly: last 6 calendar months, bucket_width=1d, one API call per
+//              month (limit=31 caps how much we can ask for in one shot),
+//              then re-aggregated to one bucket per month
+//
+// Each TimeBucket carries per-family token + cost splits so the renderer can
+// draw a stacked bar without re-classifying.
+
+export type UsageGranularity = 'monthly' | 'daily' | 'hourly';
+
+export interface FamilySlice {
+  tokens: number;     // input + cacheRead + cacheWrite + output
+  usd: number;
+}
+
+export interface TimeBucket {
+  label: string;       // short label for the bar row (e.g. "May 28", "14:00", "Feb")
+  startMs: number;     // epoch ms of bucket start — used to sort and to detect day boundaries
+  perFamily: Record<string, FamilySlice>;  // keys: haiku / sonnet / opus / other
+  totalTokens: number;
+  totalUsd: number;
+}
+
+export interface UsageSeries {
+  granularity: UsageGranularity;
+  buckets: TimeBucket[];
+  rangeLabel: string;      // "May 1 – May 28", "Last 24 hours", "Dec – May"
+  totalUsd: number;
+  totalTokens: number;
+  daysElapsed: number;     // for daily-avg display
+}
+
+async function fetchBuckets(
+  adminKey: string,
+  startISO: string,
+  endISO: string,
+  bucketWidth: '1h' | '1d',
+  limit: number,
+): Promise<OrgUsageBucket[] | string> {
+  const url =
+    `https://api.anthropic.com/v1/organizations/usage_report/messages` +
+    `?starting_at=${startISO}` +
+    `&ending_at=${endISO}` +
+    `&bucket_width=${bucketWidth}` +
+    `&limit=${limit}` +
+    `&group_by[]=model`;
+
+  let resp: Response;
+  try {
+    resp = await fetch(url, {
+      headers: { 'anthropic-version': '2023-06-01', 'x-api-key': adminKey },
+    });
+  } catch (err) {
+    return `Network error: ${err instanceof Error ? err.message : String(err)}`;
+  }
+  if (!resp.ok) {
+    const body = await resp.text().catch(() => '');
+    if (resp.status === 401 || resp.status === 403) {
+      return `Authentication failed (${resp.status}). Admin API key may be invalid or lack the required scope.`;
+    }
+    return `API error (${resp.status}): ${body}`;
+  }
+  const json = await resp.json() as OrgUsageResponse;
+  return json.data ?? [];
+}
+
+function bucketTotals(b: OrgUsageBucket): Map<string, FamilySlice> {
+  // Roll up a single API bucket's results[] into per-family slices.
+  const out = new Map<string, FamilySlice>();
+  for (const r of (b.results ?? [])) {
+    const family = classifyFamily(r.model ?? '');
+    const input      = r.uncached_input_tokens ?? 0;
+    const cacheRead  = r.cache_read_input_tokens ?? 0;
+    const cacheWrite = (r.cache_creation?.ephemeral_1h_input_tokens ?? 0)
+                     + (r.cache_creation?.ephemeral_5m_input_tokens ?? 0);
+    const output     = r.output_tokens ?? 0;
+    const tokens = input + cacheRead + cacheWrite + output;
+    const usd    = costForFamily(family, input, cacheRead, cacheWrite, output);
+    const slice  = out.get(family) ?? { tokens: 0, usd: 0 };
+    slice.tokens += tokens;
+    slice.usd    += usd;
+    out.set(family, slice);
+  }
+  return out;
+}
+
+function mergeSlices(target: Record<string, FamilySlice>, add: Map<string, FamilySlice>): void {
+  for (const [family, slice] of add) {
+    const existing = target[family] ?? { tokens: 0, usd: 0 };
+    existing.tokens += slice.tokens;
+    existing.usd    += slice.usd;
+    target[family] = existing;
+  }
+}
+
+function monthShort(d: Date): string {
+  return d.toLocaleString('en-US', { month: 'short' });
+}
+
+export async function fetchOrgUsageSeries(
+  adminKey: string,
+  granularity: UsageGranularity,
+): Promise<UsageSeries | string> {
+  const now = new Date();
+  const pad = (n: number) => String(n).padStart(2, '0');
+
+  if (granularity === 'hourly') {
+    // Align to whole hours so the API accepts the bounds.
+    const endMs   = Math.ceil(now.getTime() / 3_600_000) * 3_600_000;
+    const startMs = endMs - 24 * 3_600_000;
+    const startISO = new Date(startMs).toISOString().replace(/\.\d{3}Z$/, 'Z');
+    const endISO   = new Date(endMs).toISOString().replace(/\.\d{3}Z$/, 'Z');
+    const result = await fetchBuckets(adminKey, startISO, endISO, '1h', 24);
+    if (typeof result === 'string') return result;
+
+    const buckets: TimeBucket[] = result.map(b => {
+      const start = new Date(b.starting_at ?? startISO);
+      const slices = bucketTotals(b);
+      const perFamily: Record<string, FamilySlice> = {};
+      let totalTokens = 0, totalUsd = 0;
+      for (const [family, s] of slices) {
+        perFamily[family] = s;
+        totalTokens += s.tokens;
+        totalUsd    += s.usd;
+      }
+      return {
+        label: `${pad(start.getUTCHours())}:00`,
+        startMs: start.getTime(),
+        perFamily,
+        totalTokens,
+        totalUsd,
+      };
+    });
+    buckets.sort((a, b) => a.startMs - b.startMs);
+    return buildSeries(granularity, buckets, 'Last 24 hours', 1);
+  }
+
+  if (granularity === 'daily') {
+    const year  = now.getUTCFullYear();
+    const month = now.getUTCMonth() + 1;
+    const startISO = `${year}-${pad(month)}-01T00:00:00Z`;
+    const endISO   = `${year}-${pad(month)}-${pad(now.getUTCDate() + 1)}T00:00:00Z`;
+    const result = await fetchBuckets(adminKey, startISO, endISO, '1d', 31);
+    if (typeof result === 'string') return result;
+
+    const buckets: TimeBucket[] = result.map(b => {
+      const start = new Date(b.starting_at ?? startISO);
+      const slices = bucketTotals(b);
+      const perFamily: Record<string, FamilySlice> = {};
+      let totalTokens = 0, totalUsd = 0;
+      for (const [family, s] of slices) {
+        perFamily[family] = s;
+        totalTokens += s.tokens;
+        totalUsd    += s.usd;
+      }
+      return {
+        label: `${monthShort(start)} ${pad(start.getUTCDate())}`,
+        startMs: start.getTime(),
+        perFamily,
+        totalTokens,
+        totalUsd,
+      };
+    });
+    buckets.sort((a, b) => a.startMs - b.startMs);
+    const rangeLabel = `${monthShort(new Date(year, month - 1, 1))} 1 – ${monthShort(now)} ${now.getUTCDate()}`;
+    return buildSeries(granularity, buckets, rangeLabel, buckets.length || 1);
+  }
+
+  // monthly — last 6 calendar months including the current one. One API call
+  // per month with bucket_width=1d, then sum each month's days into a single
+  // bucket. Sequential so we don't hammer the rate limit; 6 cheap calls.
+  const monthsBack = 6;
+  const buckets: TimeBucket[] = [];
+  for (let i = monthsBack - 1; i >= 0; i--) {
+    const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - i, 1));
+    const monthEnd   = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - i + 1, 1));
+    const startISO = monthStart.toISOString().replace(/\.\d{3}Z$/, 'Z');
+    const cap = i === 0 ? new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1)) : monthEnd;
+    const endISO = cap.toISOString().replace(/\.\d{3}Z$/, 'Z');
+    const result = await fetchBuckets(adminKey, startISO, endISO, '1d', 31);
+    if (typeof result === 'string') return result;
+
+    const perFamily: Record<string, FamilySlice> = {};
+    for (const b of result) mergeSlices(perFamily, bucketTotals(b));
+    let totalTokens = 0, totalUsd = 0;
+    for (const fam of Object.values(perFamily)) {
+      totalTokens += fam.tokens;
+      totalUsd    += fam.usd;
+    }
+    buckets.push({
+      label: monthShort(monthStart),
+      startMs: monthStart.getTime(),
+      perFamily,
+      totalTokens,
+      totalUsd,
+    });
+  }
+  const first = buckets[0];
+  const last  = buckets[buckets.length - 1];
+  const rangeLabel = first && last ? `${first.label} – ${last.label}` : 'Last 6 months';
+  // Days-elapsed approximation for "daily avg" line on the monthly view:
+  // count distinct calendar days covered (sum of buckets' real day count).
+  const daysCovered = Math.max(1, Math.floor((Date.now() - (first?.startMs ?? Date.now())) / 86_400_000));
+  return buildSeries('monthly', buckets, rangeLabel, daysCovered);
+}
+
+function buildSeries(
+  granularity: UsageGranularity,
+  buckets: TimeBucket[],
+  rangeLabel: string,
+  daysElapsed: number,
+): UsageSeries {
+  let totalUsd = 0, totalTokens = 0;
+  for (const b of buckets) {
+    totalUsd    += b.totalUsd;
+    totalTokens += b.totalTokens;
+  }
+  return {
+    granularity,
+    buckets,
+    rangeLabel,
+    totalUsd,
+    totalTokens,
+    daysElapsed: Math.max(1, daysElapsed),
+  };
+}
+
 export interface UsageEvent {
   turnLabel: string;            // "/lint-deep" | "/kimball" | "chat" | ...
   subAgentLabel?: string;       // present only when the call came from a sub-agent
@@ -419,7 +652,7 @@ export function buildReport(state: UsageState): UsageReport {
   };
 }
 
-function fmtTokens(n: number): string {
+export function fmtTokens(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
   if (n >= 1_000)     return `${(n / 1_000).toFixed(1)}k`;
   return String(n);

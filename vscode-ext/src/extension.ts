@@ -36,12 +36,16 @@ function openBk1(extensionUri: vscode.Uri) {
   const bk1Bin = path.join(os.homedir(), '.local', 'bin', 'bk1');
   const shellPath = fs.existsSync(bk1Bin) ? bk1Bin : 'bk1';
 
+  // viewColumn: Beside opens bk1 in a new editor group to the side of the
+  // currently active one (Claude Code-style split layout). Without this,
+  // TerminalLocation.Editor alone would put bk1 as a tab in the active group,
+  // forcing files and bk1 to share the same column.
   bk1Terminal = vscode.window.createTerminal({
     name: 'bk1',
     shellPath,
     cwd,
     iconPath: vscode.Uri.joinPath(extensionUri, 'media', 'icon.svg'),
-    location: vscode.TerminalLocation.Editor,
+    location: { viewColumn: vscode.ViewColumn.Beside },
   });
 
   bk1Terminal.show();
