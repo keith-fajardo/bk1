@@ -204,6 +204,14 @@ export function PlayroomLobby({ mode, pet, sessionAlias, onSetAlias, onExit, onC
     }
     setSubscreen('lobby');
   };
+  // Natural match-end dismissal: both players have independently reached
+  // match_over (their tryResolve computed the same outcome), so each side
+  // dismisses its OWN match_over screen via Enter. We do NOT broadcast
+  // game_ended here — that would yank the peer off their match_over screen
+  // before they got to acknowledge it. exitGame (esc/forfeit) still broadcasts.
+  const dismissMatch = () => {
+    setSubscreen('lobby');
+  };
   const runAction = (id: ActionId): void => {
     switch (id) {
       case 'jakenpoy':     launchGame('jakenpoy'); return;
@@ -342,7 +350,7 @@ export function PlayroomLobby({ mode, pet, sessionAlias, onSetAlias, onExit, onC
     // Player path — need peerPet to render the interactive game.
     if (state.kind === 'connected' && peerPet) {
       if (subscreen === 'jakenpoy') {
-        return <Jakenpoy pet={pet} peerPet={peerPet} sidecar={sidecar} onExit={exitGame} />;
+        return <Jakenpoy pet={pet} peerPet={peerPet} sidecar={sidecar} onExit={exitGame} onMatchDismiss={dismissMatch} />;
       }
       return <Race pet={pet} peerPet={peerPet} sidecar={sidecar} onExit={exitGame} />;
     }

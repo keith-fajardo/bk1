@@ -81,6 +81,7 @@ function handle(ws: WebSocket, raw: string): void {
       rooms.set(pin, room);
       peerByWs.set(ws, peer);
       send(ws, { op: 'created', pin });
+      console.log(`[create] pin=${pin}`);
       return;
     }
     case 'join': {
@@ -96,6 +97,7 @@ function handle(ws: WebSocket, raw: string): void {
         send(ws, { op: 'joined' });
         send(room.host.ws, { op: 'paired' });
         send(room.joiner.ws, { op: 'paired' });
+        console.log(`[join joiner] pin=${msg.pin}`);
         return;
       }
       // Both player slots are filled — attach as spectator.
@@ -106,6 +108,7 @@ function handle(ws: WebSocket, raw: string): void {
       // Tell both players that a watcher came in (with updated count).
       const count = room.spectators.size;
       broadcastToPlayers(room, { op: 'spectator_joined', count });
+      console.log(`[join spectator] pin=${msg.pin} watchers=${count}`);
       return;
     }
     case 'data': {
@@ -113,10 +116,13 @@ function handle(ws: WebSocket, raw: string): void {
       if (!peer) { send(ws, { op: 'error', msg: 'not in a room' }); return; }
       const room = rooms.get(peer.pin);
       if (!room) return;
-      // Spectators are view-only. Drop their sends silently — the client
-      // shouldn't be calling .send() in spectator mode anyway, but we never
-      // want a malicious spectator to inject choices into a match.
-      if (peer.role === 'spectator') return;
+      if (peer.role === 'spectator') {
+        console.log(`[data dropped: spectator] pin=${peer.pin}`);
+        return;
+      }
+      let typeHint = '?';
+      try { typeHint = (JSON.parse(msg.payload) as { type?: string }).type ?? '?'; } catch {}
+      console.log(`[data] from=${peer.role} pin=${peer.pin} type=${typeHint}`);
       forwardData(room, peer.role as 'host' | 'joiner', msg.payload);
       return;
     }
