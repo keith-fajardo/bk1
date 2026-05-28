@@ -7,11 +7,32 @@ import {
   encodeMessage,
   parseGameMessage,
   jakenpoyWinner,
-  jakenpoyVerdict,
   type JakenpoyChoice,
 } from './messages';
 
 const WIN_AT = 2; // best of 3 → first to 2
+
+// Picker option order chosen by user — Papel first, then Gunting, then Bato.
+// The arrow-key cursor cycles within this array; Enter locks in.
+const PICKER_OPTIONS: { id: JakenpoyChoice; emoji: string; label: string }[] = [
+  { id: 'papel',   emoji: '📄', label: 'Papel'   },
+  { id: 'gunting', emoji: '✂️',  label: 'Gunting' },
+  { id: 'bato',    emoji: '🪨', label: 'Bato'    },
+];
+
+function choiceLabel(c: JakenpoyChoice): string {
+  const o = PICKER_OPTIONS.find(o => o.id === c);
+  return o ? `${o.emoji} ${o.label}` : c;
+}
+
+// Verdict line for the reveal screen, using the emoji-decorated choice
+// names. Falls back silently to '' for unknown combinations — pure helper.
+function prettyVerdict(winner: JakenpoyChoice, loser: JakenpoyChoice): string {
+  if (winner === 'bato'    && loser === 'gunting') return `${choiceLabel('bato')} dulls ${choiceLabel('gunting')}`;
+  if (winner === 'gunting' && loser === 'papel'  ) return `${choiceLabel('gunting')} cuts ${choiceLabel('papel')}`;
+  if (winner === 'papel'   && loser === 'bato'   ) return `${choiceLabel('papel')} wraps ${choiceLabel('bato')}`;
+  return '';
+}
 
 type Phase =
   | { kind: 'choosing' }
@@ -33,6 +54,8 @@ export function Jakenpoy({ pet, peerPet, sidecar, onExit }: Props) {
   const theirChoiceRef = useRef<JakenpoyChoice | null>(null);
   const [myChoiceDisplay, setMyChoiceDisplay] = useState<JakenpoyChoice | null>(null);
   const [theirLocked, setTheirLocked] = useState(false);
+  // Picker cursor — index into PICKER_OPTIONS. Resets to 0 on each new round.
+  const [pickerIdx, setPickerIdx] = useState(0);
   const roundRef = useRef(round);
   roundRef.current = round;
 
@@ -84,20 +107,25 @@ export function Jakenpoy({ pet, peerPet, sidecar, onExit }: Props) {
     }
     if (phase.kind === 'choosing') {
       if (myChoiceRef.current) return; // already locked
-      const choice =
-        input === 'b' ? 'bato' :
-        input === 'g' ? 'gunting' :
-        input === 'p' ? 'papel' :
-        null;
-      if (!choice) return;
-      myChoiceRef.current = choice;
-      setMyChoiceDisplay(choice);
-      sidecar.send(encodeMessage({
-        type: 'jakenpoy_choice',
-        round: roundRef.current,
-        choice,
-      })).catch(() => {});
-      tryResolve();
+      if (key.upArrow) {
+        setPickerIdx(i => (i - 1 + PICKER_OPTIONS.length) % PICKER_OPTIONS.length);
+        return;
+      }
+      if (key.downArrow) {
+        setPickerIdx(i => (i + 1) % PICKER_OPTIONS.length);
+        return;
+      }
+      if (key.return) {
+        const choice = PICKER_OPTIONS[pickerIdx]!.id;
+        myChoiceRef.current = choice;
+        setMyChoiceDisplay(choice);
+        sidecar.send(encodeMessage({
+          type: 'jakenpoy_choice',
+          round: roundRef.current,
+          choice,
+        })).catch(() => {});
+        tryResolve();
+      }
       return;
     }
     if (phase.kind === 'reveal') {
@@ -109,6 +137,7 @@ export function Jakenpoy({ pet, peerPet, sidecar, onExit }: Props) {
         theirChoiceRef.current = null;
         setMyChoiceDisplay(null);
         setTheirLocked(false);
+        setPickerIdx(0);
         setPhase({ kind: 'choosing' });
       }
       return;
@@ -175,9 +204,17 @@ export function Jakenpoy({ pet, peerPet, sidecar, onExit }: Props) {
             ) : (
               <>
                 <Text>pick:</Text>
-                <Text>  [b] bato</Text>
-                <Text>  [g] gunting</Text>
-                <Text>  [p] papel</Text>
+                {PICKER_OPTIONS.map((opt, i) => {
+                  const active = i === pickerIdx;
+                  return (
+                    <Box key={opt.id}>
+                      <Text color={active ? '#C0FAD2' : 'gray'}>{active ? '  ❯ ' : '    '}</Text>
+                      <Text color={active ? '#C0FAD2' : 'gray'} bold={active}>{opt.emoji}  {opt.label}</Text>
+                    </Box>
+                  );
+                })}
+                <Text> </Text>
+                <Text color="gray">  ↑↓ navigate · ↵ lock in</Text>
               </>
             )}
           </Box>
@@ -201,10 +238,11 @@ export function Jakenpoy({ pet, peerPet, sidecar, onExit }: Props) {
 
 function fighterLabel(phase: Phase, side: 'me' | 'you', placeholder: JakenpoyChoice | '?' | null): string {
   if (phase.kind === 'reveal' || phase.kind === 'match_over') {
-    return side === 'me' ? phase.mine : phase.theirs;
+    return choiceLabel(side === 'me' ? phase.mine : phase.theirs);
   }
   if (placeholder === null) return '';
-  return placeholder;
+  if (placeholder === '?') return '?';
+  return choiceLabel(placeholder);
 }
 
 function FighterPair({
@@ -254,13 +292,13 @@ function RevealSummary({ mine, theirs, score }: { mine: JakenpoyChoice; theirs: 
   let headline: string;
   let sub: string;
   if (outcome === 'tie') {
-    headline = `${mine} vs ${theirs} — tie`;
+    headline = `${choiceLabel(mine)} vs ${choiceLabel(theirs)} — tie`;
     sub = 'replay the round';
   } else if (outcome === 'me') {
-    headline = jakenpoyVerdict(mine, theirs);
+    headline = prettyVerdict(mine, theirs);
     sub = 'you win this round';
   } else {
-    headline = jakenpoyVerdict(theirs, mine);
+    headline = prettyVerdict(theirs, mine);
     sub = 'friend wins this round';
   }
   return (
@@ -282,7 +320,7 @@ function MatchOverSummary({ mine, theirs, score }: { mine: JakenpoyChoice; their
       <Text>{iWon ? `you win ${score.me}-${score.you}` : `friend wins ${score.you}-${score.me}`}</Text>
       <Text color="gray">sinong matalo, siyang unggoy</Text>
       <Text> </Text>
-      <Text color="gray">final picks: you {mine} · friend {theirs}</Text>
+      <Text color="gray">final picks: you {choiceLabel(mine)} · friend {choiceLabel(theirs)}</Text>
       <Text> </Text>
       <Text color="gray">press ↵ to return to playroom</Text>
     </Box>
