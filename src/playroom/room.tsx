@@ -29,28 +29,37 @@ type SubScreen = 'lobby' | 'jakenpoy' | 'race';
 // In-room actions, in the order shown to the user. The arrow-key cursor
 // in the connected state cycles through this list; Enter executes; the
 // `shortcut` letter is also accepted as a direct accelerator.
-type ActionId = 'jakenpoy' | 'race' | 'space-impact' | 'cycle-color';
+type ActionId = 'jakenpoy' | 'race' | 'space-impact' | 'cycle-color' | 'change-alias';
 const CONNECTED_ACTIONS: { id: ActionId; label: string; shortcut: string; disabled?: boolean }[] = [
   { id: 'jakenpoy',     label: 'Jakenpoy',                shortcut: 'j' },
   { id: 'race',         label: 'Race',                    shortcut: 'r' },
   { id: 'space-impact', label: 'Space Impact (soon)',     shortcut: 's', disabled: true },
   { id: 'cycle-color',  label: 'Cycle pet color',         shortcut: 'c' },
+  { id: 'change-alias', label: 'Change alias',            shortcut: 'a' },
 ];
 
 interface Props {
   mode: LobbyMode;
   pet: PetState;
+  // Session-only display name override. When set, it's used in place of
+  // pet.name when this client sends a hello to the relay, so peers and
+  // spectators see this string as the player's name.
+  sessionAlias: string | null;
+  onSetAlias: (alias: string | null) => void;
   onExit: () => void;
   onCycleColor?: () => void;
 }
 
-export function PlayroomLobby({ mode, pet, onExit, onCycleColor }: Props) {
+export function PlayroomLobby({ mode, pet, sessionAlias, onSetAlias, onExit, onCycleColor }: Props) {
   const [state, setState] = useState<LobbyState>({ kind: 'starting' });
   const [role, setRole] = useState<PlayerRole | null>(null);
   const [subscreen, setSubscreen] = useState<SubScreen>('lobby');
   const [watchers, setWatchers] = useState(0);
   // Cursor index into CONNECTED_ACTIONS for the connected-state menu.
   const [actionIdx, setActionIdx] = useState(0);
+  // When non-null, the lobby is showing the alias-edit text field (overlaying
+  // the connected-state menu). Esc cancels without saving; Enter saves.
+  const [aliasEditing, setAliasEditing] = useState<{ value: string } | null>(null);
 
   // Player-side pets (used in player mode).
   const [peerPet, setPeerPet] = useState<PetState | null>(null);
@@ -64,6 +73,23 @@ export function PlayroomLobby({ mode, pet, onExit, onCycleColor }: Props) {
   petRef.current = pet;
   const roleRef = useRef<PlayerRole | null>(null);
   roleRef.current = role;
+  // Mirror sessionAlias in a ref so the long-lived peer_message handlers
+  // (registered once via useEffect([])) read the freshest alias when they
+  // build a hello to re-broadcast.
+  const aliasRef = useRef(sessionAlias);
+  aliasRef.current = sessionAlias;
+
+  // Build a hello payload with the user's chosen alias (if any) overriding
+  // pet.name. Peer/spectator clients just render whatever `name` they see —
+  // they don't know or care that it's an alias.
+  const buildHello = (): string => {
+    const p = petRef.current;
+    const a = aliasRef.current;
+    return encodeMessage({
+      type: 'hello',
+      pet: a ? { ...p, name: a } : p,
+    });
+  };
 
   useEffect(() => {
     const sidecar = new PlayroomSidecar();
@@ -74,7 +100,7 @@ export function PlayroomLobby({ mode, pet, onExit, onCycleColor }: Props) {
       roleRef.current = sidecar.role;
       setState({ kind: 'connected' });
       // Hello exchange: send our pet state as soon as the channel is up.
-      sidecar.send(encodeMessage({ type: 'hello', pet: petRef.current })).catch(() => {});
+      sidecar.send(buildHello()).catch(() => {});
     });
     const offSpectated = sidecar.on('joined_as_spectator', ({ pin }) => {
       setRole('spectator');
@@ -92,7 +118,7 @@ export function PlayroomLobby({ mode, pet, onExit, onCycleColor }: Props) {
       setWatchers(count);
       // Re-broadcast hello so the new spectator sees our pet sprite.
       if (roleRef.current === 'host' || roleRef.current === 'joiner') {
-        sidecar.send(encodeMessage({ type: 'hello', pet: petRef.current })).catch(() => {});
+        sidecar.send(buildHello()).catch(() => {});
       }
     });
     const offSpectatorLeft = sidecar.on('spectator_left', ({ count }) => {
@@ -164,8 +190,8 @@ export function PlayroomLobby({ mode, pet, onExit, onCycleColor }: Props) {
     if (firstColorRef.current) { firstColorRef.current = false; return; }
     if (state.kind !== 'connected') return;
     if (roleRef.current === 'spectator') return;
-    sidecarRef.current?.send(encodeMessage({ type: 'hello', pet: petRef.current })).catch(() => {});
-  }, [pet.color, state.kind]);
+    sidecarRef.current?.send(buildHello()).catch(() => {});
+  }, [pet.color, sessionAlias, state.kind]);
 
   const launchGame = (game: 'jakenpoy' | 'race') => {
     sidecarRef.current?.send(encodeMessage({ type: 'game_started', game })).catch(() => {});
@@ -183,12 +209,41 @@ export function PlayroomLobby({ mode, pet, onExit, onCycleColor }: Props) {
       case 'jakenpoy':     launchGame('jakenpoy'); return;
       case 'race':         launchGame('race'); return;
       case 'cycle-color':  if (onCycleColor) onCycleColor(); return;
+      case 'change-alias': setAliasEditing({ value: sessionAlias ?? '' }); return;
       case 'space-impact': /* not yet implemented — picker shows it disabled */ return;
     }
   };
 
   useInput((input, key) => {
     if (subscreen !== 'lobby') return;
+
+    // Alias-edit text field takes priority over everything else when active.
+    // Esc cancels (returns to menu without saving); Enter saves the trimmed
+    // value (or clears the alias if empty); chars/backspace edit the buffer.
+    if (aliasEditing) {
+      if (key.escape) { setAliasEditing(null); return; }
+      if (key.return) {
+        const trimmed = aliasEditing.value.trim();
+        onSetAlias(trimmed.length > 0 ? trimmed : null);
+        setAliasEditing(null);
+        return;
+      }
+      if (key.backspace || key.delete) {
+        setAliasEditing({ value: aliasEditing.value.slice(0, -1) });
+        return;
+      }
+      if (input && !key.ctrl && !key.meta) {
+        // Allow letters, digits, space, and common punctuation. Cap at a
+        // reasonable display width so it doesn't blow out the layout.
+        const cleaned = input.replace(/[\r\n\t]/g, '');
+        if (cleaned) {
+          const next = (aliasEditing.value + cleaned).slice(0, 20);
+          setAliasEditing({ value: next });
+        }
+      }
+      return;
+    }
+
     if (key.escape) { onExit(); return; }
 
     const isSpectator = roleRef.current === 'spectator';
@@ -297,6 +352,8 @@ export function PlayroomLobby({ mode, pet, onExit, onCycleColor }: Props) {
           role={role}
           watchers={watchers}
           actionIdx={actionIdx}
+          sessionAlias={sessionAlias}
+          aliasEditing={aliasEditing}
         />
       </Box>
       <Box paddingX={1}>
@@ -334,7 +391,7 @@ function headerStatus(state: LobbyState, role: PlayerRole | null): string {
 }
 
 function Body({
-  state, pet, peerPet, hostPet, joinerPet, role, watchers, actionIdx,
+  state, pet, peerPet, hostPet, joinerPet, role, watchers, actionIdx, sessionAlias, aliasEditing,
 }: {
   state: LobbyState;
   pet: PetState;
@@ -344,6 +401,8 @@ function Body({
   role: PlayerRole | null;
   watchers: number;
   actionIdx: number;
+  sessionAlias: string | null;
+  aliasEditing: { value: string } | null;
 }) {
   switch (state.kind) {
     case 'starting':
@@ -416,31 +475,50 @@ function Body({
       return (
         <Box flexDirection="column">
           <PetPair
-            leftPet={pet} leftLabel="you"
+            leftPet={pet} leftLabel={`you${sessionAlias ? ` (${sessionAlias})` : ''}`}
             rightPet={peerPet} rightLabel={peerPet ? 'friend' : '(empty)'}
           />
           <Text> </Text>
-          <Text>games:</Text>
-          {CONNECTED_ACTIONS.map((a, i) => {
-            const active = i === actionIdx;
-            const color = a.disabled
-              ? '#3D6650'                       // dim — not yet implemented
-              : active ? '#C0FAD2' : 'gray';
-            return (
-              <Box key={a.id}>
-                <Text color={color}>{active ? '  > ' : '    '}</Text>
-                <Text color={color} bold={active && !a.disabled}>
-                  {a.label}
-                </Text>
-              </Box>
-            );
-          })}
-          <Text> </Text>
-          <Text color="gray">↑↓ navigate · ↵ select · shortcut letters also work</Text>
-          {watchers > 0 && (
-            <>
+          {aliasEditing ? (
+            // Inline alias-edit text field. Takes over the menu while open.
+            // Esc cancels, Enter saves (empty = clear alias, falls back to
+            // the persistent pet name).
+            <Box flexDirection="column">
+              <Text>Change alias — what should your friend see as your name?</Text>
+              <Text color="gray">Leave empty and press ↵ to clear (uses pet name: {pet.name ?? 'motchi'}).</Text>
               <Text> </Text>
-              <Text color="gray">{watchers} {watchers === 1 ? 'person is' : 'people are'} watching.</Text>
+              <Box>
+                <Text color="gray">alias › </Text>
+                <Text color="cyan" bold>{aliasEditing.value || ' '}</Text>
+              </Box>
+              <Text> </Text>
+              <Text color="gray">↵ save · esc cancel · up to 20 characters</Text>
+            </Box>
+          ) : (
+            <>
+              <Text>games:</Text>
+              {CONNECTED_ACTIONS.map((a, i) => {
+                const active = i === actionIdx;
+                const color = a.disabled
+                  ? '#3D6650'                       // dim — not yet implemented
+                  : active ? '#C0FAD2' : 'gray';
+                return (
+                  <Box key={a.id}>
+                    <Text color={color}>{active ? '  > ' : '    '}</Text>
+                    <Text color={color} bold={active && !a.disabled}>
+                      {a.label}
+                    </Text>
+                  </Box>
+                );
+              })}
+              <Text> </Text>
+              <Text color="gray">↑↓ navigate · ↵ select · shortcut letters also work</Text>
+              {watchers > 0 && (
+                <>
+                  <Text> </Text>
+                  <Text color="gray">{watchers} {watchers === 1 ? 'person is' : 'people are'} watching.</Text>
+                </>
+              )}
             </>
           )}
         </Box>
