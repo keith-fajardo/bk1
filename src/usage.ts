@@ -14,13 +14,26 @@ import { estimateCostUsd, formatUsd } from './pricing';
 
 // ─── Organization-level usage (Admin API) ────────────────────────────────────
 
+// Shape of the Admin Messages Usage Report response. Each time bucket in
+// `data` carries a `results[]` array; when group_by[]=model is set, there's
+// one entry per distinct model used in that bucket. Token counts live INSIDE
+// each result, not on the bucket itself. Cache-creation tokens are split
+// between 1h and 5m ephemeral entries — sum both for the total.
+interface OrgUsageResult {
+  model?: string | null;
+  uncached_input_tokens?: number;
+  cache_read_input_tokens?: number;
+  cache_creation?: {
+    ephemeral_1h_input_tokens?: number;
+    ephemeral_5m_input_tokens?: number;
+  };
+  output_tokens?: number;
+}
+
 interface OrgUsageBucket {
-  input_tokens: number;
-  output_tokens: number;
-  cache_creation_input_tokens: number;
-  cache_read_input_tokens: number;
-  model?: string;
-  snapshot_at?: string;
+  starting_at?: string;
+  ending_at?: string;
+  results?: OrgUsageResult[];
 }
 
 interface OrgUsageResponse {
@@ -85,11 +98,15 @@ export async function fetchOrgUsage(adminKey: string): Promise<string> {
   const firstOfMonth = `${year}-${pad(month)}-01`;
   const today        = `${year}-${pad(month)}-${pad(day)}`;
 
+  // limit=31 because bucket_width=1d defaults to 7 days (max 31). Without
+  // this, requesting May 1–28 silently truncates to the last 7 days, so any
+  // usage from the first three weeks of the month is invisible in the report.
   const url =
     `https://api.anthropic.com/v1/organizations/usage_report/messages` +
     `?starting_at=${firstOfMonth}T00:00:00Z` +
     `&ending_at=${today}T00:00:00Z` +
     `&bucket_width=1d` +
+    `&limit=31` +
     `&group_by[]=model`;
 
   let resp: Response;
@@ -126,14 +143,17 @@ export async function fetchOrgUsage(adminKey: string): Promise<string> {
   const uniqueDays = new Set<string>();
 
   for (const b of buckets) {
-    const family = classifyFamily(b.model ?? '');
-    const agg = byFamily.get(family) ?? { input: 0, cacheRead: 0, cacheWrite: 0, output: 0 };
-    agg.input      += b.input_tokens ?? 0;
-    agg.cacheRead  += b.cache_read_input_tokens ?? 0;
-    agg.cacheWrite += b.cache_creation_input_tokens ?? 0;
-    agg.output     += b.output_tokens ?? 0;
-    byFamily.set(family, agg);
-    if (b.snapshot_at) uniqueDays.add(b.snapshot_at.slice(0, 10));
+    if (b.starting_at) uniqueDays.add(b.starting_at.slice(0, 10));
+    for (const r of (b.results ?? [])) {
+      const family = classifyFamily(r.model ?? '');
+      const agg = byFamily.get(family) ?? { input: 0, cacheRead: 0, cacheWrite: 0, output: 0 };
+      agg.input      += r.uncached_input_tokens ?? 0;
+      agg.cacheRead  += r.cache_read_input_tokens ?? 0;
+      agg.cacheWrite += (r.cache_creation?.ephemeral_1h_input_tokens ?? 0)
+                     + (r.cache_creation?.ephemeral_5m_input_tokens ?? 0);
+      agg.output     += r.output_tokens ?? 0;
+      byFamily.set(family, agg);
+    }
   }
 
   // Compute costs
@@ -145,6 +165,18 @@ export async function fetchOrgUsage(adminKey: string): Promise<string> {
     familyRows.push({ name: friendlyModelName(family), agg, cost });
   }
   familyRows.sort((a, b) => b.cost - a.cost);
+
+  // Buckets came back but every results[] was empty. Most common cause: the
+  // Admin API key belongs to a different organization than the workspace
+  // running the actual API calls, so the key sees zero usage even though the
+  // user IS spending. Surfaces a hint instead of a silently-zero report.
+  if (familyRows.length === 0) {
+    return `No usage found for ${firstOfMonth} to ${today}.\n\n` +
+      `If you're actively using the API, the most likely cause is that this ` +
+      `Admin API key belongs to a different organization than the workspace ` +
+      `your calls are billed to. Run /logout, paste an Admin key from the ` +
+      `correct org at console.anthropic.com/settings/admin-keys, then /usage again.`;
+  }
 
   const daysElapsed = Math.max(1, uniqueDays.size > 0 ? uniqueDays.size : day - 1);
   const totalDaysInMonth = daysInMonth(year, month);
@@ -159,18 +191,20 @@ export async function fetchOrgUsage(adminKey: string): Promise<string> {
   }
   const cacheEfficiency = totalInput > 0 ? (totalCacheRead / totalInput) * 100 : 0;
 
-  // Dominant cost driver
+  // Dominant cost driver — only meaningful when there's real spend and the
+  // dominant row is a known family. Skipping the line when everything is
+  // either zero or "other" avoids the nonsense "other accounts for 0% of
+  // total spend" footnote.
   const dominant = familyRows[0];
   let observation = '';
-  if (dominant) {
-    const pct = totalCost > 0 ? ((dominant.cost / totalCost) * 100).toFixed(0) : '0';
-    observation = `${dominant.name} accounts for ${pct}% of total spend — `;
+  if (dominant && totalCost > 0) {
+    const pct = ((dominant.cost / totalCost) * 100).toFixed(0);
     if (dominant.name.includes('Opus')) {
-      observation += 'output tokens on Opus are the primary cost lever.';
+      observation = `${dominant.name} accounts for ${pct}% of total spend — output tokens on Opus are the primary cost lever.`;
     } else if (dominant.name.includes('Sonnet')) {
-      observation += 'Sonnet output is the primary cost driver; consider routing simpler tasks to Haiku.';
-    } else {
-      observation += 'volume on Haiku is driving cost despite its low per-token rate.';
+      observation = `${dominant.name} accounts for ${pct}% of total spend — Sonnet output is the primary cost driver; consider routing simpler tasks to Haiku.`;
+    } else if (dominant.name.includes('Haiku')) {
+      observation = `${dominant.name} accounts for ${pct}% of total spend — volume on Haiku is driving cost despite its low per-token rate.`;
     }
   }
 

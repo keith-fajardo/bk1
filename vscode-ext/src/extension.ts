@@ -137,10 +137,24 @@ let statusProvider: StatusProvider;
 let logProvider: LogProvider;
 let lastFilePath: string | null | undefined;
 let lastSelKey: string | undefined;
+// Tracks the most recent active editor so we can fall back to it when focus
+// moves to a non-editor surface (terminal, panel, webview). Without this,
+// clicking into the bk1 terminal makes activeTextEditor undefined and the
+// snapshot goes null — even though the user's file is still visible on screen.
+let lastActiveEditor: vscode.TextEditor | undefined;
 
 function snapshot(): IdeContext {
-  const editor = vscode.window.activeTextEditor;
+  const active = vscode.window.activeTextEditor;
+  if (active) lastActiveEditor = active;
+  // Fall back to the last active editor only if it's still visible (the file
+  // tab hasn't been closed). If they closed the file, we genuinely have no
+  // editor context — write the null state so stale snapshots don't linger.
+  const editor = active
+    ?? (lastActiveEditor && vscode.window.visibleTextEditors.includes(lastActiveEditor)
+      ? lastActiveEditor
+      : undefined);
   if (!editor) {
+    lastActiveEditor = undefined;
     return {
       file_path: null, language: null, has_selection: false,
       selection_start_line: null, selection_end_line: null,
