@@ -12,6 +12,194 @@
 
 import { estimateCostUsd, formatUsd } from './pricing';
 
+// ─── Organization-level usage (Admin API) ────────────────────────────────────
+
+interface OrgUsageBucket {
+  input_tokens: number;
+  output_tokens: number;
+  cache_creation_input_tokens: number;
+  cache_read_input_tokens: number;
+  model?: string;
+  snapshot_at?: string;
+}
+
+interface OrgUsageResponse {
+  data: OrgUsageBucket[];
+}
+
+interface OrgModelRate {
+  input: number;
+  cacheRead: number;
+  cacheWrite: number;
+  output: number;
+}
+
+const ORG_RATES: Record<string, OrgModelRate> = {
+  haiku:  { input: 1.00, cacheRead: 0.10, cacheWrite: 1.25, output: 5.00  },
+  sonnet: { input: 3.00, cacheRead: 0.30, cacheWrite: 3.75, output: 15.00 },
+  opus:   { input: 5.00, cacheRead: 0.50, cacheWrite: 6.25, output: 25.00 },
+};
+
+function classifyFamily(model: string): string {
+  if (/haiku/i.test(model))  return 'haiku';
+  if (/sonnet/i.test(model)) return 'sonnet';
+  if (/opus/i.test(model))   return 'opus';
+  return 'other';
+}
+
+function friendlyModelName(family: string): string {
+  if (family === 'haiku')  return 'Haiku 4.5';
+  if (family === 'sonnet') return 'Sonnet 4.6';
+  if (family === 'opus')   return 'Opus 4.6/4.7';
+  return family;
+}
+
+function daysInMonth(year: number, month: number): number {
+  return new Date(year, month, 0).getDate();
+}
+
+function costForFamily(
+  family: string,
+  input: number,
+  cacheRead: number,
+  cacheWrite: number,
+  output: number,
+): number {
+  const rate = ORG_RATES[family];
+  if (!rate) return 0;
+  const m = 1_000_000;
+  return (
+    (input      / m) * rate.input +
+    (cacheRead  / m) * rate.cacheRead +
+    (cacheWrite / m) * rate.cacheWrite +
+    (output     / m) * rate.output
+  );
+}
+
+export async function fetchOrgUsage(adminKey: string): Promise<string> {
+  const now = new Date();
+  const year  = now.getUTCFullYear();
+  const month = now.getUTCMonth() + 1;
+  const day   = now.getUTCDate();
+  const pad   = (n: number) => String(n).padStart(2, '0');
+  const firstOfMonth = `${year}-${pad(month)}-01`;
+  const today        = `${year}-${pad(month)}-${pad(day)}`;
+
+  const url =
+    `https://api.anthropic.com/v1/organizations/usage_report/messages` +
+    `?starting_at=${firstOfMonth}T00:00:00Z` +
+    `&ending_at=${today}T00:00:00Z` +
+    `&bucket_width=1d` +
+    `&group_by[]=model`;
+
+  let resp: Response;
+  try {
+    resp = await fetch(url, {
+      headers: {
+        'anthropic-version': '2023-06-01',
+        'x-api-key': adminKey,
+      },
+    });
+  } catch (err) {
+    return `Network error: ${err instanceof Error ? err.message : String(err)}`;
+  }
+
+  if (!resp.ok) {
+    const body = await resp.text().catch(() => '');
+    if (resp.status === 401 || resp.status === 403) {
+      return `Authentication failed (${resp.status}). Your Admin API key may be invalid or lack the required scope.\n${body}`;
+    }
+    return `API error (${resp.status}): ${body}`;
+  }
+
+  const json = await resp.json() as OrgUsageResponse;
+  const buckets = json.data ?? [];
+  if (buckets.length === 0) {
+    return `No usage data returned for ${firstOfMonth} to ${today}. The organization may have no API calls this month.`;
+  }
+
+  // Aggregate per model family
+  interface FamilyAgg {
+    input: number; cacheRead: number; cacheWrite: number; output: number;
+  }
+  const byFamily = new Map<string, FamilyAgg>();
+  const uniqueDays = new Set<string>();
+
+  for (const b of buckets) {
+    const family = classifyFamily(b.model ?? '');
+    const agg = byFamily.get(family) ?? { input: 0, cacheRead: 0, cacheWrite: 0, output: 0 };
+    agg.input      += b.input_tokens ?? 0;
+    agg.cacheRead  += b.cache_read_input_tokens ?? 0;
+    agg.cacheWrite += b.cache_creation_input_tokens ?? 0;
+    agg.output     += b.output_tokens ?? 0;
+    byFamily.set(family, agg);
+    if (b.snapshot_at) uniqueDays.add(b.snapshot_at.slice(0, 10));
+  }
+
+  // Compute costs
+  let totalCost = 0;
+  const familyRows: { name: string; agg: FamilyAgg; cost: number }[] = [];
+  for (const [family, agg] of byFamily) {
+    const cost = costForFamily(family, agg.input, agg.cacheRead, agg.cacheWrite, agg.output);
+    totalCost += cost;
+    familyRows.push({ name: friendlyModelName(family), agg, cost });
+  }
+  familyRows.sort((a, b) => b.cost - a.cost);
+
+  const daysElapsed = Math.max(1, uniqueDays.size > 0 ? uniqueDays.size : day - 1);
+  const totalDaysInMonth = daysInMonth(year, month);
+  const dailyAvg = totalCost / daysElapsed;
+  const projected = dailyAvg * totalDaysInMonth;
+
+  // Cache efficiency
+  let totalInput = 0, totalCacheRead = 0;
+  for (const [, agg] of byFamily) {
+    totalInput     += agg.input + agg.cacheRead + agg.cacheWrite;
+    totalCacheRead += agg.cacheRead;
+  }
+  const cacheEfficiency = totalInput > 0 ? (totalCacheRead / totalInput) * 100 : 0;
+
+  // Dominant cost driver
+  const dominant = familyRows[0];
+  let observation = '';
+  if (dominant) {
+    const pct = totalCost > 0 ? ((dominant.cost / totalCost) * 100).toFixed(0) : '0';
+    observation = `${dominant.name} accounts for ${pct}% of total spend — `;
+    if (dominant.name.includes('Opus')) {
+      observation += 'output tokens on Opus are the primary cost lever.';
+    } else if (dominant.name.includes('Sonnet')) {
+      observation += 'Sonnet output is the primary cost driver; consider routing simpler tasks to Haiku.';
+    } else {
+      observation += 'volume on Haiku is driving cost despite its low per-token rate.';
+    }
+  }
+
+  // Format report
+  const lines: string[] = [];
+  lines.push(`Organization Usage — ${firstOfMonth} to ${today}`);
+  lines.push('');
+  lines.push('Per-model breakdown:');
+  lines.push('');
+
+  for (const row of familyRows) {
+    const a = row.agg;
+    lines.push(`  ${row.name}`);
+    lines.push(`    Input:        ${fmtTokens(a.input).padStart(10)}    Cache reads:  ${fmtTokens(a.cacheRead).padStart(10)}`);
+    lines.push(`    Cache writes: ${fmtTokens(a.cacheWrite).padStart(10)}    Output:       ${fmtTokens(a.output).padStart(10)}`);
+    lines.push(`    Cost: ${formatUsd(row.cost)}`);
+    lines.push('');
+  }
+
+  lines.push(`Total estimated cost:       ${formatUsd(totalCost)}`);
+  lines.push(`Daily average:              ${formatUsd(dailyAvg)}  (${daysElapsed} day${daysElapsed === 1 ? '' : 's'} of data)`);
+  lines.push(`Projected end-of-month:     ${formatUsd(projected)}  (${totalDaysInMonth} days in ${year}-${pad(month)})`);
+  lines.push(`Cache efficiency:           ${cacheEfficiency.toFixed(1)}%  (cache reads / total input tokens)`);
+  lines.push('');
+  if (observation) lines.push(observation);
+
+  return lines.join('\n');
+}
+
 export interface UsageEvent {
   turnLabel: string;            // "/lint-deep" | "/kimball" | "chat" | ...
   subAgentLabel?: string;       // present only when the call came from a sub-agent

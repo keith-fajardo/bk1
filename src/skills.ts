@@ -641,9 +641,9 @@ If new score < 90 with remaining auto-fixable findings, offer another approval r
   },
 
   usage: {
-    description: 'Session token usage broken down by command + sub-agent (most expensive first)',
+    description: 'Organization usage + cost (Admin API) and session token breakdown',
     usage: '/usage',
-    // Intercepted in app.tsx — generates the report locally, no LLM call.
+    // Intercepted in app.tsx — fetches org usage via Admin API, no LLM call.
     expand: () => '',
   },
 
