@@ -521,7 +521,7 @@ export function renderPetView(state: PetState, now: Date = new Date()): string {
     `🍗 hunger     ${statBar(state.hunger)}  ${Math.round(state.hunger)}%`,
     `😊 happiness  ${statBar(state.happiness)}  ${Math.round(state.happiness)}%`,
     `🔋 energy     ${statBar(state.energy)}  ${Math.round(state.energy)}%`,
-    `🪙  coins      ${state.coins}`,
+    `💰  coins      ${state.coins}`,
     '',
   ];
 
