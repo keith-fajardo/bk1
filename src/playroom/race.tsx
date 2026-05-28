@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { Box, Text, useInput } from 'ink';
-import type { PetState } from '../pet';
+import { PetSpriteLine } from '../app';
+import { petSprite, petSpriteHappy, petSpriteSad, type PetState } from '../pet';
 import type { PlayroomSidecar } from './sidecar';
 import { encodeMessage, parseGameMessage } from './messages';
 
@@ -23,12 +24,24 @@ interface Props {
   peerPet: PetState;
   sidecar: PlayroomSidecar;
   onExit: () => void;
+  // Mirrors Jakenpoy. Used only when BOTH runners have finished (natural end)
+  // so each side dismisses its own 'finished' screen without yanking the peer.
+  // Forfeit paths (esc mid-race, esc while opponent still racing) still go
+  // through onExit which broadcasts game_ended as before.
+  onMatchDismiss?: () => void;
 }
 
-export function Race({ pet, peerPet, sidecar, onExit }: Props) {
+export function Race({ pet, peerPet, sidecar, onExit, onMatchDismiss }: Props) {
   const [phase, setPhase] = useState<Phase>({ kind: 'ready', selfReady: false, peerReady: false });
   const phaseRef = useRef(phase);
   phaseRef.current = phase;
+  // True once BOTH selfTime and peerTime are known — i.e. the race fully
+  // resolved on its own. When true, the unmount cleanup skips race_quit so
+  // we don't trip the peer's race_quit handler (which calls their onExit and
+  // kicks them to the lobby off their own finish screen). If a player esc's
+  // while their peer is still racing this stays false → cleanup broadcasts
+  // race_quit → peer is yanked out, same as today.
+  const matchEndedRef = useRef(false);
 
   // Apply a phase update via a transform — used by both keyboard handlers and
   // message handlers so the most recent phase is always the source of truth.
@@ -47,6 +60,16 @@ export function Race({ pet, peerPet, sidecar, onExit }: Props) {
     if (!p.selfReady || !p.peerReady) return;
     setPhase({ kind: 'countdown', count: 3 });
   };
+
+  // Watch for the "both finished" transition and flip the natural-end flag.
+  // Once true, the cleanup skips race_quit and the Enter-at-finished handler
+  // can dismiss silently. We never flip it back — once the race is over, it's
+  // over.
+  useEffect(() => {
+    if (phase.kind === 'finished' && phase.selfTime !== null && phase.peerTime !== null) {
+      matchEndedRef.current = true;
+    }
+  }, [phase]);
 
   // Countdown timer — fires once per second while in countdown phase.
   useEffect(() => {
@@ -105,7 +128,11 @@ export function Race({ pet, peerPet, sidecar, onExit }: Props) {
     });
     return () => {
       offMessage();
-      sidecar.send(encodeMessage({ type: 'race_quit' })).catch(() => {});
+      // Forfeit signal — skipped on natural race-end (both times known) so
+      // each side can dismiss independently. Same pattern as Jakenpoy.
+      if (!matchEndedRef.current) {
+        sidecar.send(encodeMessage({ type: 'race_quit' })).catch(() => {});
+      }
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -152,7 +179,11 @@ export function Race({ pet, peerPet, sidecar, onExit }: Props) {
       return;
     }
     if (phase.kind === 'finished' && key.return) {
-      onExit();
+      // Natural end (both finished) → silent dismiss. Otherwise, the local
+      // user is dismissing while the peer is still mid-race; treat as forfeit
+      // so the peer gets cleaned up too (existing behavior).
+      const naturalEnd = phase.selfTime !== null && phase.peerTime !== null;
+      (naturalEnd ? (onMatchDismiss ?? onExit) : onExit)();
     }
   });
 
@@ -232,14 +263,59 @@ function Body({ phase, pet, peerPet }: { phase: Phase; pet: PetState; peerPet: P
   const result = finishResult(phase);
   return (
     <Box flexDirection="column">
+      <FinishedSprites pet={pet} peerPet={peerPet} result={result} yourName={yourName} peerName={peerName} />
+      <Text> </Text>
       <TrackLine name={yourName} col={phase.selfCol} side="me" finished={phase.selfTime !== null} time={phase.selfTime} winner={result === 'me'} />
       <Text> </Text>
       <TrackLine name={peerName} col={phase.peerCol} side="you" finished={phase.peerTime !== null} time={phase.peerTime} winner={result === 'you'} />
       <Text> </Text>
-      <Text> </Text>
       <Text bold color={result === 'me' ? 'green' : result === 'you' ? 'red' : 'gray'}>{resultCopy(result, phase, yourName, peerName)}</Text>
       <Text> </Text>
       <Text color="gray">press ↵ to return to playroom</Text>
+    </Box>
+  );
+}
+
+// Side-by-side pet sprites for the finished screen. Winner gets the happy
+// sprite, loser the sad one. Ties / "pending" (one still racing) leave both
+// neutral so we don't telegraph an outcome that isn't settled yet. Only
+// rendered in 'finished' phase — no sprites during racing, where the
+// dotted-track UI is the focus.
+function FinishedSprites({
+  pet, peerPet, result, yourName, peerName,
+}: {
+  pet: PetState;
+  peerPet: PetState;
+  result: 'me' | 'you' | 'tie' | 'pending';
+  yourName: string;
+  peerName: string;
+}) {
+  const myMood: 'happy' | 'sad' | 'neutral' =
+    result === 'me'  ? 'happy' :
+    result === 'you' ? 'sad'   : 'neutral';
+  const theirMood: 'happy' | 'sad' | 'neutral' =
+    result === 'you' ? 'happy' :
+    result === 'me'  ? 'sad'   : 'neutral';
+  const spriteFor = (p: PetState, m: 'happy' | 'sad' | 'neutral') =>
+    m === 'happy' ? petSpriteHappy(p)
+    : m === 'sad' ? petSpriteSad(p)
+    : petSprite(p);
+  const mineSprite = spriteFor(pet, myMood);
+  const peerSprite = spriteFor(peerPet, theirMood);
+  return (
+    <Box flexDirection="row">
+      <Box flexDirection="column" width={22}>
+        <Text>you{result === 'me' ? ' ★' : ''}</Text>
+        <Text> </Text>
+        {mineSprite.map((line, i) => <PetSpriteLine key={i} line={line} />)}
+        <Text>{yourName}</Text>
+      </Box>
+      <Box flexDirection="column" width={22}>
+        <Text>friend{result === 'you' ? ' ★' : ''}</Text>
+        <Text> </Text>
+        {peerSprite.map((line, i) => <PetSpriteLine key={i} line={line} />)}
+        <Text>{peerName}</Text>
+      </Box>
     </Box>
   );
 }
