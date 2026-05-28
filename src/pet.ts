@@ -37,6 +37,25 @@ export interface PetState {
   coins: number;                // bk1 in-game currency — starts at 100, earned via dbt activity + games
   sleeping_until?: string;      // ISO — while in the future, pet shows closed eyes + snore
   eating_until?: string;        // ISO — while in the future, pet shows 2-frame chewing animation
+  color?: PetColorName;         // body color (defaults to 'green' if absent); existing files without this still load
+}
+
+// Body-color palette. Keys are stable identifiers stored in pet.json; values
+// are the hex colors applied at render time. `green` is the original/default.
+export const PET_COLORS = {
+  green:  '#9FE749',
+  pink:   '#FF8FB1',
+  blue:   '#6FCFFF',
+  yellow: '#FFD93D',
+  purple: '#C77DFF',
+  orange: '#FF9A3C',
+} as const;
+export type PetColorName = keyof typeof PET_COLORS;
+export const PET_COLOR_NAMES = Object.keys(PET_COLORS) as PetColorName[];
+export const DEFAULT_PET_COLOR: PetColorName = 'green';
+
+export function petColorHex(pet: PetState): string {
+  return PET_COLORS[pet.color ?? DEFAULT_PET_COLOR];
 }
 
 export type Stage = 'egg' | 'baby' | 'adult';
@@ -654,6 +673,9 @@ export function readPetFrom(path: string): PetState | null {
         coins:          typeof data.coins === 'number' ? data.coins : STARTING_COINS,
         sleeping_until: typeof data.sleeping_until === 'string' ? data.sleeping_until : undefined,
         eating_until:   typeof data.eating_until   === 'string' ? data.eating_until   : undefined,
+        color:          typeof data.color === 'string' && (PET_COLOR_NAMES as readonly string[]).includes(data.color)
+                          ? (data.color as PetColorName)
+                          : undefined,
       };
     }
     return null;

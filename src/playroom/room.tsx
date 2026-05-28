@@ -2,7 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { Box, Text, useInput } from 'ink';
 import { PlayroomSidecar } from './sidecar';
 import { PetSpriteLine } from '../app';
-import { petSprite, type PetState } from '../pet';
+import { petSprite, petColorHex, type PetState } from '../pet';
 import { encodeMessage, parseGameMessage } from './messages';
 import { Jakenpoy } from './jakenpoy';
 import { Race } from './race';
@@ -27,9 +27,10 @@ interface Props {
   mode: LobbyMode;
   pet: PetState;
   onExit: () => void;
+  onCycleColor?: () => void;
 }
 
-export function PlayroomLobby({ mode, pet, onExit }: Props) {
+export function PlayroomLobby({ mode, pet, onExit, onCycleColor }: Props) {
   const [state, setState] = useState<LobbyState>({ kind: 'starting' });
   const [peerPet, setPeerPet] = useState<PetState | null>(null);
   const [subscreen, setSubscreen] = useState<SubScreen>('lobby');
@@ -93,12 +94,28 @@ export function PlayroomLobby({ mode, pet, onExit }: Props) {
     };
   }, [mode]);
 
+  // Re-send hello whenever our pet color changes mid-session, so the peer
+  // re-renders our sprite in the new color. Skipped on the initial connect
+  // because the connect handler already sends hello once.
+  const firstColorRef = useRef(true);
+  useEffect(() => {
+    if (firstColorRef.current) { firstColorRef.current = false; return; }
+    if (state.kind !== 'connected') return;
+    sidecarRef.current?.send(encodeMessage({ type: 'hello', pet: petRef.current })).catch(() => {});
+  }, [pet.color, state.kind]);
+
   useInput((input, key) => {
     // Subscreen owns its own input.
     if (subscreen !== 'lobby') return;
 
     if (key.escape) { onExit(); return; }
 
+    if (state.kind === 'connected' || state.kind === 'waiting') {
+      // Color cycling is allowed both before peer joins (so you can pick your
+      // color while sharing the address) and after (so you can change it
+      // mid-session and have the peer see it via the re-broadcast).
+      if (input === 'c' && onCycleColor) { onCycleColor(); return; }
+    }
     if (state.kind === 'connected') {
       if (input === 'j') { setSubscreen('jakenpoy'); return; }
       if (input === 'r') { setSubscreen('race'); return; }
@@ -222,6 +239,8 @@ function Body({ state, pet, peerPet }: { state: LobbyState; pet: PetState; peerP
           <Text>Share this with your friend so they can join:</Text>
           <Text> </Text>
           <Text color="cyan">    {state.address}</Text>
+          <Text> </Text>
+          <Text color="gray">c  cycle color</Text>
         </Box>
       );
 
@@ -245,7 +264,7 @@ function Body({ state, pet, peerPet }: { state: LobbyState; pet: PetState; peerP
         <Box flexDirection="column">
           <PetPair pet={pet} peerPet={peerPet} />
           <Text> </Text>
-          <Text color="gray">j  jakenpoy   r  race   s  space impact (soon)</Text>
+          <Text color="gray">j  jakenpoy   r  race   s  space impact (soon)   c  cycle color</Text>
         </Box>
       );
 
@@ -259,20 +278,22 @@ export function PetPair({ pet, peerPet }: { pet: PetState; peerPet: PetState | n
   const peerSprite = peerPet ? petSprite(peerPet) : null;
   const yourName = pet.name ?? 'motchi';
   const peerName = peerPet?.name ?? (peerPet ? 'unnamed' : null);
+  const myColor = petColorHex(pet);
+  const peerColor = peerPet ? petColorHex(peerPet) : undefined;
 
   return (
     <Box flexDirection="row">
       <Box flexDirection="column" width={20}>
         <Text>you</Text>
         <Text> </Text>
-        {mineSprite.map((line, i) => <PetSpriteLine key={i} line={line} />)}
+        {mineSprite.map((line, i) => <PetSpriteLine key={i} line={line} bodyColor={myColor} />)}
         <Text>{yourName}</Text>
       </Box>
       <Box flexDirection="column" width={20}>
         <Text>{peerPet ? 'friend' : '(empty)'}</Text>
         <Text> </Text>
         {peerSprite
-          ? peerSprite.map((line, i) => <PetSpriteLine key={i} line={line} />)
+          ? peerSprite.map((line, i) => <PetSpriteLine key={i} line={line} bodyColor={peerColor} />)
           : <Text color="gray">  · · ·  </Text>}
         <Text>{peerName ?? ' '}</Text>
       </Box>

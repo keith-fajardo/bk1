@@ -21,7 +21,7 @@ import {
   petSpriteLookUL, petSpriteLookUR, petSpriteLookDL, petSpriteLookDR,
   renderPetView, isSleeping, isEating,
   feed, play, petSleep, wakePet, rename, autoFeedFromActivity,
-  FOODS, addCoins,
+  FOODS, addCoins, petColorHex, PET_COLOR_NAMES, DEFAULT_PET_COLOR,
   type PetState,
 } from './pet';
 import { disableMouseTracking, parseMouseEvents } from './mouse';
@@ -548,10 +548,11 @@ function PetSpritePanel({ pet, renderHeight }: {
   // Snore column: 3 cells tall (matches the 3 body rows of the sprite — legs row gets
   // a blank pad so the Z's hover next to the head, not the feet).
   const snore = SNORE_FRAMES[snoreFrame];
+  const bodyColor = petColorHex(pet);
   return (
     <Box flexDirection="row">
       <Box flexDirection="column">
-        {sprite.map((line, i) => <PetSpriteLine key={i} line={line} />)}
+        {sprite.map((line, i) => <PetSpriteLine key={i} line={line} bodyColor={bodyColor} />)}
       </Box>
       {sleeping && (
         <Box flexDirection="column" marginLeft={1}>
@@ -755,7 +756,7 @@ function PetStatLine({ prefix, name, gap1, bar, gap2, value }: {
 // For cells where both halves are the same color, a space with that background is
 // preferred — it fills the font line-leading so cells meet flush vertically
 // (the original stripe-elimination trick, applied per cell).
-const PET_BODY  = '#9FE749';
+export const PET_BODY  = '#9FE749';
 const PET_EYE   = '#000000';
 const PET_BLINK = '#FCD34D';
 
@@ -802,16 +803,23 @@ function applyTiredEyes(rows: string[], tired: boolean): string[] {
 
 const PET_SPRITE_SENTINEL = '​'; // zero-width space — sprite-line marker
 
-export function PetSpriteLine({ line }: { line: string }) {
+export function PetSpriteLine({ line, bodyColor }: { line: string; bodyColor?: string }) {
   const payload = line.startsWith(PET_SPRITE_SENTINEL) ? line.slice(1) : line;
+  // Per-pet color override: PET_BODY is the only color that varies across pets
+  // (eyes / blink stay default). Any cell whose fg or bg is PET_BODY gets
+  // remapped to the override; everything else passes through unchanged.
+  const swap = (c: string | undefined): string | undefined =>
+    bodyColor && c === PET_BODY ? bodyColor : c;
   return (
     <Text>
       {[...payload].map((ch, i) => {
         const spec = PET_CELLS[ch];
         if (!spec) return <Text key={i}>{ch}</Text>;
-        if (spec.bg && spec.fg) return <Text key={i} color={spec.fg} backgroundColor={spec.bg}>{spec.glyph}</Text>;
-        if (spec.bg)            return <Text key={i} backgroundColor={spec.bg}>{spec.glyph}</Text>;
-        if (spec.fg)            return <Text key={i} color={spec.fg}>{spec.glyph}</Text>;
+        const bg = swap(spec.bg);
+        const fg = swap(spec.fg);
+        if (bg && fg) return <Text key={i} color={fg} backgroundColor={bg}>{spec.glyph}</Text>;
+        if (bg)       return <Text key={i} backgroundColor={bg}>{spec.glyph}</Text>;
+        if (fg)       return <Text key={i} color={fg}>{spec.glyph}</Text>;
         return <Text key={i}>{spec.glyph}</Text>;
       })}
     </Text>
@@ -2984,6 +2992,17 @@ function App({ onLogout }: { onLogout: () => void }) {
         mode={playroom}
         pet={pet}
         onExit={() => setPlayroom(null)}
+        onCycleColor={() => {
+          // Cycle through the palette and persist. The lobby's useEffect on
+          // pet.color picks this up and re-broadcasts hello to the peer.
+          const current = pet.color ?? DEFAULT_PET_COLOR;
+          const idx = PET_COLOR_NAMES.indexOf(current);
+          const next = PET_COLOR_NAMES[(idx + 1) % PET_COLOR_NAMES.length]!;
+          const updated = { ...pet, color: next };
+          petRef.current = updated;
+          setPet(updated);
+          savePet(updated);
+        }}
       />
     );
   }
