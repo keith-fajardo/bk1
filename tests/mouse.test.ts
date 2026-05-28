@@ -6,7 +6,7 @@ describe('parseMouseEvents (xterm SGR protocol)', () => {
     // Format: ESC [ < button ; col ; row M (press) or m (release)
     const events = parseMouseEvents('\x1b[<0;42;15M');
     expect(events).toHaveLength(1);
-    expect(events[0]).toEqual({ button: 'left', col: 42, row: 15, press: true, motion: false });
+    expect(events[0]).toEqual({ button: 'left', col: 42, row: 15, press: true, motion: false, shift: false, alt: false, ctrl: false });
   });
 
   test('parses release (lowercase m) distinctly from press (uppercase M)', () => {
@@ -37,6 +37,9 @@ describe('parseMouseEvents (xterm SGR protocol)', () => {
     // those off, shift-click reports as "other" and never triggers the pet interaction.
     const events = parseMouseEvents('\x1b[<20;1;1M'); // 16 + 4 = ctrl-shift-left
     expect(events[0]?.button).toBe('left');
+    expect(events[0]?.shift).toBe(true);
+    expect(events[0]?.ctrl).toBe(true);
+    expect(events[0]?.alt).toBe(false);
   });
 
   test('returns empty array when input contains no mouse escape', () => {

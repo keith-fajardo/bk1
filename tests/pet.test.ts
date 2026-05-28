@@ -5,6 +5,7 @@ import { join } from 'path';
 import {
   newPet, tickPet, stage, mood, petFace, petSprite,
   feed, play, petSleep, rename, autoFeedFromActivity,
+  addCoins, spendCoins, STARTING_COINS,
   renderPetView,
   readPetFrom, writePetTo,
   type PetState,
@@ -30,8 +31,48 @@ describe('newPet', () => {
     expect(p.hunger).toBe(0);
     expect(p.happiness).toBe(80);
     expect(p.energy).toBe(100);
+    expect(p.coins).toBe(STARTING_COINS);
     expect(p.born_at).toBe(T0.toISOString());
     expect(p.last_seen).toBe(T0.toISOString());
+  });
+});
+
+describe('coins', () => {
+  test('addCoins increases balance and never goes below zero', () => {
+    const p = newPet(T0);
+    expect(addCoins(p, 50).coins).toBe(STARTING_COINS + 50);
+    expect(addCoins(p, -1000).coins).toBe(0);  // clamp at zero
+  });
+
+  test('spendCoins returns new state when affordable', () => {
+    const p = newPet(T0);
+    const after = spendCoins(p, 40);
+    expect(after).not.toBeNull();
+    expect(after!.coins).toBe(STARTING_COINS - 40);
+  });
+
+  test('spendCoins returns null when balance is insufficient', () => {
+    const p = newPet(T0);
+    expect(spendCoins(p, STARTING_COINS + 1)).toBeNull();
+  });
+
+  test('spendCoins rejects negative costs (would otherwise grant coins)', () => {
+    const p = newPet(T0);
+    expect(spendCoins(p, -10)).toBeNull();
+  });
+
+  test('readPetFrom migrates pet.json without coins to the starter balance', () => {
+    const dir  = mkdtempSync(join(tmpdir(), 'bk1-coins-mig-'));
+    const path = join(dir, 'pet.json');
+    // Simulate a pre-coins pet.json (saved before this feature shipped).
+    writeFileSync(path, JSON.stringify({
+      name: null, born_at: T0.toISOString(), last_seen: T0.toISOString(),
+      hunger: 0, happiness: 80, energy: 100,
+    }), 'utf-8');
+    const loaded = readPetFrom(path);
+    expect(loaded).not.toBeNull();
+    expect(loaded!.coins).toBe(STARTING_COINS);
+    rmSync(dir, { recursive: true, force: true });
   });
 });
 
@@ -48,15 +89,15 @@ describe('tickPet (time-based decay)', () => {
   test('hunger increases linearly with elapsed minutes', () => {
     const p = newPet(T0);
     const t = tickPet(p, minutesLater(60));
-    // 60 min × 0.20/min = 12
-    expect(t.hunger).toBeCloseTo(12, 1);
+    // 60 min × 0.0625/min = 3.75 (tuned for ~3 meals per 24h at FEED_HUNGER_DELTA = -30)
+    expect(t.hunger).toBeCloseTo(3.75, 1);
   });
 
   test('happiness decreases over time toward zero', () => {
     const p = newPet(T0);
     const t = tickPet(p, hoursLater(10));
-    // 600 min × 0.08/min = 48 → 80 - 48 = 32
-    expect(t.happiness).toBeCloseTo(32, 1);
+    // 600 min × (10/(8*60) + 1/30) ≈ 32.5 → 80 - 32.5 ≈ 47.5
+    expect(t.happiness).toBeCloseTo(47.5, 1);
   });
 
   test('extended idle clamps stats at the bounds (no negative happiness, no >100 hunger)', () => {
@@ -230,14 +271,53 @@ describe('petSprite (pixel-art body)', () => {
 describe('interactions', () => {
   test('feed reduces hunger and bumps happiness slightly', () => {
     const p: PetState = { ...newPet(T0), born_at: HATCHED_BORN_AT, hunger: 60, happiness: 50 };
-    const after = feed(p, T0);
+    const { state: after, error } = feed(p, 'meal', T0);
+    expect(error).toBeUndefined();
     expect(after.hunger).toBeLessThan(p.hunger);
     expect(after.happiness).toBeGreaterThan(p.happiness);
   });
 
   test('feed cannot drive hunger below zero', () => {
     const p: PetState = { ...newPet(T0), born_at: HATCHED_BORN_AT, hunger: 5 };
-    expect(feed(p, T0).hunger).toBe(0);
+    expect(feed(p, 'meal', T0).state.hunger).toBe(0);
+  });
+
+  test('feed restores energy by the food-specific amount', () => {
+    const p: PetState = { ...newPet(T0), born_at: HATCHED_BORN_AT, energy: 40, coins: 100 };
+    const snack = feed(p, 'snack', T0);
+    expect(snack.state.energy).toBe(42);  // +2
+    const meal  = feed(p, 'meal',  T0);
+    expect(meal.state.energy).toBe(48);   // +8
+    const feast = feed(p, 'feast', T0);
+    expect(feast.state.energy).toBe(65);  // +25
+  });
+
+  test('feed energy boost is clamped at 100', () => {
+    const p: PetState = { ...newPet(T0), born_at: HATCHED_BORN_AT, energy: 90, coins: 100 };
+    expect(feed(p, 'feast', T0).state.energy).toBe(100);  // +25 → clamp
+  });
+
+  test('feed deducts the food cost from coins', () => {
+    const p: PetState = { ...newPet(T0), born_at: HATCHED_BORN_AT, coins: 50 };
+    const snack = feed(p, 'snack', T0);
+    expect(snack.error).toBeUndefined();
+    expect(snack.state.coins).toBe(45);
+    const feast = feed(p, 'feast', T0);
+    expect(feast.state.coins).toBe(15);
+  });
+
+  test('feed errors and leaves stats unchanged when balance is insufficient', () => {
+    const p: PetState = { ...newPet(T0), born_at: HATCHED_BORN_AT, coins: 3, hunger: 90 };
+    const { state, error } = feed(p, 'meal', T0);  // meal costs 15, only have 3
+    expect(error).toContain('Not enough coins');
+    expect(state.hunger).toBe(90);  // hunger untouched
+    expect(state.coins).toBe(3);    // coins untouched
+  });
+
+  test('feed errors on unknown food id', () => {
+    const p: PetState = { ...newPet(T0), born_at: HATCHED_BORN_AT };
+    const { error } = feed(p, 'banana', T0);
+    expect(error).toContain('Unknown food');
   });
 
   test('play increases happiness and decreases energy', () => {
@@ -285,13 +365,23 @@ describe('interactions', () => {
     // would show stat decay on an egg, implying it was already alive.
     const p: PetState = { ...newPet(T0), hunger: 30, happiness: 50, energy: 70 };
     const later = minutesLater(10);
-    for (const fn of [feed, play, petSleep, autoFeedFromActivity]) {
+    // play / petSleep / autoFeedFromActivity all share (state, now) signature.
+    for (const fn of [play, petSleep, autoFeedFromActivity]) {
       const after = fn(p, later);
       expect(after.hunger).toBe(p.hunger);
       expect(after.happiness).toBe(p.happiness);
       expect(after.energy).toBe(p.energy);
       expect(after.last_seen).toBe(later.toISOString());
     }
+    // feed() returns {state, error?} and takes a foodId — check it separately.
+    // Eggs short-circuit before charging coins, so no error and balance unchanged.
+    const fed = feed(p, 'meal', later);
+    expect(fed.error).toBeUndefined();
+    expect(fed.state.hunger).toBe(p.hunger);
+    expect(fed.state.happiness).toBe(p.happiness);
+    expect(fed.state.energy).toBe(p.energy);
+    expect(fed.state.coins).toBe(p.coins);
+    expect(fed.state.last_seen).toBe(later.toISOString());
   });
 });
 

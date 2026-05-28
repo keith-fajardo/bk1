@@ -1,5 +1,6 @@
 import { useState, useRef, useCallback, useMemo, useEffect } from 'react';
-import { existsSync } from 'fs';
+import { existsSync, mkdirSync, writeFileSync } from 'fs';
+import { spawnSync } from 'node:child_process';
 import { render, Box, Text, Static, useInput, measureElement, type DOMElement } from 'ink';
 import Spinner from 'ink-spinner';
 import type Anthropic from '@anthropic-ai/sdk';
@@ -18,10 +19,13 @@ import {
   petSpriteLookUL, petSpriteLookUR, petSpriteLookDL, petSpriteLookDR,
   renderPetView, isSleeping, isEating,
   feed, play, petSleep, wakePet, rename, autoFeedFromActivity,
+  FOODS, addCoins,
   type PetState,
 } from './pet';
-import { enableMouseTracking, disableMouseTracking, parseMouseEvents } from './mouse';
+import { disableMouseTracking, parseMouseEvents } from './mouse';
 import { GAMES } from './games';
+import { registerCoinEventHandler, emitCoinEvent, COIN_REWARDS, PASSIVE_SESSION_CAP, type CoinEvent } from './coin-events';
+import { parseAnsi, type AnsiSpan } from './ansi';
 
 const MODELS = [
   { id: 'claude-haiku-4-5-20251001', label: 'Haiku 4.5' },
@@ -153,6 +157,37 @@ function GamePicker({ currentIdx }: { currentIdx: number }) {
   );
 }
 
+// Food picker — same shape as GamePicker. Each row shows id + cost + effect
+// so the user can budget against their coin balance before pressing Enter.
+function FoodPicker({ currentIdx, balance }: { currentIdx: number; balance: number }) {
+  const entries = Object.values(FOODS);
+  const labelWidth = Math.max(
+    CMD_COL_WIDTH,
+    ...entries.map(f => `/pet feed ${f.id}`.length + 2),
+  );
+  return (
+    <Box flexDirection="column" marginBottom={0}>
+      {entries.map((f, i) => {
+        const active     = i === currentIdx;
+        const affordable = balance >= f.cost;
+        return (
+          <Box key={f.id} paddingX={2} gap={1}>
+            <Box width={labelWidth} flexShrink={0}>
+              <Text color={active ? '#C0FAD2' : '#5A8060'} bold={active}>/pet feed {f.id}</Text>
+              <Text color="#B9FECF">{active ? ' ●' : '  '}</Text>
+            </Box>
+            <Text color={affordable ? '#FCD34D' : '#7A4747'}>🪙  {f.cost}</Text>
+            <Text color={active ? '#7AB890' : '#3D6650'}>{f.description}</Text>
+          </Box>
+        );
+      })}
+      <Box paddingX={2} marginTop={0}>
+        <Text color="#5A8060">↑↓ navigate · Enter buy · Esc cancel · balance 🪙  {balance}</Text>
+      </Box>
+    </Box>
+  );
+}
+
 const CONFIRM_OPTIONS = [
   { label: 'Yes', color: '#4ADE80', value: 'yes' },
   { label: 'No',  color: '#F87171', value: 'no'  },
@@ -183,12 +218,14 @@ function ConfirmBar({ question, selectedIdx }: { question: string; selectedIdx: 
   );
 }
 
-function HintBar({ isRunning }: { isRunning: boolean }) {
+function HintBar({ isRunning, paneMode }: { isRunning: boolean; paneMode: boolean }) {
   return (
     <Box paddingX={2} paddingBottom={1}>
       {isRunning
         ? <Text color="#3D6650">t  toggle output   Esc  stop agent   Ctrl+C  exit</Text>
-        : <Text color="#3D6650">↵ send   Tab switch mode (plan/build/auto)   ↑↓ navigate   /model ↑↓ switch model   /pet sleep to scroll   Ctrl+C exit</Text>
+        : paneMode
+          ? <Text color="#FCD34D">PANE MODE — wheel/click the dbt pane   Ctrl+P  back to terminal mode   Ctrl+C exit</Text>
+          : <Text color="#3D6650">↵ send   Tab switch mode   ↑↓ navigate   Ctrl+P  pane mode (mouse on dbt pane)   Ctrl+C exit</Text>
       }
     </Box>
   );
@@ -263,6 +300,9 @@ function InputBar({ input, isRunning, mode, modelLabel }: {
   const theme = MODE_THEME[mode];
   const accent = isRunning ? '#5A8060' : theme.accent;
   const text   = isRunning ? '#5A8060' : theme.text;
+  // Cursor is a static block — no blink. Blinking would fire setState on an
+  // interval, forcing Ink to repaint the dynamic frame and wiping any
+  // in-progress terminal selection. Static cursor = no repaint pressure.
   return (
     <Box paddingX={2} gap={1}>
       <Text color={theme.badge} bold>{theme.label}</Text>
@@ -338,50 +378,49 @@ function isGreeting(raw: string): boolean {
   return GREETING_PATTERNS.some(re => re.test(stripped));
 }
 
+// Module-level mutable mouse position for the pet's eye tracking. Updated
+// directly by the raw mouse handler (no setState → no Ink re-render → no
+// flicker). PetSpritePanel reads `.col` / `.row` at render time, so the eye
+// direction picks up the latest cursor position on whatever next render
+// happens (blink scheduler, eating tick, parent prop change, etc.). The
+// trade-off is eye tracking that's lazy rather than real-time — eyes
+// "freeze" at the last known direction until another render happens.
+const petMousePos: { col: number | null; row: number | null } = { col: null, row: null };
+
+
 const PET_CENTER_COL  = 7;
 const PET_DEAD_ZONE_X = 1;
 const PET_DEAD_ZONE_Y = 1;
 
-function PetSpritePanel({ pet, mouseCol, mouseRow, renderHeight }: {
+function PetSpritePanel({ pet, renderHeight }: {
   pet: PetState;
-  mouseCol: number | null;
-  mouseRow: number | null;
   renderHeight: number;
 }) {
-  const [blinking, setBlinking] = useState(false);
+  // Read mouse position from the module-level mutable object. Reads happen at
+  // render time, so the eye direction reflects whatever position the motion
+  // handler last wrote — without that handler having to trigger a re-render.
+  const { col: mouseCol, row: mouseRow } = petMousePos;
+  // Blink animation removed — see no-interval comment below. Pet's eyes stay
+  // open. The blinking flag is kept (constant false) so the rest of the sprite
+  // picker code that references it remains compile-clean.
+  const blinking = false;
   // Snore frame cycler. Also doubles as a re-render tick while sleeping so the panel
   // naturally drops out of the sleep frame when sleeping_until elapses (isSleeping
   // re-evaluates on each tick and flips to false).
-  const [snoreFrame, setSnoreFrame] = useState(0);
+  // Snore frame is held at 0 instead of cycling — see the no-interval comment
+  // below. Index into SNORE_FRAMES still drives the rendered "Z" column.
+  const snoreFrame = 0;
   // Same idea for the chewing animation — cycles every ~300ms while eating_until is
   // in the future, then naturally drops back to the static sprite when it elapses.
   const [eatingFrame, setEatingFrame] = useState(0);
   const sleeping = isSleeping(pet);
   const eating   = isEating(pet) && !sleeping;
 
-  useEffect(() => {
-    let pending: ReturnType<typeof setTimeout>;
-    function schedule() {
-      const delay = 3000 + Math.random() * 3000;
-      pending = setTimeout(() => {
-        setBlinking(true);
-        pending = setTimeout(() => {
-          setBlinking(false);
-          schedule();
-        }, 180);
-      }, delay);
-    }
-    schedule();
-    return () => clearTimeout(pending);
-  }, []);
-
-  useEffect(() => {
-    if (!sleeping) return;
-    const id = setInterval(() => {
-      setSnoreFrame(f => (f + 1) % SNORE_FRAMES.length);
-    }, 500);
-    return () => clearInterval(id);
-  }, [sleeping]);
+  // Blink scheduler removed — was the last idle-state setState in bk1's
+  // dynamic frame. With it gone, an idle pet awake (no agent run, no dbt
+  // streaming) produces zero React state changes per second, which means zero
+  // Ink repaints, which means terminal text selection survives indefinitely.
+  // Snore animation intentionally not run for the same reason.
 
   useEffect(() => {
     if (!eating) return;
@@ -438,7 +477,7 @@ function PetSpritePanel({ pet, mouseCol, mouseRow, renderHeight }: {
     }
   }
 
-  const sprite =
+  const baseSprite =
     frame === 'sleep'  ? petSpriteSleep(pet) :
     frame === 'eating' ? petSpriteEating(pet, eatingFrame) :
     frame === 'blink'  ? petSpriteBlink(pet) :
@@ -451,6 +490,16 @@ function PetSpritePanel({ pet, mouseCol, mouseRow, renderHeight }: {
     frame === 'lookDL' ? petSpriteLookDL(pet) :
     frame === 'lookDR' ? petSpriteLookDR(pet) :
                          petSprite(pet);
+  // Mood eye overrides — apply on top of the look-direction sprite.
+  //   tired (energy === 0): H eyes — same drowsy eyelid as sleep.
+  //   hungry (hunger ≥ 80): S eyes — spiral.
+  // Tired runs first so its H eyes stick when both conditions hit (hungry's
+  // V/M→S no-ops on H). Sleep + eating sprites already use H/W/T glyphs that
+  // neither pass touches, so deliberate animations stay intact even while
+  // tired or hungry.
+  const tired  = pet.energy === 0 && !sleeping && !eating;
+  const hungry = pet.hunger >= 80 && !sleeping && !eating;
+  const sprite = applyHungryEyes(applyTiredEyes(baseSprite, tired), hungry);
 
   // Snore column: 3 cells tall (matches the 3 body rows of the sprite — legs row gets
   // a blank pad so the Z's hover next to the head, not the feet).
@@ -470,12 +519,11 @@ function PetSpritePanel({ pet, mouseCol, mouseRow, renderHeight }: {
   );
 }
 
-function StatusFooter({ sessionUsd, pet, mouseCol, mouseRow, renderHeight }: {
+function StatusFooter({ sessionUsd, pet, renderHeight, coinToast }: {
   sessionUsd: number;
   pet: PetState;
-  mouseCol: number | null;
-  mouseRow: number | null;
   renderHeight: number;
+  coinToast: { delta: number; reason: string } | null;
 }) {
   // 2-frame chewing animation: while isEating(pet) is true, swap the kaomoji
   // between `(•~•)` and `(•∽•)` every 300 ms. The interval also doubles as the
@@ -493,7 +541,7 @@ function StatusFooter({ sessionUsd, pet, mouseCol, mouseRow, renderHeight }: {
   const petLabel = pet.name ?? 'pet';
   return (
     <Box paddingX={2} gap={2} marginTop={1}>
-      <PetSpritePanel pet={pet} mouseCol={mouseCol} mouseRow={mouseRow} renderHeight={renderHeight} />
+      <PetSpritePanel pet={pet} renderHeight={renderHeight} />
       {/* Info column sits to the right of the animated sprite. Bottom-aligned so the
           existing single-line readout lines up with the bottom edge of the sprite
           panel rather than floating mid-air. */}
@@ -501,6 +549,13 @@ function StatusFooter({ sessionUsd, pet, mouseCol, mouseRow, renderHeight }: {
         <Box gap={1}>
           <Text color="#E76F51">{petLabel}:</Text>
           <Text color="#FF9F40">{face}</Text>
+          <Text color="#3D6650">·</Text>
+          <Text color="#FCD34D">💰  {pet.coins}</Text>
+          {coinToast && (
+            <Text color={coinToast.delta >= 0 ? '#4ADE80' : '#F87171'} bold>
+              {coinToast.delta >= 0 ? '+' : ''}{coinToast.delta} ({coinToast.reason})
+            </Text>
+          )}
           <Text color="#3D6650">·</Text>
           {sessionUsd > 0 && (
             <>
@@ -679,8 +734,27 @@ const PET_CELLS: Record<string, CellSpec> = {
   Y: { glyph: '▀', fg: PET_BLINK, bg: PET_BODY },  // eye-blink | body
   U: { glyph: '▀', fg: PET_BODY },                 // body | empty (legacy: legs / sprite top)
   L: { glyph: '▄', fg: PET_BODY },                 // empty | body  (leg hanging below body)
+  S: { glyph: '꩜', fg: PET_EYE,  bg: PET_BODY },  // U+AA5C spiral — hungry-mood eye glyph
   ' ': { glyph: ' ' },                              // empty | empty
 };
+
+// Post-process a decoded sprite to swap eye glyphs when the pet is hungry.
+// Replaces V (top-half eye) and M (bottom-half eye) with S (spiral). Leaves
+// H (sleep eyelid) and Y (blink) alone so sleep/blink frames stay intact —
+// hungry is a continuous-state mood, sleep/blink are deliberate overrides.
+function applyHungryEyes(rows: string[], hungry: boolean): string[] {
+  if (!hungry) return rows;
+  return rows.map(row => row.replace(/[VM]/g, 'S'));
+}
+
+// Same idea for "tired" — energy bottomed out at 0. Eyes become H (the same
+// drowsy eyelid the sleep sprite uses). Apply this BEFORE applyHungryEyes
+// so when both conditions hit, H stays (hungry's V/M→S no-ops on H). Tired
+// = passive collapse, more severe than hungry, so it wins.
+function applyTiredEyes(rows: string[], tired: boolean): string[] {
+  if (!tired) return rows;
+  return rows.map(row => row.replace(/[VM]/g, 'H'));
+}
 
 const PET_SPRITE_SENTINEL = '​'; // zero-width space — sprite-line marker
 
@@ -980,12 +1054,261 @@ function SemanticProgressBar({ progress }: { progress: SemanticProgress }) {
   );
 }
 
+// ─── dbt log pane ────────────────────────────────────────────────────────────
+//
+// Right-side panel that streams output from `dbt …` commands the user types
+// directly into the prompt. Lives in the dynamic frame (top-right) so it
+// re-renders as new lines arrive without affecting the Static message scroll.
+// ANSI colors from dbt are parsed and re-rendered as Ink spans — PASS green /
+// FAIL red / WARN yellow all survive the pipe.
+
+// Horizontal slice that respects ANSI span boundaries: drops the first `offset`
+// visible characters across spans without losing colors on what remains.
+function sliceSpansH(spans: AnsiSpan[], offset: number): AnsiSpan[] {
+  if (offset <= 0) return spans;
+  const out: AnsiSpan[] = [];
+  let drop = offset;
+  for (const sp of spans) {
+    if (drop >= sp.text.length) { drop -= sp.text.length; continue; }
+    out.push({ ...sp, text: sp.text.slice(drop) });
+    drop = 0;
+  }
+  return out;
+}
+
+function DbtLogPane({ logs, running, width, height, scrollV, scrollH, copyFlash, paneMode, searchQuery }: {
+  logs: string[]; running: boolean; width: number; height: number;
+  scrollV: number; scrollH: number; copyFlash: boolean; paneMode: boolean;
+  searchQuery: string;
+}) {
+  const q = searchQuery.toLowerCase();
+  const searchActive = q.length > 0;
+  const matchCount = searchActive
+    ? logs.reduce((n, l) => n + (l.toLowerCase().includes(q) ? 1 : 0), 0)
+    : 0;
+  // scrollV is "lines back from bottom". end excludes the trailing N lines.
+  const end = Math.max(0, logs.length - scrollV);
+  const start = Math.max(0, end - height);
+  const visible = logs.slice(start, end);
+  const atBottom = scrollV === 0;
+  const totalBack = logs.length;
+
+  // Vertical scrollbar thumb. Track length is FIXED at `height` (matches the
+  // log-rows area, which always renders `height` rows). Earlier this used
+  // visible.length which grew with log count, causing the whole pane to change
+  // height row-by-row during a dbt run.
+  const needsBar = logs.length > height;
+  const trackLen = height;
+  let thumbStart = 0, thumbLen = trackLen;
+  if (needsBar) {
+    thumbLen = Math.max(1, Math.round((height / logs.length) * trackLen));
+    const maxThumb = trackLen - thumbLen;
+    const maxScrollV = logs.length - height;
+    const ratio = maxScrollV > 0 ? scrollV / maxScrollV : 0;
+    thumbStart = Math.round((1 - ratio) * maxThumb);
+  }
+
+  // Horizontal scrollbar. Spans the full pane width inside the borders
+  // (width - 2), so it reaches edge-to-edge — no inset gap from padding.
+  // The thumb represents scroll position against the widest visible log line.
+  // Raw line length is used as a width proxy (ANSI codes inflate it slightly,
+  // so the thumb runs a touch smaller than the "true" content — acceptable
+  // for a position indicator).
+  const hBarWidth = Math.max(1, width - 2);
+  // -2 border, -2 padding, -2 v-scrollbar = -6 (v-scrollbar is now 2 cols wide
+  // so it visually matches the h-scrollbar's 1-row thickness).
+  const contentWidth = Math.max(1, width - 6);
+  // Strip ANSI escape codes before measuring line length — without this, a
+  // colored 20-char line measures as 50+ raw chars and the h-scrollbar lets
+  // the user "scroll right" into 30 cols of blank space that don't exist.
+  const stripAnsi = (s: string) => s.replace(/\x1b\[[\d;?]*[A-Za-z~]/g, '');
+  const maxLineVisible = logs.reduce((m, l) => Math.max(m, stripAnsi(l).length), 0);
+  const hNeedsBar = maxLineVisible > contentWidth;
+  let hThumbStart = 0, hThumbLen = hBarWidth;
+  if (hNeedsBar) {
+    // Minimum thumb length of 4 so it's always visually grab-able.
+    hThumbLen = Math.max(4, Math.round((contentWidth / maxLineVisible) * hBarWidth));
+    const hMaxThumb = Math.max(0, hBarWidth - hThumbLen);
+    const hRange = Math.max(1, maxLineVisible - contentWidth);
+    hThumbStart = Math.min(hMaxThumb, Math.round((scrollH / hRange) * hMaxThumb));
+  }
+
+  return (
+    <Box flexDirection="column" width={width} borderStyle="round" borderColor="#3D6650">
+      {/* Top section: header + log content + vertical scrollbar as a row */}
+      <Box flexDirection="row">
+        <Box flexDirection="column" flexGrow={1} paddingX={1}>
+          <Box gap={1}>
+            <Text bold color="#B9FECF">dbt logs</Text>
+            {running
+              ? <Text color="#FCD34D"><Spinner type="dots" /></Text>
+              : <Text color="#3D6650">· idle</Text>}
+            {!atBottom && (
+              <Text color="#5A8060">↕ {Math.max(1, end)}/{totalBack}</Text>
+            )}
+            {scrollH > 0 && <Text color="#5A8060">→ col {scrollH}</Text>}
+            {searchActive && (
+              <Text color="#FCD34D">/{searchQuery}/ {matchCount}</Text>
+            )}
+            <Box flexGrow={1} />
+            {copyFlash
+              ? <Text color="#4ADE80">copied!</Text>
+              : paneMode
+                ? <Text color="#7AB890">[copy]</Text>
+                : <Text color="#5A8060">Ctrl+P to scroll</Text>}
+          </Box>
+          {/* Always render exactly `height` rows. Blank rows render as a
+              single space so the pane's vertical dimension stays constant
+              from the first frame onward — no growing-pane drift. */}
+          {Array.from({ length: height }, (_, i) => {
+            const line = visible[i];
+            // For missing entries (logs.length < height) render an explicit
+            // single-space row so Ink reserves a row of vertical space.
+            if (line === undefined) return <Text key={i}>{' '}</Text>;
+
+            const isMatch = searchActive && line.toLowerCase().includes(q);
+            const leftClip = scrollH > 0;
+
+            // Match rendering — whole line forced yellow + bold.
+            if (isMatch) {
+              const tail = line.slice(scrollH).replace(/\x1b\[[\d;?]*[A-Za-z~]/g, '');
+              return (
+                <Text key={i} wrap="truncate-end" color="#FCD34D" bold>
+                  {leftClip ? '…' : ''}{tail || ' '}
+                </Text>
+              );
+            }
+
+            // Normal rendering. Compute the ANSI-stripped visible tail length
+            // so we can detect rows that became empty after h-scrolling — and
+            // render them as a single-space row instead of nothing (Ink
+            // collapses empty <Text> to 0 rows, which made the pane look
+            // shorter when many lines were shorter than scrollH).
+            const stripAnsi = (s: string) => s.replace(/\x1b\[[\d;?]*[A-Za-z~]/g, '');
+            const visibleLen = stripAnsi(line).length - scrollH;
+            if (visibleLen <= 0) {
+              // Whole row scrolled off — render `…` (if scrolled) or a blank
+              // space, guaranteed to occupy 1 row.
+              return <Text key={i} wrap="truncate-end" color="#5A8060">{leftClip ? '…' : ' '}</Text>;
+            }
+
+            return (
+              <Text key={i} wrap="truncate-end">
+                {leftClip && <Text color="#5A8060">…</Text>}
+                {sliceSpansH(parseAnsi(line), scrollH).map((sp, j) => (
+                  <Text key={j} color={sp.color} bold={sp.bold} dimColor={sp.dim}>{sp.text}</Text>
+                ))}
+              </Text>
+            );
+          })}
+        </Box>
+        {/* Vertical scrollbar column. 2 cols wide so its visual thickness
+            matches the h-scrollbar's 1-row thickness (1 col would look thin
+            since terminal cells are ~2x taller than they are wide). */}
+        <Box flexDirection="column" width={2} flexShrink={0}>
+          <Text> </Text>{/* spacer to align track with log rows, not header */}
+          {Array.from({ length: trackLen }, (_, i) => {
+            const isThumb = needsBar && i >= thumbStart && i < thumbStart + thumbLen;
+            return (
+              <Text key={i} color={isThumb ? '#FCD34D' : '#5A8060'} bold={isThumb}>
+                {isThumb ? '██' : '││'}
+              </Text>
+            );
+          })}
+        </Box>
+      </Box>
+      {/* Bottom section: horizontal scrollbar — spans the full pane width
+          inside the borders (not constrained by the inner column's padding),
+          so it visually reaches edge-to-edge. */}
+      <Box>
+        {Array.from({ length: hBarWidth }, (_, i) => {
+          const isThumb = hNeedsBar && i >= hThumbStart && i < hThumbStart + hThumbLen;
+          // Thumb uses solid block (█) which is unambiguously distinct from
+          // the rounded-border ─ glyph that sits just below the h-scrollbar.
+          // Color contrast (yellow vs olive) reinforces this.
+          return isThumb
+            ? <Text key={i} color="#FCD34D" bold>█</Text>
+            : <Text key={i} color="#5A8060">─</Text>;
+        })}
+      </Box>
+    </Box>
+  );
+}
+
 // ─── Login screen ────────────────────────────────────────────────────────────
 //
 // Shown before the main TUI when no API key is found in env or ~/.bk1/auth.json.
 // Uses its own useInput handler so none of the main App's input plumbing (cursor,
 // history, suggestions, etc.) is touched. Renders asterisks for the typed/pasted
 // key — the actual value is held only in component state, never logged.
+
+// ─── Conversation review mode (full-screen scrollable history) ──────────────
+//
+// Triggered by `/review` (or `/scroll`). Replaces the normal TUI with a single
+// scrollable list of every message in the session. Exists so users can read
+// back through long agent output (lint findings, analyses) without relying on
+// VS Code's terminal scrollback — which may be disabled, remapped, or eaten by
+// bk1's mouse-tracking mode. Scroll via ↑↓/PgUp/PgDn/Home/End. Esc returns to
+// the normal TUI.
+
+function ReviewMode({ messages, onExit }: { messages: Message[]; onExit: () => void }) {
+  // Flatten each message into individual terminal lines so we can window by
+  // line count (not message count). Long messages no longer count as a single
+  // PgDn step — you scroll past them one line at a time.
+  const lines = useMemo(() => {
+    const out: { kind: 'user' | 'assistant'; text: string }[] = [];
+    for (const msg of messages) {
+      const split = msg.content.split('\n');
+      if (msg.role === 'user') {
+        split.forEach((line, i) => {
+          out.push({ kind: 'user', text: i === 0 ? `> ${line}` : `  ${line}` });
+        });
+      } else {
+        for (const line of split) out.push({ kind: 'assistant', text: line });
+      }
+      out.push({ kind: 'assistant', text: '' });
+    }
+    return out;
+  }, [messages]);
+
+  const termRows = process.stdout.rows ?? 24;
+  // Reserve 1 row for header + 1 row for spacing + 1 row for hint footer.
+  const visibleHeight = Math.max(1, termRows - 4);
+  const maxOffset = Math.max(0, lines.length - visibleHeight);
+  // Start at the bottom of the conversation so the latest content is on screen.
+  const [offset, setOffset] = useState(maxOffset);
+
+  useInput((_input, key) => {
+    if (key.escape) { onExit(); return; }
+    if (key.upArrow)   setOffset(o => Math.max(0, o - 1));
+    if (key.downArrow) setOffset(o => Math.min(maxOffset, o + 1));
+    if (key.pageUp)    setOffset(o => Math.max(0, o - visibleHeight + 1));
+    if (key.pageDown)  setOffset(o => Math.min(maxOffset, o + visibleHeight - 1));
+  });
+
+  const visible = lines.slice(offset, offset + visibleHeight);
+  const last = Math.min(offset + visibleHeight, lines.length);
+
+  return (
+    <Box flexDirection="column">
+      <Box paddingX={2} gap={1}>
+        <Text bold color="#B9FECF">Conversation Review</Text>
+        <Text color="#5A8060">·</Text>
+        <Text color="#5A8060">lines {offset + 1}–{last} of {lines.length}</Text>
+      </Box>
+      <Box flexDirection="column" paddingX={2}>
+        {visible.map((entry, i) => (
+          entry.kind === 'user'
+            ? <Text key={i} color="#C0FAD2" wrap="wrap">{entry.text || ' '}</Text>
+            : <RichLine key={i} line={entry.text} />
+        ))}
+      </Box>
+      <Box paddingX={2} marginTop={1}>
+        <Text color="#3D6650">↑↓ scroll · PgUp/PgDn page · Esc exit</Text>
+      </Box>
+    </Box>
+  );
+}
 
 function LoginScreen({ onLogin }: { onLogin: (key: string) => void }) {
   const [value, setValue] = useState('');
@@ -1123,11 +1446,46 @@ function App({ onLogout }: { onLogout: () => void }) {
   const [mode, setMode] = useState<Mode>('plan');
   const [modelIdx, setModelIdx] = useState(DEFAULT_MODEL_IDX);
   const [petPlayIdx, setPetPlayIdx] = useState(0);
+  const [petFeedIdx, setPetFeedIdx] = useState(0);
   const [semanticProgress, setSemanticProgress] = useState<SemanticProgress | null>(null);
   const [lintProgress, setLintProgress] = useState<LintProgress | null>(null);
   const [confirmPrompt, setConfirmPrompt] = useState<string | null>(null);
   const [confirmSelected, setConfirmSelected] = useState(0);
   const [liveTokens, setLiveTokens] = useState<TokenTotals | null>(null);
+  // dbt passthrough: typed `dbt …` commands run as subprocesses (no LLM, no tokens)
+  // and stream into the right-side log pane. dbtRunning is separate from isRunning
+  // so the user can keep chatting while a long dbt build runs.
+  const [dbtLogs, setDbtLogs] = useState<string[]>([]);
+  const [dbtRunning, setDbtRunning] = useState(false);
+  // Scroll offsets for DbtLogPane. scrollV is "lines back from bottom" (0 = follow tail);
+  // scrollH is "characters scrolled right" (0 = at left edge). New lines auto-stick to
+  // bottom only when scrollV is already 0 — otherwise the user's read position is held.
+  const [dbtScrollV, setDbtScrollV] = useState(0);
+  const [dbtScrollH, setDbtScrollH] = useState(0);
+  // Search query for highlighting matching lines in the dbt log pane. Set via
+  // the /find command; empty string disables highlighting.
+  const [dbtSearchQuery, setDbtSearchQuery] = useState('');
+  // Bounds of the rendered pane in terminal coordinates, captured at paint time so the
+  // raw mouse handler (which only knows screen col/row) can route wheel + clicks to it.
+  const dbtPaneBoundsRef = useRef<{
+    top: number; bottom: number; left: number; right: number;
+    copyLeft: number; copyRight: number; copyRow: number;
+    // Vertical scrollbar: scrollCol is the column; track[Top|Bottom] are the
+    // first/last track cell rows. Horizontal scrollbar: hbarRow is its row;
+    // hbar[Left|Right] are the first/last cells. Used by the drag handler.
+    scrollCol: number; trackTop: number; trackBottom: number;
+    hbarRow: number; hbarLeft: number; hbarRight: number;
+  } | null>(null);
+  // 'v' = dragging vertical scrollbar (cursor row → scrollV).
+  // 'h' = dragging horizontal scrollbar (cursor col → scrollH).
+  // null = not dragging.
+  const dbtDragRef = useRef<'v' | 'h' | null>(null);
+  const [copyFlash, setCopyFlash] = useState(false);
+  // Mirror dbtLogs into a ref so the raw-stdin mouse handler (mounted once with
+  // empty deps) can read the current value without re-binding on every append.
+  const dbtLogsRef = useRef<string[]>([]);
+  useEffect(() => { dbtLogsRef.current = dbtLogs; }, [dbtLogs]);
+  const dbtProcRef = useRef<ReturnType<typeof Bun.spawn> | null>(null);
 
   const inputRef = useRef('');
   const isRunningRef = useRef(false);
@@ -1156,7 +1514,14 @@ function App({ onLogout }: { onLogout: () => void }) {
   // ready-made hook, so we listen to stdout's resize event ourselves.
   const [terminalRows, setTerminalRows] = useState(process.stdout.rows ?? 24);
   useEffect(() => {
-    const onResize = () => setTerminalRows(process.stdout.rows ?? 24);
+    const onResize = () => {
+      // Ink can't reliably erase its previous dynamic frame across a resize —
+      // the old row count no longer matches the new viewport, so ghost frames
+      // (e.g. a stale DbtLogPane) leak into the scrollback. Clear once so the
+      // next paint starts from a known-clean screen.
+      process.stdout.write('\x1b[2J\x1b[H');
+      setTerminalRows(process.stdout.rows ?? 24);
+    };
     process.stdout.on('resize', onResize);
     return () => { process.stdout.off('resize', onResize); };
   }, []);
@@ -1169,8 +1534,17 @@ function App({ onLogout }: { onLogout: () => void }) {
   const modelIdxRef = useRef(DEFAULT_MODEL_IDX);
   const modeRef = useRef<Mode>('plan');
   const abortRef = useRef<AbortController | null>(null);
+  // Game / food picker selection — used inside the /pet play and /pet feed
+  // handlers in submit(). Without these refs, submit captures the initial
+  // picker indices (always 0) and ignores arrow-key navigation, so picking
+  // "exam" still launched "fetch" and picking any non-first food always used
+  // the first food.
+  const petPlayIdxRef = useRef(0);
+  const petFeedIdxRef = useRef(0);
   useEffect(() => { modelIdxRef.current = modelIdx; }, [modelIdx]);
   useEffect(() => { modeRef.current = mode; }, [mode]);
+  useEffect(() => { petPlayIdxRef.current = petPlayIdx; }, [petPlayIdx]);
+  useEffect(() => { petFeedIdxRef.current = petFeedIdx; }, [petFeedIdx]);
   // Lint phase tracking refs — readable inside the memoised submit callback
   const lintProgressRef = useRef<LintProgress | null>(null);
   const lastModelStateActionRef = useRef<string | null>(null);
@@ -1206,6 +1580,38 @@ function App({ onLogout }: { onLogout: () => void }) {
   const petRef = useRef(pet);
   useEffect(() => { petRef.current = pet; }, [pet]);
 
+  // Transient toast surfaced when a coin event fires (lint fix, push, etc.).
+  // Auto-clears after a few seconds so it doesn't linger past the moment.
+  const [coinToast, setCoinToast] = useState<{ delta: number; reason: string } | null>(null);
+
+  // Track cumulative passive earnings (model add/update) this session — capped
+  // at PASSIVE_SESSION_CAP so a refactor that touches 100 files doesn't dump
+  // 500 coins. Lint fixes, pushes, dbt runs are NOT capped (they reflect real
+  // work). Resets on app restart, intentionally — the cap is per-session.
+  const passiveEarnedRef = useRef(0);
+
+  // Register the coin-event handler once at mount. State.ts (lint pipeline)
+  // and future emitters (git poll, dbt tool wrappers) call emitCoinEvent;
+  // this handler applies the delta to the pet and shows a transient toast.
+  useEffect(() => {
+    registerCoinEventHandler((event: CoinEvent) => {
+      let delta = event.delta;
+      if (event.countsTowardPassiveCap && delta > 0) {
+        const headroom = Math.max(0, PASSIVE_SESSION_CAP - passiveEarnedRef.current);
+        delta = Math.min(delta, headroom);
+        passiveEarnedRef.current += delta;
+        if (delta === 0) return;  // cap hit — silently drop
+      }
+      const next = addCoins(petRef.current, delta);
+      petRef.current = next;
+      setPet(next);
+      savePet(next);
+      setCoinToast({ delta, reason: event.reason });
+      setTimeout(() => setCoinToast(c => (c && c.reason === event.reason ? null : c)), 4_000);
+    });
+    return () => registerCoinEventHandler(null);
+  }, []);
+
   // Active pet mini-game (currently 'fetch'). When set, the game owns the screen +
   // input; the welcome / conversation view is suppressed and the App-level mouse
   // handler short-circuits via activeGameRef so clicks don't double-fire as both
@@ -1215,33 +1621,65 @@ function App({ onLogout }: { onLogout: () => void }) {
   const activeGameRef = useRef<string | null>(null);
   useEffect(() => { activeGameRef.current = activeGame; }, [activeGame]);
 
+  // Full-screen scrollable conversation view (triggered by /review or /scroll).
+  // Replaces the normal TUI with a keyboard-navigable history so users don't
+  // depend on VS Code's terminal scrollback to read back through long sessions.
+  const [reviewMode, setReviewMode] = useState(false);
+  // Pane mode toggle. When ON, bk1 enables xterm mouse tracking so the dbt
+  // log pane's wheel/click/scrollbar/copy button respond again — at the cost
+  // of the terminal's native scroll/select. When OFF (default), no mouse
+  // tracking, native terminal everything. Toggled via Ctrl+P in useInput.
+  const [paneMode, setPaneMode] = useState(false);
+
+  // Unified mouse-tracking lifecycle. Tracking is ON if EITHER a pet mini-game
+  // is active (fetch needs to receive clicks) OR pane mode is on (dbt pane
+  // wheel/click/scrollbar). Otherwise OFF, so the terminal handles wheel/select
+  // natively (Claude Code-style). This replaces the per-callsite enable/disable
+  // calls that were leaving the terminal stuck in inconsistent states.
+  useEffect(() => {
+    const want = activeGame !== null || paneMode;
+    if (want === mouseTrackingOnRef.current) return;
+    if (want) {
+      void import('./mouse').then(m => {
+        m.enableMouseTracking(process.stdout);
+        mouseTrackingOnRef.current = true;
+      });
+    } else {
+      disableMouseTracking(process.stdout);
+      mouseTrackingOnRef.current = false;
+    }
+  }, [activeGame, paneMode]);
+
   // Re-evaluate the desired mouse-mode state whenever the pet flips between awake and
   // asleep. Polled once per second while the effect is active to catch natural wake-up
   // (sleeping_until elapses) without lifting the sleep timer into App-level reactivity.
+  // Grace period: if the user has scrolled the dbt log pane in the last 3s we keep mouse
+  // tracking ON even if the pet is "asleep" — otherwise tracking would flip off mid-scroll
+  // and the next wheel tick would go to the terminal instead of the pane.
   const mouseTrackingOnRef = useRef(false);
+  const lastPaneScrollAtRef = useRef(0);
+  // Called on every dbt-pane scroll interaction (wheel or keyboard). Stamps the
+  // grace-period ref so the mouse-tracking poll keeps tracking ON for ~3s after
+  // the last scroll. (Previously this also put the pet to sleep — that was a
+  // workaround for eye-tracking flicker, which the direct-stdout pet overlay
+  // now handles. Auto-sleeping on scroll just disabled mouse tracking after 3s
+  // and broke the user's ability to keep scrolling the pane with the mouse.)
+  const markPaneScroll = useCallback(() => {
+    lastPaneScrollAtRef.current = Date.now();
+  }, []);
+  // Mouse tracking is intentionally never enabled. Claude Code and other
+  // well-behaved terminal apps don't capture the mouse, which lets VS Code's
+  // terminal scrollback, native text selection, and wheel scroll keep working.
+  // The cost: bk1's click-driven features (pet tap, [copy] click, scrollbar
+  // drag) no longer fire — they all have keyboard equivalents (`/pet play`,
+  // `Ctrl+Y` for copy, `PgUp/PgDn`/`Shift+↑↓` for pane scroll). Run a one-shot
+  // disable in case a previous bk1 session left the terminal in mouse mode.
   useEffect(() => {
-    const apply = () => {
-      const wantOn = !isSleeping(petRef.current);
-      if (wantOn !== mouseTrackingOnRef.current) {
-        mouseTrackingOnRef.current = wantOn;
-        if (wantOn) enableMouseTracking(process.stdout);
-        else        disableMouseTracking(process.stdout);
-      }
-    };
-    apply();
-    const id = setInterval(apply, 1000);
-    return () => clearInterval(id);
-  }, [pet.sleeping_until]);
+    disableMouseTracking(process.stdout);
+    mouseTrackingOnRef.current = false;
+  }, []);
 
   // Live mouse cursor position — drives the pet's eye-tracking. `null` means we haven't
-  // seen any motion event yet (eyes stay centered). Throttled to 250 ms because every
-  // motion update re-renders the whole App tree (Ink writes cursor + content escapes
-  // to stdout each pass) and at 10Hz that's visible as terminal flicker. The pet only
-  // has 9 eye positions, so 4Hz is plenty of resolution.
-  const [mouseCol, setMouseCol] = useState<number | null>(null);
-  const [mouseRow, setMouseRow] = useState<number | null>(null);
-  const lastMouseUpdateRef = useRef(0);
-
   // Mouse click → pet interaction. Mouse motion → eye tracking.
   //
   // Listen to raw stdin and parse xterm SGR mouse escape sequences. A left-press
@@ -1261,34 +1699,136 @@ function App({ onLogout }: { onLogout: () => void }) {
       // and re-render the bottom bar mid-game).
       if (activeGameRef.current) return;
       const events = parseMouseEvents(data.toString('utf8'));
+      // Maps a terminal row inside the scrollbar track onto scrollV. Top of track
+      // = oldest content (max scrollV); bottom = newest (scrollV=0). Used by both
+      // the initial press and motion-while-dragging branches below.
+      const rowToScrollV = (row: number): number | null => {
+        const b = dbtPaneBoundsRef.current;
+        if (!b) return null;
+        const paneHeight = b.trackBottom - b.trackTop + 1;
+        const maxScrollV = Math.max(0, dbtLogsRef.current.length - paneHeight);
+        const range = b.trackBottom - b.trackTop;
+        if (range <= 0) return 0;
+        const clamped = Math.max(b.trackTop, Math.min(b.trackBottom, row));
+        const ratio = (clamped - b.trackTop) / range; // 0 at top, 1 at bottom
+        return Math.round((1 - ratio) * maxScrollV);
+      };
+      // Horizontal twin of rowToScrollV — maps cursor col on the h-scrollbar
+      // onto scrollH. Max scrollH = widest log line minus the pane's visible
+      // content cols (border + padding + v-scrollbar = ~5 cols of chrome).
+      const colToScrollH = (col: number): number | null => {
+        const b = dbtPaneBoundsRef.current;
+        if (!b) return null;
+        const range = b.hbarRight - b.hbarLeft;
+        if (range <= 0) return 0;
+        const contentW = Math.max(1, (b.right - b.left + 1) - 5);
+        // Strip ANSI escape codes so the max-scroll bound matches the actual
+        // visible content width (not the raw string length, which is inflated
+        // by color escapes and would let the user scroll into empty space).
+        const stripAnsi = (s: string) => s.replace(/\x1b\[[\d;?]*[A-Za-z~]/g, '');
+        const maxLine = dbtLogsRef.current.reduce((m, l) => Math.max(m, stripAnsi(l).length), 0);
+        const maxScrollH = Math.max(0, maxLine - contentW);
+        const clamped = Math.max(b.hbarLeft, Math.min(b.hbarRight, col));
+        const ratio = (clamped - b.hbarLeft) / range;
+        return Math.round(ratio * maxScrollH);
+      };
       for (const ev of events) {
-        if (ev.motion) {
-          // Throttle: at most one state update per 250ms — mouse-move can fire >60Hz
-          // and every update re-renders the App tree (visible flicker in the terminal).
-          const now = Date.now();
-          if (now - lastMouseUpdateRef.current >= 250) {
-            lastMouseUpdateRef.current = now;
-            setMouseCol(ev.col);
-            setMouseRow(ev.row);
-          }
+        // Release event (any button): always clear an in-progress scrollbar drag so
+        // the next motion event doesn't keep dragging without a held button.
+        if (!ev.press && !ev.motion) {
+          if (dbtDragRef.current) dbtDragRef.current = null;
           continue;
         }
-        // Wheel = user wants to scroll. Put the pet to sleep, which releases all
-        // mouse modes so subsequent wheel ticks and the scrollbar go through to the
-        // terminal natively. This first event is consumed by bk1 (no scroll happens
-        // for it), but the next one — and everything until the pet wakes — works.
+        if (ev.motion) {
+          // Scrollbar drag: dispatch on which bar the user grabbed.
+          if (dbtDragRef.current === 'v') {
+            const next = rowToScrollV(ev.row);
+            if (next !== null) setDbtScrollV(next);
+            continue;
+          }
+          if (dbtDragRef.current === 'h') {
+            const next = colToScrollH(ev.col);
+            if (next !== null) setDbtScrollH(next);
+            continue;
+          }
+          // Eye tracking removed. PetSpritePanel falls through to the default
+          // (forward-facing) sprite when petMousePos.col/row stay null, which
+          // they do because nothing writes to them anymore. Trade-off: pet eyes
+          // no longer follow the cursor, but we eliminate the dominant source
+          // of awake-state Ink repaints — and reliable native text selection
+          // matters more than the eye-tracking feature.
+          continue;
+        }
+        // Wheel handling: if the dbt pane is visible, scroll it (vertical by
+        // default, horizontal with Shift). If not visible, the wheel is just
+        // ignored — bk1 no longer auto-puts the pet to sleep / releases mouse
+        // tracking on wheel. That legacy "release for native scrollback"
+        // shortcut kept breaking pane scroll on cursor-position edge cases.
+        // To get the terminal's native scrollback now, use `/pet sleep`
+        // explicitly — that's the single, predictable release path.
         if (ev.button === 'wheel-up' || ev.button === 'wheel-down') {
-          if (!isSleeping(petRef.current)) {
-            const napping = petSleep(petRef.current);
-            petRef.current = napping;
-            setPet(napping);
-            savePet(napping);
-            disableMouseTracking(process.stdout);
-            mouseTrackingOnRef.current = false;
+          if (dbtLogsRef.current.length > 0) {
+            const step = 3;
+            if (ev.shift) {
+              setDbtScrollH(h => Math.max(0, h + (ev.button === 'wheel-up' ? -step : step)));
+            } else {
+              setDbtScrollV(v => Math.max(0, v + (ev.button === 'wheel-up' ? step : -step)));
+            }
+            markPaneScroll();
           }
           continue;
         }
         if (ev.button !== 'left' || !ev.press) continue;
+        const b = dbtPaneBoundsRef.current;
+        // Horizontal scrollbar press FIRST so it wins the (row=trackBottom,
+        // col=scrollCol) overlap when the user clicks on the visible h-bar.
+        // ±1 row tolerance absorbs the same off-by-one we hit with [copy].
+        // Exclude clicks that land exactly inside the v-scrollbar track at its
+        // dedicated column — those are intentional v-scrollbar clicks and
+        // shouldn't be hijacked by the h-bar's tolerance band.
+        if (b && Math.abs(ev.row - b.hbarRow) <= 1
+            && ev.col >= b.hbarLeft && ev.col <= b.hbarRight
+            && !((ev.col === b.scrollCol || ev.col === b.scrollCol + 1) && ev.row >= b.trackTop && ev.row <= b.trackBottom)) {
+          dbtDragRef.current = 'h';
+          const next = colToScrollH(ev.col);
+          if (next !== null) setDbtScrollH(next);
+          continue;
+        }
+        // Vertical scrollbar press.
+        if (b && (ev.col === b.scrollCol || ev.col === b.scrollCol + 1) && ev.row >= b.trackTop && ev.row <= b.trackBottom) {
+          dbtDragRef.current = 'v';
+          const next = rowToScrollV(ev.row);
+          if (next !== null) setDbtScrollV(next);
+          continue;
+        }
+        // Copy-to-clipboard hit: [copy] text in DbtLogPane header.
+        // - Hit box: ±1 row around copyRow (absorbs off-by-one in CHROME math),
+        //   col from copyLeft-2 to right (the whole right portion of the header
+        //   so click position doesn't have to be pixel-perfect on "[copy]").
+        // - Spawn: node's spawnSync with `input` — synchronously pipes the text
+        //   to pbcopy/xsel stdin. Replaces the earlier Bun.spawn calls which
+        //   weren't reliably delivering stdin before the process exited.
+        // - Strip ANSI so the clipboard gets plain text.
+        if (b
+            && ev.row >= b.copyRow - 2 && ev.row <= b.copyRow + 2
+            && ev.col >= b.copyLeft - 2 && ev.col <= b.right) {
+          const stripAnsi = (s: string) => s.replace(/\x1b\[[\d;?]*[A-Za-z~]/g, '');
+          const text = dbtLogsRef.current.map(stripAnsi).join('\n');
+          const argv: string[] = process.platform === 'darwin'
+            ? ['pbcopy']
+            : ['xsel', '--clipboard', '--input'];
+          try {
+            spawnSync(argv[0]!, argv.slice(1), { input: text });
+          } catch { /* clipboard tool not on PATH; ignore silently */ }
+          setCopyFlash(true);
+          setTimeout(() => setCopyFlash(false), 800);
+          continue;
+        }
+        // Click anywhere over the pane (other than [copy]) is absorbed so it doesn't
+        // also register as a pet-tap in the StatusFooter band below.
+        if (b && ev.col >= b.left && ev.col <= b.right && ev.row >= b.top && ev.row <= b.bottom) {
+          continue;
+        }
         const totalRows = process.stdout.rows ?? 24;
         // StatusFooter is the line above the HintBar; allow a 3-row band to absorb
         // terminal padding differences.
@@ -1309,13 +1849,14 @@ function App({ onLogout }: { onLogout: () => void }) {
   // Matches "/pet play" exactly OR "/pet play <anything>" so partial typing
   // of a game id keeps the picker visible.
   const isPetPlayPicker = input === '/pet play' || input.startsWith('/pet play ');
+  const isPetFeedPicker = input === '/pet feed' || input.startsWith('/pet feed ');
 
   const suggestions = useMemo(() => {
-    if (isModelPicker || isPetPlayPicker) return [] as [string, typeof SKILLS[string]][];
+    if (isModelPicker || isPetPlayPicker || isPetFeedPicker) return [] as [string, typeof SKILLS[string]][];
     if (!input.startsWith('/')) return [] as [string, typeof SKILLS[string]][];
     const partial = input.slice(1).split(' ')[0]?.toLowerCase() ?? '';
     return Object.entries(SKILLS).filter(([cmd]) => cmd.startsWith(partial)) as [string, typeof SKILLS[string]][];
-  }, [input, isModelPicker, isPetPlayPicker]);
+  }, [input, isModelPicker, isPetPlayPicker, isPetFeedPicker]);
 
   const submit = useCallback(async () => {
     const raw = inputRef.current.trim();
@@ -1384,6 +1925,71 @@ function App({ onLogout }: { onLogout: () => void }) {
       ]);
       return;
     }
+    if (raw === '/find' || raw.startsWith('/find ')) {
+      // Highlight matching lines in the dbt log pane. /find with no argument
+      // clears the highlight. Local — no LLM call.
+      setInput(''); inputRef.current = ''; setSuggestionIndex(-1);
+      const query = raw.slice('/find'.length).trim();
+      setDbtSearchQuery(query);
+      const matchCount = query
+        ? dbtLogsRef.current.filter(l => l.toLowerCase().includes(query.toLowerCase())).length
+        : 0;
+      const note = query
+        ? `Highlighting "${query}" in dbt logs (${matchCount} match${matchCount === 1 ? '' : 'es'}). Run /find with no argument to clear.`
+        : `Cleared dbt log search.`;
+      setMessages(prev => [
+        ...prev,
+        { role: 'user',      content: raw },
+        { role: 'assistant', content: note },
+      ]);
+      return;
+    }
+    if (raw === '/review' || raw === '/scroll') {
+      // Enter full-screen scrollable conversation view. The App's render path
+      // short-circuits to <ReviewMode/> while `reviewMode` is true; Esc inside
+      // ReviewMode calls onExit which flips it back to false.
+      setInput(''); inputRef.current = ''; setSuggestionIndex(-1);
+      setReviewMode(true);
+      return;
+    }
+    if (raw === '/history') {
+      // Snapshot the current conversation to a markdown file and open it in a
+      // VS Code editor pane next to the terminal. Lets users review long agent
+      // output (lint findings, analyses) in a fully scrollable, searchable,
+      // copy-able editor view without fighting the terminal's mouse-tracking
+      // selection limits. Snapshot is point-in-time; re-run /history for an
+      // updated view.
+      setInput(''); inputRef.current = ''; setSuggestionIndex(-1);
+      const md: string[] = [`# bk1 session — ${new Date().toISOString()}`, ''];
+      for (const msg of messages) {
+        if (msg.role === 'user') {
+          md.push(`## > ${msg.content}`, '');
+        } else {
+          md.push(msg.content, '');
+        }
+      }
+      const dir  = `${PROJECT_DIR}/.bk1`;
+      const path = `${dir}/session-${Date.now()}.md`;
+      let note: string;
+      try {
+        mkdirSync(dir, { recursive: true });
+        writeFileSync(path, md.join('\n'));
+        // Try `code <path>` first (VS Code's CLI). Falls back to just reporting
+        // the path if `code` isn't on PATH.
+        const r = spawnSync('code', [path], { stdio: 'ignore' });
+        note = r.status === 0
+          ? `Opened conversation log in VS Code: ${path}`
+          : `Saved conversation log to: ${path}\n\nOpen it with:  code ${path}`;
+      } catch (e) {
+        note = `Failed to save history: ${e instanceof Error ? e.message : String(e)}`;
+      }
+      setMessages(prev => [
+        ...prev,
+        { role: 'user',      content: raw },
+        { role: 'assistant', content: note },
+      ]);
+      return;
+    }
     // Local greeting reply — short-circuits the LLM for boilerplate "hi" / "what
     // can you do" inputs. Not added to historyRef so the LLM never sees these
     // turns on subsequent prompts (no token cost now, no cache pollution later).
@@ -1411,8 +2017,29 @@ function App({ onLogout }: { onLogout: () => void }) {
         // Bare /pet — just show the view, no state change.
         nextPet = tickPet(nextPet);
       } else if (sub === 'feed') {
-        nextPet = feed(nextPet);
-        note = `You fed ${nextPet.name ?? 'your pet'}.`;
+        // Arg present → direct purchase (`/pet feed snack`). No arg → use the
+        // FoodPicker's current selection. feed() returns {state, error?} —
+        // surface the error verbatim (covers "not enough coins" and "unknown
+        // food") and skip the success message.
+        const ids = Object.keys(FOODS);
+        let foodId: string | null;
+        if (arg) {
+          foodId = arg;
+        } else {
+          foodId = ids[petFeedIdxRef.current] ?? ids[0] ?? null;
+        }
+        if (!foodId) {
+          note = 'No foods are registered.';
+        } else {
+          const result = feed(nextPet, foodId);
+          nextPet = result.state;
+          if (result.error) {
+            note = result.error;
+          } else {
+            const food = FOODS[foodId]!;
+            note = `You fed ${nextPet.name ?? 'your pet'} a ${food.label.toLowerCase()} (-${food.cost} 🪙 ).`;
+          }
+        }
       } else if (sub === 'play') {
         // Arg present → direct launch (`/pet play fetch`); arg invalid → error.
         // No arg → launch whatever the GamePicker is currently highlighting.
@@ -1427,7 +2054,7 @@ function App({ onLogout }: { onLogout: () => void }) {
           note = `Unknown game "${arg}". Try: ${ids}`;
         } else {
           const ids = Object.keys(GAMES);
-          const picked = ids[petPlayIdx] ?? ids[0];
+          const picked = ids[petPlayIdxRef.current] ?? ids[0];
           if (picked) {
             setActiveGame(picked);
             return;
@@ -1470,6 +2097,17 @@ function App({ onLogout }: { onLogout: () => void }) {
         { role: 'user',      content: raw },
         { role: 'assistant', content: body },
       ]);
+      return;
+    }
+
+    // dbt passthrough — `dbt …` typed literally runs as a real subprocess.
+    // No LLM call, no token spend; output streams to the right-side log pane.
+    // Echo the command into the chat as a user message so the scrollback still
+    // shows what the user ran (in order with surrounding prompts).
+    if (/^dbt(\s|$)/.test(raw)) {
+      setInput(''); inputRef.current = ''; setSuggestionIndex(-1);
+      setMessages(prev => [...prev, { role: 'user', content: raw }]);
+      void runDbtCommand(raw);
       return;
     }
 
@@ -1659,7 +2297,82 @@ function App({ onLogout }: { onLogout: () => void }) {
     }
   }, []);
 
+  // dbt passthrough runner. Spawned via `bash -c` so the user's quoting + flags
+  // (`-s tag:foo`, `--vars '{...}'`) round-trip the same way they would in a
+  // real shell. FORCE_COLOR=1 makes dbt emit ANSI even though stdout is a pipe;
+  // parseAnsi in DbtLogPane translates that to Ink-friendly spans.
+  const DBT_LOG_CAP = 1000;
+  const appendDbtLines = useCallback((lines: string[]) => {
+    if (lines.length === 0) return;
+    setDbtLogs(prev => {
+      const next = prev.concat(lines);
+      return next.length > DBT_LOG_CAP ? next.slice(next.length - DBT_LOG_CAP) : next;
+    });
+    // When the user is scrolled up (scrollV > 0), bump scrollV by the number of
+    // newly appended lines so their visible window stays anchored on the same
+    // content instead of sliding forward under them. When scrollV === 0 we're
+    // auto-tailing — leave it alone so the next render shows the new tail.
+    setDbtScrollV(v => v === 0 ? 0 : v + lines.length);
+  }, []);
+  const runDbtCommand = useCallback(async (raw: string) => {
+    // Each new run starts with a clean pane — prior output is dropped (still
+    // available via the [copy] button before the user triggers another run).
+    setDbtLogs([`$ ${raw}`]);
+    setDbtScrollV(0);
+    setDbtScrollH(0);
+    setDbtRunning(true);
+    try {
+      const proc = Bun.spawn(['bash', '-c', raw], {
+        cwd: PROJECT_DIR,
+        stdout: 'pipe',
+        stderr: 'pipe',
+        env: { ...process.env, FORCE_COLOR: '1', CLICOLOR_FORCE: '1' },
+      });
+      dbtProcRef.current = proc;
+      const decoder = new TextDecoder();
+      const pump = async (stream: ReadableStream<Uint8Array>) => {
+        const reader = stream.getReader();
+        let buf = '';
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          const parts = buf.split('\n');
+          buf = parts.pop() ?? '';
+          if (parts.length) appendDbtLines(parts);
+        }
+        if (buf) appendDbtLines([buf]);
+      };
+      await Promise.all([pump(proc.stdout as ReadableStream<Uint8Array>),
+                         pump(proc.stderr as ReadableStream<Uint8Array>)]);
+      const code = await proc.exited;
+      appendDbtLines([`[exit ${code}]`, '']);
+      // Award coins on successful run. Parse the leading subcommand: dbt run / build
+      // → dbtRun reward (+2); dbt test → dbtTest reward (+1). Anything else (compile,
+      // ls, debug, source freshness, etc.) is a no-op — those aren't "real work."
+      if (code === 0) {
+        const tokens = raw.trim().split(/\s+/);
+        const sub = tokens[0] === 'dbt' ? tokens[1] : tokens[0];
+        if (sub === 'run' || sub === 'build') {
+          emitCoinEvent({ type: 'dbt_run',  delta: COIN_REWARDS.dbtRun,  reason: `dbt ${sub}` });
+        } else if (sub === 'test') {
+          emitCoinEvent({ type: 'dbt_test', delta: COIN_REWARDS.dbtTest, reason: 'dbt test' });
+        }
+      }
+    } catch (err) {
+      appendDbtLines([`error: ${err instanceof Error ? err.message : String(err)}`, '']);
+    } finally {
+      dbtProcRef.current = null;
+      setDbtRunning(false);
+    }
+  }, [appendDbtLines]);
+
   useInput((inputChar, key) => {
+    // When a pet mini-game is active, it owns input — bail out so App's
+    // handlers (Enter→submit, ↑↓ history scroll, Shift+↑↓ dbt-pane scroll,
+    // Ctrl+L clear, etc.) don't fire alongside the game's own useInput and
+    // eat/duplicate its key events.
+    if (activeGameRef.current) return;
     // SGR mouse-event residue (e.g. `[<64;10;20M` from a wheel tick) sometimes
     // leaks through Ink's keypress parser as "printable text" right after the
     // dedicated raw-stdin handler processes the same event. Drop it here so
@@ -1667,6 +2380,76 @@ function App({ onLogout }: { onLogout: () => void }) {
     // hook — react to what was actually a mouse event. Without this guard a
     // wheel scroll would put the pet to sleep and immediately wake it back up.
     if (inputChar && /\[<\d+;\d+;\d+[Mm]/.test(inputChar)) return;
+
+    // Keyboard scroll for the dbt log pane. Lets users review log history with
+    // the pet asleep (= mouse tracking off = selection works) — no mouse needed,
+    // so there's no animation/repaint cost. PgUp/PgDn = page; Shift+↑/↓ = line.
+    // Returns early so these keys don't trigger the wake-on-keypress hook below.
+    if (dbtLogsRef.current.length > 0) {
+      const paneHeight = Math.max(6, Math.floor((process.stdout.rows ?? 24) / 2));
+      const maxScrollV = Math.max(0, dbtLogsRef.current.length - paneHeight);
+      const pageStep   = Math.max(1, paneHeight - 1);
+      // Ctrl+Y: copy the current logs to the system clipboard. Lets the user
+      // copy without the mouse — important because mouse tracking is off while
+      // the pet is asleep, and clicks don't reach bk1 to hit the [copy] button.
+      if (key.ctrl && inputChar === 'y') {
+        const stripAnsi = (s: string) => s.replace(/\x1b\[[\d;?]*[A-Za-z~]/g, '');
+        const text = dbtLogsRef.current.map(stripAnsi).join('\n');
+        const argv: string[] = process.platform === 'darwin'
+          ? ['pbcopy']
+          : ['xsel', '--clipboard', '--input'];
+        try { spawnSync(argv[0]!, argv.slice(1), { input: text }); }
+        catch { /* clipboard tool not on PATH; ignore */ }
+        setCopyFlash(true);
+        setTimeout(() => setCopyFlash(false), 800);
+        return;
+      }
+      if (key.pageUp) {
+        setDbtScrollV(v => Math.min(maxScrollV, v + pageStep));
+        markPaneScroll();
+        return;
+      }
+      if (key.pageDown) {
+        setDbtScrollV(v => Math.max(0, v - pageStep));
+        markPaneScroll();
+        return;
+      }
+      if (key.shift && key.upArrow) {
+        setDbtScrollV(v => Math.min(maxScrollV, v + 1));
+        markPaneScroll();
+        return;
+      }
+      if (key.shift && key.downArrow) {
+        setDbtScrollV(v => Math.max(0, v - 1));
+        markPaneScroll();
+        return;
+      }
+      // Shift+←/→: horizontal scroll. Step by 4 cols per press. Bounded
+      // loosely by the widest log line; if the user over-scrolls, lines just
+      // appear blank and they can scroll back. No max enforcement here.
+      if (key.shift && key.leftArrow) {
+        setDbtScrollH(h => Math.max(0, h - 4));
+        markPaneScroll();
+        return;
+      }
+      if (key.shift && key.rightArrow) {
+        // Use stripped (ANSI-free) line length so we don't allow scrolling
+        // past where there's actually visible content.
+        const stripAnsi = (s: string) => s.replace(/\x1b\[[\d;?]*[A-Za-z~]/g, '');
+        const maxLine = dbtLogsRef.current.reduce((m, l) => Math.max(m, stripAnsi(l).length), 0);
+        setDbtScrollH(h => Math.min(Math.max(0, maxLine - 10), h + 4));
+        markPaneScroll();
+        return;
+      }
+      // Shift+Home (or just inputChar === '0' with Ctrl) — fast reset to col 0
+      // when the user has scrolled right and wants to get back to the line
+      // starts. Ink's Key type doesn't expose Home, so we use Ctrl+0.
+      if (key.ctrl && inputChar === '0') {
+        setDbtScrollH(0);
+        markPaneScroll();
+        return;
+      }
+    }
 
     // Any real keypress while the pet is asleep wakes it up — the closest natural
     // substitute to "click the pet to wake it" we can offer without re-enabling
@@ -1679,8 +2462,8 @@ function App({ onLogout }: { onLogout: () => void }) {
       petRef.current = woke;
       setPet(woke);
       savePet(woke);
-      enableMouseTracking(process.stdout);
-      mouseTrackingOnRef.current = true;
+      // Mouse tracking is no longer enabled (see startup useEffect). Waking
+      // the pet is now a pure visual/state change — no terminal mode flip.
     }
     // Ctrl+C always exits. ESC interrupts a running agent; when idle, ESC is a no-op
     // so users can't accidentally kill the app with one keystroke.
@@ -1693,6 +2476,12 @@ function App({ onLogout }: { onLogout: () => void }) {
       process.stdout.write('\x1b[2J\x1b[H');
       return;
     }
+    // Ctrl+P: toggle pane mode. The unified useEffect above watches paneMode
+    // and enables/disables xterm mouse tracking accordingly.
+    if (key.ctrl && inputChar === 'p') {
+      setPaneMode(prev => !prev);
+      return;
+    }
     if (key.escape) {
       // Remember when ESC fired. Option+<letter> in some terminals (notably VS Code's
       // xterm.js) gets split into two keypresses — ESC, then the letter — instead of
@@ -1701,6 +2490,15 @@ function App({ onLogout }: { onLogout: () => void }) {
       // (that's the `Sonnet 4.et` glitch where typed letters bled into the model badge).
       lastEscapeAtRef.current = Date.now();
       if (isRunningRef.current) abortRef.current?.abort();
+      if (dbtProcRef.current) { try { dbtProcRef.current.kill(); } catch { /* already exited */ } }
+      // When nothing's running, Esc clears the input — dismisses any open
+      // picker (/model, /pet play, /pet feed) and acts as a general
+      // "cancel current entry" affordance.
+      if (!isRunningRef.current && !dbtProcRef.current && inputRef.current.length > 0) {
+        inputRef.current = '';
+        setInput('');
+        setSuggestionIndex(-1);
+      }
       return;
     }
     if (isRunningRef.current) {
@@ -1758,6 +2556,18 @@ function App({ onLogout }: { onLogout: () => void }) {
       if (total > 0) {
         if (key.upArrow) setPetPlayIdx(i => (i - 1 + total) % total);
         else             setPetPlayIdx(i => (i + 1) % total);
+      }
+      return;
+    }
+
+    // /pet feed arrow cycling — mirror of /pet play. Up/down navigate the foods
+    // picker; Enter falls through to submit() to actually purchase the food.
+    if ((inputRef.current === '/pet feed' || inputRef.current.startsWith('/pet feed '))
+        && (key.upArrow || key.downArrow)) {
+      const total = Object.keys(FOODS).length;
+      if (total > 0) {
+        if (key.upArrow) setPetFeedIdx(i => (i - 1 + total) % total);
+        else             setPetFeedIdx(i => (i + 1) % total);
       }
       return;
     }
@@ -1893,14 +2703,14 @@ function App({ onLogout }: { onLogout: () => void }) {
   // path so the existing decay/cap rules apply uniformly.
   if (activeGame && GAMES[activeGame]) {
     const GameComponent = GAMES[activeGame].component;
-    const onGameExit = (happinessGain?: number) => {
-      // Convert the game's earned happiness into play() taps. play() is the canonical
-      // mutation; calling it N times preserves the existing rate-limit + decay semantics
-      // we'd otherwise have to duplicate. happinessGain is roughly "happiness points",
-      // which we floor to integer taps.
-      const taps = Math.max(0, Math.floor((happinessGain ?? 0) / 2));
+    const onGameExit = (result?: import('./games/types').GameResult) => {
+      // Happiness → play() taps (canonical mutation; preserves the decay
+      // semantics in pet.ts). Coins delta is applied directly via addCoins,
+      // which clamps at zero so a punishing exam can't go negative.
+      const taps = Math.max(0, Math.floor((result?.happiness ?? 0) / 2));
       let next = petRef.current;
       for (let i = 0; i < taps; i++) next = play(next);
+      if (result?.coins) next = addCoins(next, result.coins);
       petRef.current = next;
       setPet(next);
       savePet(next);
@@ -1910,7 +2720,7 @@ function App({ onLogout }: { onLogout: () => void }) {
   }
 
   // Welcome screen
-  if (messages.length === 0) {
+  if (messages.length === 0 && dbtLogs.length === 0) {
     return (
       <Box ref={containerRef} flexDirection="column" paddingTop={1}>
         <Box flexDirection="column" paddingX={2}>
@@ -1931,14 +2741,16 @@ function App({ onLogout }: { onLogout: () => void }) {
             ? <ModelPicker currentIdx={modelIdx} />
             : isPetPlayPicker
               ? <GamePicker currentIdx={petPlayIdx} />
-              : <Suggestions suggestions={suggestions} selectedIndex={suggestionIndex} input={input} />
+              : isPetFeedPicker
+                ? <FoodPicker currentIdx={petFeedIdx} balance={pet.coins} />
+                : <Suggestions suggestions={suggestions} selectedIndex={suggestionIndex} input={input} />
           }
           <HRule />
           <InputBar input={input} isRunning={isRunning} mode={mode} modelLabel={MODELS[modelIdx]!.label} />
           <HRule />
-          <StatusFooter sessionUsd={sessionUsd} pet={pet} mouseCol={mouseCol} mouseRow={mouseRow} renderHeight={renderHeight} />
+          <StatusFooter sessionUsd={sessionUsd} pet={pet} renderHeight={renderHeight} coinToast={coinToast} />
           <HRule />
-          <HintBar isRunning={isRunning} />
+          <HintBar isRunning={isRunning} paneMode={paneMode} />
         </Box>
       </Box>
     );
@@ -1997,46 +2809,111 @@ function App({ onLogout }: { onLogout: () => void }) {
         )}
       </Static>
 
-      {/* Live running indicator must stay dynamic — it streams updates while the
-          agent is mid-turn. Once the run ends and the final message is appended to
-          `messages`, it moves into Static automatically. */}
-      <Box flexDirection="column" paddingX={2}>
-        {isRunning && (
-          <Box flexDirection="column" marginBottom={1}>
-            <Box gap={1}>
-              <Text color="#5A8060">{liveExpanded ? '-' : '+'}</Text>
-              <Text color="#B9FECF"><Spinner type="sand" /></Text>
-              <GlowText text="mangroooooving..." />
-              {activeTool && (
-                <Text color="#5A8060">· {activeTool}</Text>
+      {/* Live running indicator (left) + dbt log pane (right). Wrapped in a row
+          so the pane sits alongside the live indicator in the dynamic frame.
+          Input/footer/hint stay full-width below as siblings of this row. */}
+      <Box flexDirection="row">
+        <Box flexDirection="column" paddingX={2} flexGrow={1}>
+          {isRunning && (
+            <Box flexDirection="column" marginBottom={1}>
+              <Box gap={1}>
+                <Text color="#5A8060">{liveExpanded ? '-' : '+'}</Text>
+                <Text color="#B9FECF"><Spinner type="sand" /></Text>
+                <GlowText text="mangroooooving..." />
+                {activeTool && (
+                  <Text color="#5A8060">· {activeTool}</Text>
+                )}
+              </Box>
+              {lintProgress && lintProgress.phase !== 'semantic' && <LintProgressBar progress={lintProgress} />}
+              {semanticProgress && semanticProgress.agents.some(a => !a.done) && (
+                <SemanticProgressBar progress={semanticProgress} />
+              )}
+              {liveTokens && <TokenBadge tokens={liveTokens} dim />}
+              {!liveExpanded && liveText && (
+                <Box paddingLeft={4}>
+                  <Text color="#3D6650">
+                    {(liveText.trim().split('\n').slice(-1)[0] ?? '').slice(0, 120)}
+                  </Text>
+                </Box>
+              )}
+              {liveExpanded && liveText && (
+                <Box flexDirection="column" paddingLeft={3}>
+                  <Text wrap="wrap" color="#7AB890">{liveText.trimEnd()}</Text>
+                </Box>
               )}
             </Box>
-            {lintProgress && lintProgress.phase !== 'semantic' && <LintProgressBar progress={lintProgress} />}
-            {semanticProgress && semanticProgress.agents.some(a => !a.done) && (
-              <SemanticProgressBar progress={semanticProgress} />
-            )}
-            {liveTokens && <TokenBadge tokens={liveTokens} dim />}
-            {!liveExpanded && liveText && (
-              <Box paddingLeft={4}>
-                <Text color="#3D6650">
-                  {(liveText.trim().split('\n').slice(-1)[0] ?? '').slice(0, 120)}
-                </Text>
-              </Box>
-            )}
-            {liveExpanded && liveText && (
-              <Box flexDirection="column" paddingLeft={3}>
-                <Text wrap="wrap" color="#7AB890">{liveText.trimEnd()}</Text>
-              </Box>
-            )}
-          </Box>
-        )}
+          )}
+        </Box>
+        {(dbtLogs.length > 0 || dbtRunning) && (() => {
+          const cols = process.stdout.columns ?? 80;
+          const paneWidth  = Math.max(44, Math.min(88, Math.floor(cols * 0.55)));
+          // Reserve room for input, footer, hints so the pane never pushes the
+          // prompt off-screen on short terminals.
+          const paneHeight = Math.max(6, Math.floor(terminalRows / 2));
+          // Pane bounds for the raw mouse handler. Computed from `terminalRows`
+          // assuming the dynamic frame is bottom-anchored (true once there's
+          // any scrollback). CHROME = the rows BELOW the pane's bottom border:
+          //   HRule(1) + InputBar(1) + StatusFooter(5) + HRule(1) + HintBar(2)
+          // = 10. Earlier this was 9 because StatusFooter was miscounted as 4
+          // rows (marginTop+content); the actual content is the full 4-row
+          // sprite (3 body + 1 legs from withLegs) PLUS marginTop = 5. That
+          // 1-row drift was why [copy] required a click one row below the
+          // visible button.
+          const CHROME   = 10;
+          const right    = cols - 2;
+          const left     = right - paneWidth + 1;
+          // -1 for pane's bottom border row, -1 for the horizontal scrollbar
+          // row that now sits just above the bottom border.
+          const bottom   = terminalRows - CHROME - 2;
+          const top      = bottom - paneHeight;             // header + log rows
+          const copyText = '[copy]';
+          const copyRow  = top;                            // header row sits at pane's top interior row
+          const copyRight = right - 3;                     // -1 border, -2 for the 2-col scrollbar
+          const copyLeft  = copyRight - copyText.length + 1;
+          // Scrollbar column sits just inside the right border. Now 2 cols
+          // wide; `scrollCol` is the LEFT edge of the bar and click checks
+          // accept both `scrollCol` and `scrollCol + 1`. Track cells span
+          // rows top+1 (one below the header) to top+paneHeight.
+          const scrollCol   = right - 2;
+          const trackTop    = top + 1;
+          const trackBottom = top + paneHeight;
+          // Horizontal scrollbar row: sits one row below the last log row
+          // (between the log area and the pane's bottom border). Spans the
+          // full width inside the borders (left+1 to right-1).
+          const hbarRow   = bottom + 1;
+          const hbarLeft  = left + 1;
+          const hbarRight = right - 1;
+          dbtPaneBoundsRef.current = {
+            top, bottom, left, right,
+            copyLeft, copyRight, copyRow,
+            scrollCol, trackTop, trackBottom,
+            hbarRow, hbarLeft, hbarRight,
+          };
+          return (
+            <Box paddingRight={2}>
+              <DbtLogPane
+                logs={dbtLogs}
+                running={dbtRunning}
+                width={paneWidth}
+                height={paneHeight}
+                scrollV={dbtScrollV}
+                scrollH={dbtScrollH}
+                copyFlash={copyFlash}
+                paneMode={paneMode}
+                searchQuery={dbtSearchQuery}
+              />
+            </Box>
+          );
+        })()}
       </Box>
 
       {!confirmPrompt && (isModelPicker
         ? <ModelPicker currentIdx={modelIdx} />
         : isPetPlayPicker
           ? <GamePicker currentIdx={petPlayIdx} />
-          : <Suggestions suggestions={suggestions} selectedIndex={suggestionIndex} input={input} />
+          : isPetFeedPicker
+            ? <FoodPicker currentIdx={petFeedIdx} balance={pet.coins} />
+            : <Suggestions suggestions={suggestions} selectedIndex={suggestionIndex} input={input} />
       )}
       <HRule />
       {confirmPrompt
@@ -2050,9 +2927,9 @@ function App({ onLogout }: { onLogout: () => void }) {
           least-bad option given we can't measure absolute position with Static
           content present. terminalRows itself follows window resizes via the
           stdout.on('resize') listener at the top of App. */}
-      <StatusFooter sessionUsd={sessionUsd} pet={pet} mouseCol={mouseCol} mouseRow={mouseRow} renderHeight={terminalRows} />
+      <StatusFooter sessionUsd={sessionUsd} pet={pet} renderHeight={terminalRows} coinToast={coinToast} />
       <HRule />
-      <HintBar isRunning={isRunning} />
+      <HintBar isRunning={isRunning} paneMode={paneMode} />
     </Box>
   );
 }

@@ -113,6 +113,8 @@ function decodeSpriteCell(ch: string): Cell {
   if (ch === 'B') return { char: ' ', bg: PET_BODY };
   if (ch === 'M') return { char: '▄', fg: PET_EYE,  bg: PET_BODY };
   if (ch === 'V') return { char: '▀', fg: PET_EYE,  bg: PET_BODY };
+  if (ch === 'H') return { char: '─', fg: PET_EYE,  bg: PET_BODY };  // thin closed eyelid — used in tired sprites
+  if (ch === 'S') return { char: '꩜', fg: PET_EYE,  bg: PET_BODY };  // U+AA5C spiral — hungry-mood eye
   if (ch === 'U') return { char: '▀', fg: PET_BODY };  // body in TOP half, transparent bottom
   if (ch === 'L') return { char: '▄', fg: PET_BODY };  // body in BOTTOM half, transparent top
   if (ch === 'R') return { char: '▐', fg: PET_BODY };  // body in RIGHT half — tail protruding LEFT
@@ -120,11 +122,55 @@ function decodeSpriteCell(ch: string): Cell {
   return { char: ' ' };
 }
 
-function pickSprite(target: Target | null, petCol: number): SpriteDef {
-  if (!target) return SPRITE_FRONT;
+// Swap eye glyphs V/M → S when the pet is hungry. Matches the
+// applyHungryEyes helper in app.tsx so the fetch screen and the StatusFooter
+// show the same eye glyph for the same mood. Leaves H (tired eyelid) alone —
+// tired and hungry are stacked moods; if the pet is BOTH tired and hungry,
+// the tired sprite is already in play (eyes are H) and stays as-is.
+function applyHungryEyes(rows: string[], hungry: boolean): string[] {
+  if (!hungry) return rows;
+  return rows.map(row => row.replace(/[VM]/g, 'S'));
+}
+
+// Tired (energy = 0) sprite variants: same silhouette as the awake versions,
+// just V → H at the eye positions so the eyes read as drowsy closed eyelids.
+// Matches the H-cell sleep eye in pet.ts so the visual language is consistent
+// across the footer and the fetch screen.
+const SPRITE_FRONT_TIRED: SpriteDef = {
+  rows: [
+    'BBBBBBBB',
+    'BHBBBBHB',
+    'BBBBBBBB',
+  ],
+  width: 8,
+  height: 3,
+};
+
+const SPRITE_LOOK_R_TIRED: SpriteDef = {
+  rows: [
+    ' BBBBBBB',
+    ' BBBBBHB',
+    'RBBBBBBB',
+  ],
+  width: 8,
+  height: 3,
+};
+
+const SPRITE_LOOK_L_TIRED: SpriteDef = {
+  rows: [
+    'BBBBBBB ',
+    'BHBBBBB ',
+    'BBBBBBBJ',
+  ],
+  width: 8,
+  height: 3,
+};
+
+function pickSprite(target: Target | null, petCol: number, tired: boolean): SpriteDef {
+  if (!target) return tired ? SPRITE_FRONT_TIRED : SPRITE_FRONT;
   const dx = target.col - petCol;
-  if (dx < 0) return SPRITE_LOOK_L;
-  return SPRITE_LOOK_R;
+  if (dx < 0) return tired ? SPRITE_LOOK_L_TIRED : SPRITE_LOOK_L;
+  return tired ? SPRITE_LOOK_R_TIRED : SPRITE_LOOK_R;
 }
 
 function clamp(n: number, lo: number, hi: number): number {
@@ -150,6 +196,15 @@ export function FetchGame({ pet, onExit }: GameProps) {
   const targetRef = useRef<Target | null>(null);
   targetRef.current = target;
 
+  // Refs that the movement-interval closure reads. happinessGainRef + pet.energy
+  // let us compute the live projected energy inside the tick callback without
+  // restarting the interval on every state change. tickCountRef paces the slow
+  // tired-mode movement (act on every Nth tick instead of every tick).
+  const happinessGainRef = useRef(0);
+  happinessGainRef.current = happinessGain;
+  const tickCountRef = useRef(0);
+  const TIRED_STEP_DIVISOR = 4;  // tired pet moves once every 4 ticks (~3.2 cells/sec instead of ~25)
+
   // Click → set target (in center coords) + spawn ripple at the click point.
   // Mouse coords are 1-indexed global; subtract 1 for col and 2 for row (header
   // takes the top row).
@@ -163,7 +218,10 @@ export function FetchGame({ pet, onExit }: GameProps) {
         if (localRow < 0 || localRow >= playRows) continue;
         setTarget({ col: clampCol(localCol), row: clampRow(localRow) });
         setHasThrown(true);
-        setHappinessGain(g => Math.min(g + 2, 30));
+        // No cap — happy + energy already clamp at 100/0 in pet.ts. The
+        // previous cap of 30 made energy bottom out at 25% from full, so
+        // tired mode was unreachable in a single session.
+        setHappinessGain(g => g + 2);
         setRipples(prev => [...prev, { col: localCol, row: localRow, startedAt: Date.now() }]);
       }
     };
@@ -172,27 +230,38 @@ export function FetchGame({ pet, onExit }: GameProps) {
   }, [cols, playRows]);
 
   // Movement loop. Asymmetric step (2 cols, 1 row) compensates for terminal cell
-  // aspect ratio — diagonals look right that way.
+  // aspect ratio — diagonals look right that way. When the pet's projected
+  // energy reaches 0 it enters tired mode: the movement step is gated to
+  // every TIRED_STEP_DIVISOR-th tick, so the sprite crawls instead of darts.
+  // The animation tick itself still fires every TICK_MS so ripples + the
+  // hop bounce still update at full rate.
   useEffect(() => {
     const interval = setInterval(() => {
+      tickCountRef.current = (tickCountRef.current + 1) % 1_000_000;
       setTick(t => (t + 1) % 1_000_000);
       const tgt = targetRef.current;
       if (tgt) {
-        setPetCol(curr => {
-          const dx = tgt.col - curr;
-          if (Math.abs(dx) <= STEP_COLS) return tgt.col;
-          return clampCol(curr + (dx > 0 ? STEP_COLS : -STEP_COLS));
-        });
-        setPetRow(curr => {
-          const dy = tgt.row - curr;
-          if (Math.abs(dy) <= STEP_ROWS) return tgt.row;
-          return clampRow(curr + (dy > 0 ? STEP_ROWS : -STEP_ROWS));
-        });
+        const liveTaps      = Math.max(0, Math.floor(happinessGainRef.current / 2));
+        const liveEnergy    = clamp(pet.energy - liveTaps * 3, 0, 100);
+        const tired         = liveEnergy === 0;
+        const shouldStep    = !tired || tickCountRef.current % TIRED_STEP_DIVISOR === 0;
+        if (shouldStep) {
+          setPetCol(curr => {
+            const dx = tgt.col - curr;
+            if (Math.abs(dx) <= STEP_COLS) return tgt.col;
+            return clampCol(curr + (dx > 0 ? STEP_COLS : -STEP_COLS));
+          });
+          setPetRow(curr => {
+            const dy = tgt.row - curr;
+            if (Math.abs(dy) <= STEP_ROWS) return tgt.row;
+            return clampRow(curr + (dy > 0 ? STEP_ROWS : -STEP_ROWS));
+          });
+        }
       }
       setRipples(prev => prev.filter(r => Date.now() - r.startedAt < RIPPLE_LIFE_MS));
     }, TICK_MS);
     return () => clearInterval(interval);
-  }, [cols, playRows]);
+  }, [cols, playRows, pet.energy]);
 
   // Clear target on arrival in its own effect so the move + stop happens in one
   // render frame — splitting it across the animation tick would briefly show
@@ -218,13 +287,24 @@ export function FetchGame({ pet, onExit }: GameProps) {
   }, [target, hasThrown, petCol, petRow, cols, playRows]);
 
   useInput((_input, key) => {
-    if (key.escape) onExit(happinessGain);
+    if (key.escape) onExit({ happiness: happinessGain });
   });
 
+  // Project the live stats from the gain accumulated so far. Each 2 happiness
+  // points earned = 1 future tap of play() (+20 happy / -5 energy — see
+  // PLAY_*_DELTA in pet.ts). Mirrors onGameExit so the live display matches
+  // what will actually be applied on quit.
+  const projectedTaps   = Math.max(0, Math.floor(happinessGain / 2));
+  const projectedHappy  = clamp(pet.happiness + projectedTaps * 20, 0, 100);
+  const projectedEnergy = clamp(pet.energy    - projectedTaps * 3,  0, 100);
+  const tired           = projectedEnergy === 0;
+
   // Hop bounce: while travelling, lift the sprite -1 row every other tick.
-  const hopOffset     = target && tick % 2 === 0 ? -1 : 0;
+  // Skip the bounce when tired — tired pets drag, they don't hop.
+  const hopOffset     = !tired && target && tick % 2 === 0 ? -1 : 0;
   const drawCenterRow = clampRow(petRow + hopOffset);
-  const sprite        = pickSprite(target, petCol);
+  const hungry        = pet.hunger >= 80;
+  const sprite        = applyHungryEyes(pickSprite(target, petCol, tired), hungry);
   const topLeftCol    = petCol        - Math.floor(sprite.width  / 2);
   const topLeftRow    = drawCenterRow - Math.floor(sprite.height / 2);
 
@@ -289,15 +369,9 @@ export function FetchGame({ pet, onExit }: GameProps) {
   };
 
   const petLabel   = pet.name ?? 'your pet';
-  const statusText = hasThrown ? `${petLabel} is fetching` : `click anywhere to throw`;
-
-  // Project the live stats from the gain accumulated so far. Each 2 happiness
-  // points the user has earned this session = 1 future tap of play(), which is
-  // +20 happiness / -10 energy. We mirror onGameExit's `taps` math so the live
-  // display matches whatever onExit will actually apply on quit.
-  const projectedTaps   = Math.max(0, Math.floor(happinessGain / 2));
-  const projectedHappy  = clamp(pet.happiness + projectedTaps * 20, 0, 100);
-  const projectedEnergy = clamp(pet.energy    - projectedTaps * 10, 0, 100);
+  const statusText = tired
+    ? `${petLabel} is exhausted`
+    : (hasThrown ? `${petLabel} is fetching` : `click anywhere to throw`);
 
   return (
     <Box flexDirection="column">
