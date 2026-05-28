@@ -26,6 +26,17 @@ export type LobbyMode =
 
 type SubScreen = 'lobby' | 'jakenpoy' | 'race';
 
+// In-room actions, in the order shown to the user. The arrow-key cursor
+// in the connected state cycles through this list; Enter executes; the
+// `shortcut` letter is also accepted as a direct accelerator.
+type ActionId = 'jakenpoy' | 'race' | 'space-impact' | 'cycle-color';
+const CONNECTED_ACTIONS: { id: ActionId; label: string; shortcut: string; disabled?: boolean }[] = [
+  { id: 'jakenpoy',     label: 'Jakenpoy',                shortcut: 'j' },
+  { id: 'race',         label: 'Race',                    shortcut: 'r' },
+  { id: 'space-impact', label: 'Space Impact (soon)',     shortcut: 's', disabled: true },
+  { id: 'cycle-color',  label: 'Cycle pet color',         shortcut: 'c' },
+];
+
 interface Props {
   mode: LobbyMode;
   pet: PetState;
@@ -38,6 +49,8 @@ export function PlayroomLobby({ mode, pet, onExit, onCycleColor }: Props) {
   const [role, setRole] = useState<PlayerRole | null>(null);
   const [subscreen, setSubscreen] = useState<SubScreen>('lobby');
   const [watchers, setWatchers] = useState(0);
+  // Cursor index into CONNECTED_ACTIONS for the connected-state menu.
+  const [actionIdx, setActionIdx] = useState(0);
 
   // Player-side pets (used in player mode).
   const [peerPet, setPeerPet] = useState<PetState | null>(null);
@@ -165,6 +178,14 @@ export function PlayroomLobby({ mode, pet, onExit, onCycleColor }: Props) {
     }
     setSubscreen('lobby');
   };
+  const runAction = (id: ActionId): void => {
+    switch (id) {
+      case 'jakenpoy':     launchGame('jakenpoy'); return;
+      case 'race':         launchGame('race'); return;
+      case 'cycle-color':  if (onCycleColor) onCycleColor(); return;
+      case 'space-impact': /* not yet implemented — picker shows it disabled */ return;
+    }
+  };
 
   useInput((input, key) => {
     if (subscreen !== 'lobby') return;
@@ -179,6 +200,24 @@ export function PlayroomLobby({ mode, pet, onExit, onCycleColor }: Props) {
     if (inRoom && !isSpectator && input === 'c' && onCycleColor) { onCycleColor(); return; }
 
     if (state.kind === 'connected' && !isSpectator) {
+      // Arrow-key menu navigation over CONNECTED_ACTIONS. Single-letter
+      // shortcuts (j/r/s/c) below still work as direct accelerators for
+      // power users.
+      if (key.upArrow) {
+        const n = CONNECTED_ACTIONS.length;
+        setActionIdx(i => (i - 1 + n) % n);
+        return;
+      }
+      if (key.downArrow) {
+        const n = CONNECTED_ACTIONS.length;
+        setActionIdx(i => (i + 1) % n);
+        return;
+      }
+      if (key.return) {
+        const action = CONNECTED_ACTIONS[actionIdx];
+        if (action && !action.disabled) runAction(action.id);
+        return;
+      }
       if (input === 'j') { launchGame('jakenpoy'); return; }
       if (input === 'r') { launchGame('race'); return; }
       return;
@@ -257,6 +296,7 @@ export function PlayroomLobby({ mode, pet, onExit, onCycleColor }: Props) {
           joinerPet={joinerPet}
           role={role}
           watchers={watchers}
+          actionIdx={actionIdx}
         />
       </Box>
       <Box paddingX={1}>
@@ -294,7 +334,7 @@ function headerStatus(state: LobbyState, role: PlayerRole | null): string {
 }
 
 function Body({
-  state, pet, peerPet, hostPet, joinerPet, role, watchers,
+  state, pet, peerPet, hostPet, joinerPet, role, watchers, actionIdx,
 }: {
   state: LobbyState;
   pet: PetState;
@@ -303,6 +343,7 @@ function Body({
   joinerPet: PetState | null;
   role: PlayerRole | null;
   watchers: number;
+  actionIdx: number;
 }) {
   switch (state.kind) {
     case 'starting':
@@ -379,7 +420,23 @@ function Body({
             rightPet={peerPet} rightLabel={peerPet ? 'friend' : '(empty)'}
           />
           <Text> </Text>
-          <Text color="gray">j  jakenpoy   r  race   s  space impact (soon)   c  cycle color</Text>
+          <Text>actions:</Text>
+          {CONNECTED_ACTIONS.map((a, i) => {
+            const active = i === actionIdx;
+            const color = a.disabled
+              ? '#3D6650'                       // dim — not yet implemented
+              : active ? '#C0FAD2' : 'gray';
+            return (
+              <Box key={a.id}>
+                <Text color={color}>{active ? '  > ' : '    '}</Text>
+                <Text color={color} bold={active && !a.disabled}>
+                  [{a.shortcut}] {a.label}
+                </Text>
+              </Box>
+            );
+          })}
+          <Text> </Text>
+          <Text color="gray">↑↓ navigate · ↵ select · shortcut letters also work</Text>
           {watchers > 0 && (
             <>
               <Text> </Text>
