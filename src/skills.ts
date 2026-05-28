@@ -655,8 +655,8 @@ If new score < 90 with remaining auto-fixable findings, offer another approval r
   },
 
   pet: {
-    description: 'Tamagotchi mangrove pet — /pet shows stats, /pet feed|play|sleep|name <name>|release',
-    usage: '/pet [feed|play|sleep|name <name>|release]',
+    description: 'Tamagotchi mangrove pet — /pet shows stats, /pet feed|play|sleep|name <name>|playroom|release',
+    usage: '/pet [feed|play|sleep|name <name>|playroom <create|join|leave>|release]',
     // Intercepted in app.tsx — all interactions are local state updates.
     expand: () => '',
   },
