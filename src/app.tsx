@@ -1,5 +1,6 @@
 import { useState, useRef, useCallback, useMemo, useEffect } from 'react';
 import { existsSync, mkdirSync, writeFileSync } from 'fs';
+import { homedir } from 'os';
 import { spawnSync } from 'node:child_process';
 import { render, Box, Text, Static, useInput, measureElement, type DOMElement } from 'ink';
 import Spinner from 'ink-spinner';
@@ -7,11 +8,12 @@ import type Anthropic from '@anthropic-ai/sdk';
 import { runAgent, AgentAbortedError, resetAnthropicClient, type TokenUsage } from './agent';
 import { PROJECT_DIR } from './tools';
 import { LINT_REPORT_PATH } from './state';
-import { readIdeContextBlock } from './ide-context';
+import { readIdeContextBlock, readIdeContextRaw, type IdeContext } from './ide-context';
 import { SKILLS, expandSkill } from './skills';
 import { getStoredKey, storeKey, clearStoredKey, isValidKeyShape, authFilePath, getStoredAdminKey, storeAdminKey } from './auth';
 import { estimateCostUsd, formatUsd } from './pricing';
-import { createUsageState, recordUsage, classifyTurnLabel, fetchOrgUsageSeries } from './usage';
+import { recordProjectUsage, loadProjectTotals, type ProjectTotals } from './project-usage';
+import { createUsageState, recordUsage, buildReport, renderReport, classifyTurnLabel, fetchOrgUsage, fetchOrgUsageSeries, type UsageState } from './usage';
 import {
   loadPet, savePet, newPet, tickPet, petFace, petFaceEating,
   petSprite, petSpriteBlink, petSpriteSleep, petSpriteEating,
@@ -214,6 +216,29 @@ function ConfirmBar({ question, selectedIdx }: { question: string; selectedIdx: 
       <Box paddingLeft={2} marginTop={0}>
         <Text color="#3D6650">←→ navigate · Enter confirm · Y/N quick select</Text>
       </Box>
+    </Box>
+  );
+}
+
+// Renders the currently-open file (and selected lines) from the bk1-context
+// VS Code extension. One thin dim line above the input — mirrors the cue
+// Claude Code shows so users know which file bk1 is about to use as ambient
+// context. Hidden when nothing is open or the snapshot is stale.
+function IdeContextBar({ ctx }: { ctx: IdeContext | null }) {
+  if (!ctx || !ctx.file_path) return null;
+  const rel = ctx.file_path.startsWith(PROJECT_DIR + '/')
+    ? ctx.file_path.slice(PROJECT_DIR.length + 1)
+    : ctx.file_path.replace(homedir(), '~');
+  const sel = ctx.has_selection && ctx.selection_start_line && ctx.selection_end_line
+    ? ctx.selection_start_line === ctx.selection_end_line
+      ? `L${ctx.selection_start_line}`
+      : `L${ctx.selection_start_line}–${ctx.selection_end_line}`
+    : null;
+  return (
+    <Box paddingX={2} gap={1}>
+      <Text color="#5A8060">▸</Text>
+      <Text color="#7AB890">{rel}</Text>
+      {sel && <><Text color="#3D6650">·</Text><Text color="#7AB890">{sel}</Text></>}
     </Box>
   );
 }
@@ -1317,14 +1342,16 @@ function ReviewMode({ messages, onExit }: { messages: Message[]; onExit: () => v
   );
 }
 
-// ─── /usage interactive graph ───────────────────────────────────────────────
+// ─── /usage tabbed panel ────────────────────────────────────────────────────
 //
-// Fullscreen takeover (like GameComponent) showing organization usage as
-// stacked horizontal bars, segmented by model family. Tab cycles granularity
-// (monthly → daily → hourly); t / $ toggles tokens vs cost; Esc closes.
+// Fullscreen takeover (like GameComponent) with Tab-cycling tabs:
+//   Status   — bk1 project/model/mode state, Claude-Code style two-column rows
+//   Usage    — org-level text summary (current month totals, daily avg, etc.)
+//   Stats    — horizontal stacked-bar time-series graph (m/d/h × tokens/cost)
+//   Session  — per-/command in-process attribution from this bk1 session
 //
-// Series are fetched on demand per granularity and cached in a ref so flipping
-// back to a granularity you've already seen doesn't re-hit the Admin API.
+// Tab and Shift+Tab cycle tabs. Inside Stats, m/d/h cycle granularity and
+// t/$ toggle metric. Esc closes everywhere.
 
 const USAGE_FAMILY_ORDER = ['opus', 'sonnet', 'haiku', 'other'] as const;
 const USAGE_FAMILY_LABEL: Record<string, string> = {
@@ -1341,69 +1368,222 @@ const USAGE_FAMILY_COLOR: Record<string, string> = {
   haiku:  '#B9FECF',   // brand pale-green — light/cheap model
   other:  '#5A8060',   // muted moss — fallback bucket
 };
-const USAGE_BAR_WIDTH = 28;
 
-function UsageGraphView({
-  adminKey, onExit,
-}: { adminKey: string; onExit: () => void }) {
+type UsagePanelTab = 'status' | 'usage' | 'stats' | 'projects' | 'session';
+const USAGE_TAB_ORDER: UsagePanelTab[] = ['status', 'usage', 'stats', 'projects', 'session'];
+const USAGE_TAB_LABEL: Record<UsagePanelTab, string> = {
+  status:   'Status',
+  usage:    'Usage',
+  stats:    'Stats',
+  projects: 'Projects',
+  session:  'Session',
+};
+
+function UsagePanel({
+  adminKey, model, mode, paneMode, terminalMode, usageState, onExit,
+}: {
+  adminKey: string;
+  model: { id: string; label: string };
+  mode: Mode;
+  paneMode: boolean;
+  terminalMode: boolean;
+  usageState: UsageState;
+  onExit: () => void;
+}) {
+  const [tab, setTab] = useState<UsagePanelTab>('status');
+  // Stats-tab state lives on the panel (not inside StatsTab) so the user's
+  // granularity / metric choices survive flipping to another tab and back.
   const [granularity, setGranularity] = useState<import('./usage').UsageGranularity>('daily');
   const [metric, setMetric] = useState<'cost' | 'tokens'>('cost');
-  const [series, setSeries] = useState<import('./usage').UsageSeries | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const cacheRef = useRef<Partial<Record<import('./usage').UsageGranularity, import('./usage').UsageSeries>>>({});
-
-  useEffect(() => {
-    const cached = cacheRef.current[granularity];
-    if (cached) { setSeries(cached); setLoading(false); setError(null); return; }
-    setLoading(true); setError(null); setSeries(null);
-    let cancelled = false;
-    (async () => {
-      const result = await fetchOrgUsageSeries(adminKey, granularity);
-      if (cancelled) return;
-      if (typeof result === 'string') {
-        setError(result); setLoading(false); return;
-      }
-      cacheRef.current[granularity] = result;
-      setSeries(result); setLoading(false);
-    })();
-    return () => { cancelled = true; };
-  }, [granularity, adminKey]);
 
   useInput((inputChar, key) => {
     if (key.escape) { onExit(); return; }
-    if (key.tab) {
-      setGranularity(g => g === 'monthly' ? 'daily' : g === 'daily' ? 'hourly' : 'monthly');
+    if (key.tab && key.shift) {
+      setTab(t => USAGE_TAB_ORDER[(USAGE_TAB_ORDER.indexOf(t) - 1 + USAGE_TAB_ORDER.length) % USAGE_TAB_ORDER.length]!);
       return;
     }
-    if (inputChar === 't') setMetric('tokens');
-    else if (inputChar === '$' || inputChar === 'c') setMetric('cost');
-    else if (inputChar === 'm') setGranularity('monthly');
-    else if (inputChar === 'd') setGranularity('daily');
-    else if (inputChar === 'h') setGranularity('hourly');
+    if (key.tab) {
+      setTab(t => USAGE_TAB_ORDER[(USAGE_TAB_ORDER.indexOf(t) + 1) % USAGE_TAB_ORDER.length]!);
+      return;
+    }
+    if (tab === 'stats') {
+      if (inputChar === 't') setMetric('tokens');
+      else if (inputChar === '$' || inputChar === 'c') setMetric('cost');
+      else if (inputChar === 'm') setGranularity('monthly');
+      else if (inputChar === 'd') setGranularity('daily');
+      else if (inputChar === 'h') setGranularity('hourly');
+    }
   });
+
+  return (
+    <Box flexDirection="column" paddingX={2} paddingTop={1}>
+      <UsagePanelTabsHeader active={tab} />
+      <Box marginTop={1} flexDirection="column">
+        {tab === 'status'  && <StatusTab model={model} mode={mode} paneMode={paneMode} terminalMode={terminalMode} adminKey={adminKey} />}
+        {tab === 'usage'   && <UsageTab adminKey={adminKey} />}
+        {tab === 'stats'    && <StatsTab adminKey={adminKey} granularity={granularity} metric={metric} />}
+        {tab === 'projects' && <ProjectsTab />}
+        {tab === 'session'  && <SessionTab usageState={usageState} />}
+      </Box>
+      <Box marginTop={1}>
+        <Text color="#3D6650">
+          Tab next · Shift+Tab prev · Esc close
+          {tab === 'stats' && ' · m/d/h granularity · t/$ metric'}
+        </Text>
+      </Box>
+    </Box>
+  );
+}
+
+function UsagePanelTabsHeader({ active }: { active: UsagePanelTab }) {
+  return (
+    <Box gap={2}>
+      {USAGE_TAB_ORDER.map(t => (
+        <Box key={t}>
+          {t === active
+            ? <Text bold backgroundColor="#3D6650" color="#FFFFFF"> {USAGE_TAB_LABEL[t]} </Text>
+            : <Text color="#5A8060"> {USAGE_TAB_LABEL[t]} </Text>}
+        </Box>
+      ))}
+    </Box>
+  );
+}
+
+function StatusTab({
+  model, mode, paneMode, terminalMode, adminKey,
+}: {
+  model: { id: string; label: string };
+  mode: Mode;
+  paneMode: boolean;
+  terminalMode: boolean;
+  adminKey: string;
+}) {
+  // One-shot git branch lookup. Spawned synchronously via spawnSync (already
+  // imported above) on mount. If git isn't available or the dir isn't a repo,
+  // we fall back to "—" rather than surfacing an error here.
+  const [branch, setBranch] = useState<string>('…');
+  useEffect(() => {
+    try {
+      const res = spawnSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: PROJECT_DIR, encoding: 'utf-8' });
+      setBranch(res.status === 0 ? (res.stdout?.trim() || '—') : '—');
+    } catch { setBranch('—'); }
+  }, []);
+
+  // Presence only — no fingerprint, no last-N chars. The admin key never
+  // appears on screen so an over-the-shoulder reader / screenshot / screen
+  // share can't recover any part of it.
+  const keyHint = adminKey ? 'stored' : 'not stored';
+  const lintBuilt = existsSync(`${process.env.HOME}/.bk1/bk1-lint`);
+  const dbtProject = `${PROJECT_DIR}/dbt_project.yml`;
+  const dbtPresent = existsSync(dbtProject);
+
+  const rows: { label: string; value: React.ReactNode }[] = [
+    { label: 'Version',       value: <Text color="#C0FAD2">bk1 v0.1.0</Text> },
+    { label: 'Project',       value: <Text color="#C0FAD2">{PROJECT_DIR}</Text> },
+    { label: 'Branch',        value: <Text color="#C0FAD2">{branch}</Text> },
+    { label: 'Model',         value: <Text color="#C0FAD2">{model.label}  <Text color="#5A8060">({model.id})</Text></Text> },
+    { label: 'Mode',          value: <Text color="#C0FAD2">{mode}</Text> },
+    { label: 'Admin API key', value: <Text color={adminKey ? '#C0FAD2' : '#E08080'}>{keyHint}</Text> },
+    { label: 'Pane mode',     value: <Text color="#C0FAD2">{paneMode ? 'on' : 'off'}  <Text color="#5A8060">·</Text>  Terminal mode: {terminalMode ? 'on' : 'off'}</Text> },
+    { label: 'dbt project',   value: <Text color={dbtPresent ? '#C0FAD2' : '#E08080'}>{dbtProject}  <Text color="#5A8060">{dbtPresent ? '· present' : '· missing'}</Text></Text> },
+    { label: 'Lint binary',   value: <Text color={lintBuilt ? '#C0FAD2' : '#E08080'}>~/.bk1/bk1-lint  <Text color="#5A8060">{lintBuilt ? '· built' : '· missing — run `bun run setup`'}</Text></Text> },
+  ];
+
+  const labelWidth = Math.max(...rows.map(r => r.label.length)) + 1;
+
+  return (
+    <Box flexDirection="column">
+      {rows.map((row, i) => (
+        <Box key={i}>
+          <Box width={labelWidth} flexShrink={0}>
+            <Text color="#5A8060">{row.label}:</Text>
+          </Box>
+          <Box>{row.value}</Box>
+        </Box>
+      ))}
+    </Box>
+  );
+}
+
+function UsageTab({ adminKey }: { adminKey: string }) {
+  // Text-summary view (per-model rollup, daily avg, projection, cache
+  // efficiency). Re-fetched each time the tab mounts; for tighter caching
+  // see the StatsTab pattern.
+  const [text, setText] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    fetchOrgUsage(adminKey).then(t => {
+      if (cancelled) return;
+      setText(t); setLoading(false);
+    });
+    return () => { cancelled = true; };
+  }, [adminKey]);
+  if (loading) return <Text color="#5A8060">Loading organization usage…</Text>;
+  return (
+    <Box flexDirection="column">
+      {(text ?? '').split('\n').map((line, i) => (
+        <Text key={i} color="#C0FAD2">{line || ' '}</Text>
+      ))}
+    </Box>
+  );
+}
+
+function StatsTab({
+  adminKey, granularity, metric,
+}: {
+  adminKey: string;
+  granularity: import('./usage').UsageGranularity;
+  metric: 'cost' | 'tokens';
+}) {
+  // Pre-fetch all three granularities in parallel as soon as the /usage menu
+  // mounts, so switching h/d/m is instant. The cache is intentionally NOT
+  // persisted across menu closes — every fresh /usage invocation re-pulls.
+  type G = import('./usage').UsageGranularity;
+  const [cache, setCache]     = useState<Partial<Record<G, import('./usage').UsageSeries>>>({});
+  const [errors, setErrors]   = useState<Partial<Record<G, string>>>({});
+  const [pending, setPending] = useState<Set<G>>(new Set(['hourly', 'daily', 'monthly']));
+
+  useEffect(() => {
+    let cancelled = false;
+    const grans: G[] = ['hourly', 'daily', 'monthly'];
+    for (const g of grans) {
+      (async () => {
+        const result = await fetchOrgUsageSeries(adminKey, g);
+        if (cancelled) return;
+        if (typeof result === 'string') {
+          setErrors(e => ({ ...e, [g]: result }));
+        } else {
+          setCache(c => ({ ...c, [g]: result }));
+        }
+        setPending(s => { const n = new Set(s); n.delete(g); return n; });
+      })();
+    }
+    return () => { cancelled = true; };
+  }, [adminKey]);
+
+  const series  = cache[granularity] ?? null;
+  const error   = errors[granularity] ?? null;
+  const loading = pending.has(granularity);
 
   const granularityLabel =
     granularity === 'monthly' ? 'Monthly' :
     granularity === 'daily'   ? 'Daily'   : 'Hourly';
 
   return (
-    <Box flexDirection="column" paddingX={2} paddingTop={1}>
+    <Box flexDirection="column">
       <Box gap={1}>
-        <Text bold color="#B9FECF">Organization Usage</Text>
-        <Text color="#5A8060">·</Text>
         <Text color="#C0FAD2">{granularityLabel}</Text>
         {series && <><Text color="#5A8060">·</Text><Text color="#5A8060">{series.rangeLabel}</Text></>}
         <Text color="#5A8060">·</Text>
         <Text color="#C0FAD2">{metric === 'cost' ? 'cost ($)' : 'tokens'}</Text>
       </Box>
-
       <Box marginTop={1} flexDirection="column">
         {loading && <Text color="#5A8060">Loading {granularityLabel.toLowerCase()} data…</Text>}
         {error && <Text color="#E08080">{error}</Text>}
         {series && !loading && !error && <UsageBars series={series} metric={metric} />}
       </Box>
-
       {series && !loading && !error && (
         <Box marginTop={1} flexDirection="column">
           <Box gap={2}>
@@ -1428,10 +1608,88 @@ function UsageGraphView({
           </Box>
         </Box>
       )}
+    </Box>
+  );
+}
 
-      <Box marginTop={1}>
-        <Text color="#3D6650">Tab/m d h granularity · t/$ metric · Esc close</Text>
+function ProjectsTab() {
+  // Lifetime per-dbt-project breakdown sourced from ~/.bk1/usage.db. Re-loaded
+  // on each /usage open (the panel unmounts when you Esc out, so this effect
+  // fires fresh next time). Sorted by cost desc so the heaviest projects sit
+  // at the top.
+  const [rows, setRows] = useState<ProjectTotals[] | null>(null);
+
+  useEffect(() => {
+    setRows(loadProjectTotals());
+  }, []);
+
+  if (rows === null) return <Text color="#5A8060">Loading…</Text>;
+  if (rows.length === 0) {
+    return (
+      <Box flexDirection="column">
+        <Text color="#5A8060">No locally tracked usage yet.</Text>
+        <Text color="#3D6650">bk1 records one row per LLM call to ~/.bk1/usage.db — come back after a session or two.</Text>
       </Box>
+    );
+  }
+
+  const maxCost   = Math.max(...rows.map(r => r.costUsd));
+  const totalUsd  = rows.reduce((s, r) => s + r.costUsd, 0);
+  const totalTok  = rows.reduce((s, r) => s + r.tokens, 0);
+  const totalCall = rows.reduce((s, r) => s + r.callCount, 0);
+
+  // Collapse $HOME prefix so paths read as "~/work/dbt-acme" instead of
+  // "/Users/long-name/work/dbt-acme" — keeps the column narrow.
+  const home = process.env.HOME ?? '';
+  const display = (p: string) => home && p.startsWith(home) ? '~' + p.slice(home.length) : p;
+  const pathW   = Math.max(8, ...rows.map(r => display(r.projectPath).length));
+  const barW    = 18;
+
+  return (
+    <Box flexDirection="column">
+      <Text color="#5A8060">bk1-tracked sessions only · lifetime · sorted by cost</Text>
+      <Box marginTop={1} flexDirection="column">
+        {rows.map((r, i) => {
+          const filled = Math.max(1, Math.round((r.costUsd / maxCost) * barW));
+          return (
+            <Box key={i} gap={1}>
+              <Box width={pathW} flexShrink={0}>
+                <Text color="#C0FAD2">{display(r.projectPath)}</Text>
+              </Box>
+              <Box width={10} flexShrink={0}>
+                <Text color="#C0FAD2">{formatUsd(r.costUsd)}</Text>
+              </Box>
+              <Box width={12} flexShrink={0}>
+                <Text color="#5A8060">{fmtTokens(r.tokens)} tok</Text>
+              </Box>
+              <Text backgroundColor="#6B5E8C">{' '.repeat(filled)}</Text>
+              <Text color="#3D6650">{r.callCount} call{r.callCount === 1 ? '' : 's'}</Text>
+            </Box>
+          );
+        })}
+      </Box>
+      <Box marginTop={1} flexDirection="column">
+        <Box gap={2}>
+          <Text color="#5A8060">Total tracked:</Text>
+          <Text color="#C0FAD2">{formatUsd(totalUsd)}</Text>
+          <Text color="#5A8060">·</Text>
+          <Text color="#C0FAD2">{fmtTokens(totalTok)} tok</Text>
+          <Text color="#5A8060">·</Text>
+          <Text color="#C0FAD2">{totalCall} calls</Text>
+        </Box>
+        <Text color="#3D6650">Locally tracked. Anthropic Admin totals (Usage tab) may be higher if other tools share the org.</Text>
+      </Box>
+    </Box>
+  );
+}
+
+function SessionTab({ usageState }: { usageState: UsageState }) {
+  const report = renderReport(buildReport(usageState));
+  return (
+    <Box flexDirection="column">
+      {report.split('\n').map((line, i) => (
+        <Text key={i} color="#C0FAD2">{line || ' '}</Text>
+      ))}
     </Box>
   );
 }
@@ -1439,64 +1697,117 @@ function UsageGraphView({
 function UsageBars({
   series, metric,
 }: { series: import('./usage').UsageSeries; metric: 'cost' | 'tokens' }) {
+  // Column chart: time on the x-axis, value on the y-axis. Each bucket is a
+  // vertical stack of cells, with per-family segments stacked from the bottom
+  // up in USAGE_FAMILY_ORDER. The previous layout was rows-per-bucket, which
+  // made it hard to scan a time series — this one reads left-to-right.
   const values = series.buckets.map(b => metric === 'cost' ? b.totalUsd : b.totalTokens);
   const maxVal = Math.max(0.0000001, ...values);
   const maxIdx = values.indexOf(Math.max(...values));
-  const labelWidth = Math.max(6, ...series.buckets.map(b => b.label.length));
-  // One cell = maxVal / USAGE_BAR_WIDTH. Surfaced in the footer so the user
-  // can read absolute magnitudes off the bar widths instead of just the
-  // labels.
-  const cellValue = maxVal / USAGE_BAR_WIDTH;
-  const cellLabel = metric === 'cost' ? formatUsd(cellValue) : fmtTokens(cellValue);
+
+  // Y-axis width is fixed so the bars line up no matter what value formatter
+  // we're using. Heights are tuned for terminals that are typically 24 rows
+  // tall with chrome above + below the chart.
+  const chartH    = 12;
+  const yLabelW   = 9;
+  const cols      = process.stdout.columns ?? 80;
+  const availW    = Math.max(20, cols - yLabelW - 6);
+  // Each bucket gets at least 2 cells so even single-color bars are visible
+  // as bars and not vertical hairlines. Cap at 4 so 6-bucket monthly views
+  // don't stretch into giant blocks.
+  const colW      = Math.max(2, Math.min(4, Math.floor(availW / Math.max(1, series.buckets.length))));
+
+  const bars = series.buckets.map(b => {
+    const value = metric === 'cost' ? b.totalUsd : b.totalTokens;
+    const rawFilled = Math.round((value / maxVal) * chartH);
+    // Non-zero buckets get at least one row so a small day next to a huge
+    // day doesn't vanish (same reasoning as the old horizontal version).
+    const filled = value > 0 ? Math.max(1, rawFilled) : 0;
+    const segments: { family: string; cells: number }[] = [];
+    if (filled > 0 && value > 0) {
+      const raw = USAGE_FAMILY_ORDER.map(fam => {
+        const s = b.perFamily[fam];
+        const famValue = s ? (metric === 'cost' ? s.usd : s.tokens) : 0;
+        return { family: fam, exact: (famValue / value) * filled };
+      });
+      const floors = raw.map(r => ({ family: r.family, cells: Math.floor(r.exact), frac: r.exact - Math.floor(r.exact) }));
+      let used = floors.reduce((s, r) => s + r.cells, 0);
+      const leftovers = [...floors].sort((a, b) => b.frac - a.frac);
+      for (const r of leftovers) {
+        if (used >= filled) break;
+        r.cells += 1; used += 1;
+      }
+      for (const r of floors) if (r.cells > 0) segments.push({ family: r.family, cells: r.cells });
+    }
+    return { filled, segments, value };
+  });
+
+  // For column `col`, row `row` (0 = top), what family color (if any) fills it?
+  // Walks segments bottom-up — segments[0] is the bottom-most family.
+  const cellAt = (col: number, row: number): string | null => {
+    const bar = bars[col];
+    if (!bar) return null;
+    const fromBottom = chartH - row;
+    if (fromBottom > bar.filled) return null;
+    let acc = 0;
+    for (const seg of bar.segments) {
+      acc += seg.cells;
+      if (fromBottom <= acc) return seg.family;
+    }
+    return null;
+  };
+
+  const fmtVal = (v: number) => metric === 'cost' ? formatUsd(v) : fmtTokens(v);
+  const yTicks: Record<number, string> = {
+    [0]:                      fmtVal(maxVal),
+    [Math.floor(chartH / 2)]: fmtVal(maxVal / 2),
+    [chartH - 1]:             fmtVal(0),
+  };
+
+  // X-axis labels: pick a stride so labels don't collide. Each label is
+  // rendered in `colW` columns; pad with a separator so they read cleanly.
+  const labels = series.buckets.map(b => b.label);
+  const maxLabel = Math.max(...labels.map(l => l.length));
+  const stride = Math.max(1, Math.ceil((maxLabel + 1) / colW));
 
   return (
     <Box flexDirection="column">
-      {series.buckets.map((b, idx) => {
-        const value = metric === 'cost' ? b.totalUsd : b.totalTokens;
-        // Buckets with non-zero spend always get at least one cell, otherwise
-        // a $0.01 day next to a $4 day disappears entirely from the chart.
-        const rawFilled = Math.round((value / maxVal) * USAGE_BAR_WIDTH);
-        const filled = value > 0 ? Math.max(1, rawFilled) : 0;
-        // Per-family segment widths sum to `filled`. Use largest-remainder
-        // rounding so we don't drop a cell when individual families round down.
-        const segments: { family: string; cells: number }[] = [];
-        if (filled > 0 && value > 0) {
-          const raw = USAGE_FAMILY_ORDER.map(fam => {
-            const s = b.perFamily[fam];
-            const famValue = s ? (metric === 'cost' ? s.usd : s.tokens) : 0;
-            return { family: fam, exact: (famValue / value) * filled };
-          });
-          const floors = raw.map(r => ({ family: r.family, cells: Math.floor(r.exact), frac: r.exact - Math.floor(r.exact) }));
-          let used = floors.reduce((s, r) => s + r.cells, 0);
-          const leftovers = [...floors].sort((a, b) => b.frac - a.frac);
-          for (const r of leftovers) {
-            if (used >= filled) break;
-            r.cells += 1; used += 1;
-          }
-          for (const r of floors) if (r.cells > 0) segments.push({ family: r.family, cells: r.cells });
-        }
-        const valueLabel = metric === 'cost' ? formatUsd(value) : fmtTokens(value);
-        const isMax = idx === maxIdx && value > 0;
-
-        return (
-          <Box key={idx} gap={1}>
-            <Box width={labelWidth} flexShrink={0}>
-              <Text color="#5A8060">{b.label}</Text>
-            </Box>
-            <Text>
-              {segments.map((s, i) => (
-                <Text key={i} backgroundColor={USAGE_FAMILY_COLOR[s.family]}>{' '.repeat(s.cells)}</Text>
-              ))}
-              <Text> </Text>
-              <Text color="#C0FAD2">{valueLabel}</Text>
-              {isMax && <Text color="#3D6650">  ◀ max</Text>}
-            </Text>
+      {Array.from({ length: chartH }, (_, row) => (
+        <Box key={row}>
+          <Box width={yLabelW} flexShrink={0}>
+            <Text color="#5A8060">{(yTicks[row] ?? '').padStart(yLabelW)}</Text>
           </Box>
-        );
-      })}
-      <Box marginTop={1}>
-        <Box width={labelWidth} flexShrink={0}><Text> </Text></Box>
-        <Text color="#3D6650">{'  '}Scale: each ▪ ≈ {cellLabel}</Text>
+          <Text color="#3D6650">{row === chartH - 1 ? '└' : '│'}</Text>
+          <Text>
+            {bars.map((_, col) => {
+              const fam = cellAt(col, row);
+              const isMaxCol = col === maxIdx && bars[col]!.value > 0;
+              if (fam) {
+                return <Text key={col} backgroundColor={USAGE_FAMILY_COLOR[fam]}>{' '.repeat(colW)}</Text>;
+              }
+              // Mark the peak column above the bar with a small caret so the
+              // user can still pick out the max even when many bars are close.
+              const showCaret = isMaxCol && row === chartH - bars[col]!.filled - 1 && row >= 0;
+              return <Text key={col} color="#3D6650">{showCaret ? '▼'.padEnd(colW) : ' '.repeat(colW)}</Text>;
+            })}
+          </Text>
+        </Box>
+      ))}
+      {/* X-axis labels — staggered by stride so they don't overlap */}
+      <Box>
+        <Box width={yLabelW + 1} flexShrink={0}><Text> </Text></Box>
+        <Text color="#5A8060">
+          {bars.map((_, col) => {
+            const show = col % stride === 0;
+            const label = show ? labels[col]! : '';
+            const slotW = colW * stride;
+            // For the last visible label, only pad up to the end of the chart
+            // so we don't print stray spaces past the right edge.
+            const remaining = (bars.length - col) * colW;
+            const width = Math.min(slotW, remaining);
+            return <Text key={col}>{show ? label.padEnd(width).slice(0, width) : ''}</Text>;
+          })}
+        </Text>
       </Box>
     </Box>
   );
@@ -1842,6 +2153,17 @@ function App({ onLogout }: { onLogout: () => void }) {
   const [liveShellCmd, setLiveShellCmd] = useState<string | null>(null);
   const [liveShellText, setLiveShellText] = useState('');
   const shellProcRef = useRef<ReturnType<typeof Bun.spawn> | null>(null);
+  // IDE context indicator. Polls ~/.bk1/ide-context.json once a second so the
+  // user can see at a glance which file (and selection) bk1 is about to send
+  // as ambient context with the next prompt. Same freshness rules as the
+  // submit-time injection — stale snapshots render as null.
+  const [ideCtx, setIdeCtx] = useState<IdeContext | null>(null);
+  useEffect(() => {
+    const tick = () => setIdeCtx(readIdeContextRaw());
+    tick();
+    const id = setInterval(tick, 1000);
+    return () => clearInterval(id);
+  }, []);
 
   // Unified mouse-tracking lifecycle. Tracking is ON if EITHER a pet mini-game
   // is active (fetch needs to receive clicks) OR pane mode is on (dbt pane
@@ -2491,6 +2813,23 @@ function App({ onLogout }: { onLogout: () => void }) {
               cacheWrite: u.cacheWriteTokens,
             });
 
+            // Persist a row per LLM call to the global ~/.bk1/usage.db so the
+            // Projects tab can break lifetime spend down by dbt project path.
+            recordProjectUsage({
+              projectPath: PROJECT_DIR,
+              model,
+              input:       u.inputTokens,
+              output:      u.outputTokens,
+              cacheRead:   u.cacheReadTokens,
+              cacheWrite:  u.cacheWriteTokens,
+              costUsd:     estimateCostUsd({
+                input:      u.inputTokens,
+                output:     u.outputTokens,
+                cacheRead:  u.cacheReadTokens,
+                cacheWrite: u.cacheWriteTokens,
+              }, model),
+            });
+
             // Each LLM call feeds the pet a little (your tokens are its food). We tick
             // off the latest petRef so this composes cleanly with elapsed-time decay.
             const fed = autoFeedFromActivity(petRef.current);
@@ -3031,11 +3370,21 @@ function App({ onLogout }: { onLogout: () => void }) {
     return <GameComponent pet={pet} onExit={onGameExit} />;
   }
 
-  // /usage interactive graph — fullscreen takeover. Same pattern as the
-  // mini-game above: while open, the modal owns the screen and input. Closing
-  // (Esc inside the modal) flips usageGraphKey back to null.
+  // /usage tabbed panel — fullscreen takeover. Same pattern as the mini-game
+  // above: while open, the panel owns the screen and input. Closing (Esc
+  // inside the panel) flips usageGraphKey back to null.
   if (usageGraphKey) {
-    return <UsageGraphView adminKey={usageGraphKey} onExit={() => setUsageGraphKey(null)} />;
+    return (
+      <UsagePanel
+        adminKey={usageGraphKey}
+        model={MODELS[modelIdx]!}
+        mode={mode}
+        paneMode={paneMode}
+        terminalMode={terminalMode}
+        usageState={usageStateRef.current}
+        onExit={() => setUsageGraphKey(null)}
+      />
+    );
   }
 
   // Welcome screen
@@ -3065,6 +3414,7 @@ function App({ onLogout }: { onLogout: () => void }) {
                 : <Suggestions suggestions={suggestions} selectedIndex={suggestionIndex} input={input} />
           }
           <HRule />
+          <IdeContextBar ctx={ideCtx} />
           <InputBar input={input} isRunning={isRunning} mode={mode} modelLabel={MODELS[modelIdx]!.label} maskInput={awaitingAdminKey} terminalMode={terminalMode} />
           <HRule />
           <StatusFooter sessionUsd={sessionUsd} pet={pet} renderHeight={renderHeight} coinToast={coinToast} />
@@ -3113,12 +3463,21 @@ function App({ onLogout }: { onLogout: () => void }) {
       <Static items={messages}>
         {(msg, i) => (
           <Box key={i} flexDirection="column" marginBottom={1} paddingX={2} marginTop={i === 0 ? 1 : 0}>
-            {msg.role === 'user' ? (
-              <Box gap={1}>
-                <Text color="#B9FECF">{'>'}</Text>
-                <Text color="#C0FAD2" wrap="wrap">{msg.content}</Text>
-              </Box>
-            ) : (
+            {msg.role === 'user' ? (() => {
+              // Right-aligned bordered bubble so the user can visually distinguish
+              // their own prompts from the agent's left-aligned plain output.
+              const cols = process.stdout.columns ?? 80;
+              const longest = Math.max(...msg.content.split('\n').map(l => l.length));
+              const maxInner = Math.max(20, Math.floor(cols * 0.6));
+              const innerW = Math.min(maxInner, longest);
+              return (
+                <Box justifyContent="flex-end">
+                  <Box borderStyle="round" borderColor="#6B5E8C" paddingX={1} width={innerW + 4}>
+                    <Text backgroundColor="#2E2940" color="#D8CFEF" wrap="wrap">{msg.content}</Text>
+                  </Box>
+                </Box>
+              );
+            })() : (
               <>
                 <RichMessage text={msg.content} />
                 {msg.tokens && <TokenBadge tokens={msg.tokens} />}
@@ -3252,6 +3611,7 @@ function App({ onLogout }: { onLogout: () => void }) {
             : <Suggestions suggestions={suggestions} selectedIndex={suggestionIndex} input={input} />
       )}
       <HRule />
+      {!confirmPrompt && <IdeContextBar ctx={ideCtx} />}
       {confirmPrompt
         ? <ConfirmBar question={confirmPrompt} selectedIdx={confirmSelected} />
         : <InputBar input={input} isRunning={isRunning} mode={mode} modelLabel={MODELS[modelIdx]!.label} maskInput={awaitingAdminKey} terminalMode={terminalMode} />
