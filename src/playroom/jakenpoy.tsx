@@ -15,17 +15,16 @@ const WIN_AT = 2; // best of 3 → first to 2
 // Picker option order chosen by user — Papel first, then Gunting, then Bato.
 // The arrow-key cursor cycles within this array; Enter locks in.
 //
-// NOTE: emoji glyphs are intentionally absent. The earlier version
-// rendered "📄 Papel" / "✂️ Gunting" / "🪨 Bato" and crashed Yoga (Ink's
-// WASM layout engine) with "Out of bounds memory access" when the picker
-// or reveal screen mounted. The ✂️ variation-selector sequence is the
-// most cursed, but all three triggered measurement failures. Adding
-// emojis back would require a Yoga-safe width override or replacing
-// with single-codepoint substitutes that aren't ambiguous.
-const PICKER_OPTIONS: { id: JakenpoyChoice; label: string }[] = [
-  { id: 'papel',   label: 'Papel'   },
-  { id: 'gunting', label: 'Gunting' },
-  { id: 'bato',    label: 'Bato'    },
+// Emoji glyphs live in PICKER_OPTIONS but are only rendered in the picker
+// (wrapped in a fixed-width Box — see PickerRow below). Other surfaces
+// (fighter labels, reveal verdicts, match-over recap) use the plain text
+// label because the earlier version of those surfaces inlined the emoji
+// into a single <Text> string and crashed Yoga's WASM layout engine with
+// "Out of bounds memory access" on multi-codepoint glyphs (✂️ in particular).
+const PICKER_OPTIONS: { id: JakenpoyChoice; emoji: string; label: string }[] = [
+  { id: 'papel',   emoji: '📄', label: 'Papel'   },
+  { id: 'gunting', emoji: '✂️',  label: 'Gunting' },
+  { id: 'bato',    emoji: '🪨', label: 'Bato'    },
 ];
 
 function choiceLabel(c: JakenpoyChoice): string {
@@ -214,8 +213,17 @@ export function Jakenpoy({ pet, peerPet, sidecar, onExit }: Props) {
                 {PICKER_OPTIONS.map((opt, i) => {
                   const active = i === pickerIdx;
                   return (
-                    <Box key={opt.id}>
+                    <Box key={opt.id} flexDirection="row">
                       <Text color={active ? '#C0FAD2' : 'gray'}>{active ? '  > ' : '    '}</Text>
+                      {/* Each emoji rendered in its own fixed-width Box. The
+                          explicit width prevents Yoga from trying to measure
+                          the emoji's intrinsic width — that measurement is
+                          what crashed earlier. Width=4 leaves room for an
+                          emoji (1-2 cells visually) plus 2 cells of padding
+                          before the label. */}
+                      <Box width={4}>
+                        <Text>{opt.emoji}</Text>
+                      </Box>
                       <Text color={active ? '#C0FAD2' : 'gray'} bold={active}>{opt.label}</Text>
                     </Box>
                   );
