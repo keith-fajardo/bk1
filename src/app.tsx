@@ -27,6 +27,7 @@ import {
 import { disableMouseTracking, parseMouseEvents } from './mouse';
 import { GAMES } from './games';
 import { registerCoinEventHandler, emitCoinEvent, COIN_REWARDS, PASSIVE_SESSION_CAP, type CoinEvent } from './coin-events';
+import { PlayroomLobby, type LobbyMode } from './playroom/room';
 
 const MODELS = [
   { id: 'claude-haiku-4-5-20251001', label: 'Haiku 4.5' },
@@ -745,7 +746,7 @@ const PET_EYE   = '#000000';
 const PET_BLINK = '#FCD34D';
 
 interface CellSpec { glyph: string; fg?: string; bg?: string; }
-const PET_CELLS: Record<string, CellSpec> = {
+export const PET_CELLS: Record<string, CellSpec> = {
   B: { glyph: ' ', bg: PET_BODY },                 // body | body
   V: { glyph: '▀', fg: PET_EYE,   bg: PET_BODY },  // eye-open (top) | body
   M: { glyph: '▄', fg: PET_EYE,   bg: PET_BODY },  // body | eye-open (bottom)
@@ -787,7 +788,7 @@ function applyTiredEyes(rows: string[], tired: boolean): string[] {
 
 const PET_SPRITE_SENTINEL = '​'; // zero-width space — sprite-line marker
 
-function PetSpriteLine({ line }: { line: string }) {
+export function PetSpriteLine({ line }: { line: string }) {
   const payload = line.startsWith(PET_SPRITE_SENTINEL) ? line.slice(1) : line;
   return (
     <Text>
@@ -1966,6 +1967,9 @@ function App({ onLogout }: { onLogout: () => void }) {
   // the Admin API key — passed to the modal directly so it can fetch series
   // data without re-reading from disk. Set to null to close.
   const [usageGraphKey, setUsageGraphKey] = useState<string | null>(null);
+  // When set, the render path swaps the conversation view for the multiplayer
+  // playroom lobby. `null` means closed. Driven by `/pet playroom create|join`.
+  const [playroom, setPlayroom] = useState<LobbyMode | null>(null);
   // Terminal mode toggle. When ON, lines submitted at the prompt run as shell
   // commands via runInlineShell (no LLM, no tokens) — prefix with `?` to ask
   // the agent. When OFF (default), submitted lines go to the agent — prefix
@@ -2321,8 +2325,24 @@ function App({ onLogout }: { onLogout: () => void }) {
         const farewellName = nextPet.name ?? 'your pet';
         nextPet = newPet();
         note = `You released ${farewellName} back into the mangroves. A new egg appears.`;
+      } else if (sub === 'playroom') {
+        // /pet playroom <create|join [<address>]|leave>. Opens the fullscreen lobby
+        // and returns immediately — the render path swaps to <PlayroomLobby> via
+        // the `playroom` state gate above. No pet state change.
+        const [action, ...joinRest] = rest;
+        const joinAddress = joinRest.join(' ').trim();
+        if (action === 'create') {
+          setPlayroom({ kind: 'create' });
+        } else if (action === 'join') {
+          setPlayroom(joinAddress ? { kind: 'join', address: joinAddress } : { kind: 'join' });
+        } else if (action === 'leave') {
+          setPlayroom(null);
+        } else {
+          note = `Usage: /pet playroom create · /pet playroom join [<address>] · /pet playroom leave`;
+        }
+        if (!note) return;
       } else {
-        note = `Unknown /pet subcommand "${sub}". Try: /pet · /pet feed · /pet play · /pet sleep · /pet name <name> · /pet release`;
+        note = `Unknown /pet subcommand "${sub}". Try: /pet · /pet feed · /pet play · /pet sleep · /pet name <name> · /pet playroom · /pet release`;
       }
 
       petRef.current = nextPet;
@@ -2891,6 +2911,19 @@ function App({ onLogout }: { onLogout: () => void }) {
         terminalMode={terminalMode}
         usageState={usageStateRef.current}
         onExit={() => setUsageGraphKey(null)}
+      />
+    );
+  }
+
+  // /pet playroom lobby — fullscreen takeover, same pattern as /usage above.
+  // The lobby owns the screen + input while open; esc inside the lobby flips
+  // `playroom` back to null.
+  if (playroom) {
+    return (
+      <PlayroomLobby
+        mode={playroom}
+        pet={pet}
+        onExit={() => setPlayroom(null)}
       />
     );
   }
