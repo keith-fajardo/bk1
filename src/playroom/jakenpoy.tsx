@@ -118,9 +118,8 @@ export function Jakenpoy({ pet, peerPet, sidecar, onExit }: Props) {
     }
   });
 
-  const headerStatus =
-    phase.kind === 'match_over' ? 'match over' :
-    `round ${round}/3`;
+  const roundLabel = phase.kind === 'match_over' ? 'match over' : `round ${round}/3 · best of 3`;
+  const scoreLabel = `you ${score.me}  /  friend ${score.you}`;
 
   const iLost = phase.kind === 'match_over' && score.you > score.me;
   const youLost = phase.kind === 'match_over' && score.me > score.you;
@@ -130,10 +129,18 @@ export function Jakenpoy({ pet, peerPet, sidecar, onExit }: Props) {
       <Box>
         <Text color="cyan" bold>jakenpoy</Text>
         <Box flexGrow={1} />
-        <Text color="gray">{headerStatus}</Text>
+        <Text color="gray">{roundLabel}</Text>
       </Box>
 
       <Box flexDirection="column" marginY={1} paddingX={2} minHeight={16}>
+        {/* Persistent scoreboard so neither side has to guess the running tally. */}
+        <Box>
+          <Text color="gray">scoreboard:  </Text>
+          <Text bold>{scoreLabel}</Text>
+        </Box>
+
+        <Text> </Text>
+
         <FighterPair
           pet={pet}
           peerPet={peerPet}
@@ -147,8 +154,24 @@ export function Jakenpoy({ pet, peerPet, sidecar, onExit }: Props) {
 
         {phase.kind === 'choosing' && (
           <Box flexDirection="column">
+            {/* Lock-in status for both sides. Updates the instant a choice is
+                made locally OR an opponent's choice arrives over the wire, so
+                you never wonder if you're waiting on them or they on you. */}
+            <Box>
+              <Text>you:    </Text>
+              <Text color={myChoiceDisplay ? 'green' : 'gray'}>
+                {myChoiceDisplay ? '✓ locked in' : '· still picking'}
+              </Text>
+            </Box>
+            <Box>
+              <Text>friend: </Text>
+              <Text color={theirLocked ? 'green' : 'gray'}>
+                {theirLocked ? '✓ locked in' : '· still picking'}
+              </Text>
+            </Box>
+            <Text> </Text>
             {myChoiceDisplay ? (
-              <Text color="gray">waiting for friend...</Text>
+              <Text color="gray">{theirLocked ? 'resolving round...' : 'waiting for friend to pick...'}</Text>
             ) : (
               <>
                 <Text>pick:</Text>
