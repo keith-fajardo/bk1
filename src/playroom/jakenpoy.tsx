@@ -64,18 +64,30 @@ export function Jakenpoy({ pet, peerPet, sidecar, onExit }: Props) {
   const [pickerIdx, setPickerIdx] = useState(0);
   const roundRef = useRef(round);
   roundRef.current = round;
+  // scoreRef tracks the same value as the `score` state. Critical: tryResolve
+  // is captured by the useEffect([]) peer_message handler at mount time. If
+  // we read `score` (the closure variable) inside tryResolve, the handler
+  // sees the INITIAL render's score forever — {0,0} — and the next round's
+  // setScore overwrites the running tally with "initial + just this round."
+  // Reading scoreRef.current instead bypasses the stale closure entirely.
+  const scoreRef = useRef(score);
+  scoreRef.current = score;
 
-  // Try to resolve the round if both choices are in. Stable across re-renders
-  // via refs (the choices land via different code paths — keyboard vs network).
   const tryResolve = () => {
     const mine = myChoiceRef.current;
     const theirs = theirChoiceRef.current;
     if (!mine || !theirs) return;
     const outcome = jakenpoyWinner(mine, theirs);
-    let nextScore = score;
-    if (outcome === 'me') nextScore = { ...score, me: score.me + 1 };
-    if (outcome === 'you') nextScore = { ...score, you: score.you + 1 };
-    if (outcome !== 'tie') setScore(nextScore);
+    const cur = scoreRef.current;
+    let nextScore = cur;
+    if (outcome === 'me')  nextScore = { ...cur, me:  cur.me  + 1 };
+    if (outcome === 'you') nextScore = { ...cur, you: cur.you + 1 };
+    if (outcome !== 'tie') {
+      setScore(nextScore);
+      // Also update the ref synchronously — otherwise a follow-up tryResolve
+      // before the next render would still read the pre-update value.
+      scoreRef.current = nextScore;
+    }
 
     if (nextScore.me >= WIN_AT || nextScore.you >= WIN_AT) {
       setPhase({ kind: 'match_over', mine, theirs });
