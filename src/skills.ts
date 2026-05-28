@@ -654,13 +654,6 @@ If new score < 90 with remaining auto-fixable findings, offer another approval r
     expand: () => '',
   },
 
-  find: {
-    description: 'Highlight lines matching a query in the dbt log pane; /find with no arg clears',
-    usage: '/find <query>',
-    // Intercepted in app.tsx — sets dbtSearchQuery state; matching lines render in yellow.
-    expand: () => '',
-  },
-
   pet: {
     description: 'Tamagotchi mangrove pet — /pet shows stats, /pet feed|play|sleep|name <name>|release',
     usage: '/pet [feed|play|sleep|name <name>|release]',

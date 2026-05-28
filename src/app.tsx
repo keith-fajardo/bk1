@@ -27,7 +27,6 @@ import {
 import { disableMouseTracking, parseMouseEvents } from './mouse';
 import { GAMES } from './games';
 import { registerCoinEventHandler, emitCoinEvent, COIN_REWARDS, PASSIVE_SESSION_CAP, type CoinEvent } from './coin-events';
-import { parseAnsi, type AnsiSpan } from './ansi';
 
 const MODELS = [
   { id: 'claude-haiku-4-5-20251001', label: 'Haiku 4.5' },
@@ -243,16 +242,14 @@ function IdeContextBar({ ctx }: { ctx: IdeContext | null }) {
   );
 }
 
-function HintBar({ isRunning, paneMode, terminalMode }: { isRunning: boolean; paneMode: boolean; terminalMode: boolean }) {
+function HintBar({ isRunning, terminalMode }: { isRunning: boolean; terminalMode: boolean }) {
   return (
     <Box paddingX={2} paddingBottom={1}>
       {isRunning
         ? <Text color="#3D6650">t  toggle output   Esc  stop agent   Ctrl+C  exit</Text>
-        : paneMode
-          ? <Text color="#FCD34D">PANE MODE — wheel/click the dbt pane   Ctrl+P  back to input mode   Ctrl+C exit</Text>
-          : terminalMode
-            ? <Text color="#7DD3FC">TERMINAL MODE — input runs as shell   ? prefix  ask agent   Ctrl+T  back to prompt   Ctrl+C exit</Text>
-            : <Text color="#3D6650">↵ send   Tab switch mode   ! prefix  shell   Ctrl+T  terminal mode   Ctrl+P  pane mode   Ctrl+C exit</Text>
+        : terminalMode
+          ? <Text color="#7DD3FC">TERMINAL MODE — input runs as shell   ? prefix  ask agent   Ctrl+T  back to prompt   Ctrl+C exit</Text>
+          : <Text color="#3D6650">↵ send   Tab switch mode   ! prefix  shell   Ctrl+T  terminal mode   Ctrl+C exit</Text>
       }
     </Box>
   );
@@ -1086,187 +1083,6 @@ function SemanticProgressBar({ progress }: { progress: SemanticProgress }) {
   );
 }
 
-// ─── dbt log pane ────────────────────────────────────────────────────────────
-//
-// Right-side panel that streams output from `dbt …` commands the user types
-// directly into the prompt. Lives in the dynamic frame (top-right) so it
-// re-renders as new lines arrive without affecting the Static message scroll.
-// ANSI colors from dbt are parsed and re-rendered as Ink spans — PASS green /
-// FAIL red / WARN yellow all survive the pipe.
-
-// Horizontal slice that respects ANSI span boundaries: drops the first `offset`
-// visible characters across spans without losing colors on what remains.
-function sliceSpansH(spans: AnsiSpan[], offset: number): AnsiSpan[] {
-  if (offset <= 0) return spans;
-  const out: AnsiSpan[] = [];
-  let drop = offset;
-  for (const sp of spans) {
-    if (drop >= sp.text.length) { drop -= sp.text.length; continue; }
-    out.push({ ...sp, text: sp.text.slice(drop) });
-    drop = 0;
-  }
-  return out;
-}
-
-function DbtLogPane({ logs, running, width, height, scrollV, scrollH, copyFlash, paneMode, searchQuery }: {
-  logs: string[]; running: boolean; width: number; height: number;
-  scrollV: number; scrollH: number; copyFlash: boolean; paneMode: boolean;
-  searchQuery: string;
-}) {
-  const q = searchQuery.toLowerCase();
-  const searchActive = q.length > 0;
-  const matchCount = searchActive
-    ? logs.reduce((n, l) => n + (l.toLowerCase().includes(q) ? 1 : 0), 0)
-    : 0;
-  // scrollV is "lines back from bottom". end excludes the trailing N lines.
-  const end = Math.max(0, logs.length - scrollV);
-  const start = Math.max(0, end - height);
-  const visible = logs.slice(start, end);
-  const atBottom = scrollV === 0;
-  const totalBack = logs.length;
-
-  // Vertical scrollbar thumb. Track length is FIXED at `height` (matches the
-  // log-rows area, which always renders `height` rows). Earlier this used
-  // visible.length which grew with log count, causing the whole pane to change
-  // height row-by-row during a dbt run.
-  const needsBar = logs.length > height;
-  const trackLen = height;
-  let thumbStart = 0, thumbLen = trackLen;
-  if (needsBar) {
-    thumbLen = Math.max(1, Math.round((height / logs.length) * trackLen));
-    const maxThumb = trackLen - thumbLen;
-    const maxScrollV = logs.length - height;
-    const ratio = maxScrollV > 0 ? scrollV / maxScrollV : 0;
-    thumbStart = Math.round((1 - ratio) * maxThumb);
-  }
-
-  // Horizontal scrollbar. Spans the full pane width inside the borders
-  // (width - 2), so it reaches edge-to-edge — no inset gap from padding.
-  // The thumb represents scroll position against the widest visible log line.
-  // Raw line length is used as a width proxy (ANSI codes inflate it slightly,
-  // so the thumb runs a touch smaller than the "true" content — acceptable
-  // for a position indicator).
-  const hBarWidth = Math.max(1, width - 2);
-  // -2 border, -2 padding, -2 v-scrollbar = -6 (v-scrollbar is now 2 cols wide
-  // so it visually matches the h-scrollbar's 1-row thickness).
-  const contentWidth = Math.max(1, width - 6);
-  // Strip ANSI escape codes before measuring line length — without this, a
-  // colored 20-char line measures as 50+ raw chars and the h-scrollbar lets
-  // the user "scroll right" into 30 cols of blank space that don't exist.
-  const stripAnsi = (s: string) => s.replace(/\x1b\[[\d;?]*[A-Za-z~]/g, '');
-  const maxLineVisible = logs.reduce((m, l) => Math.max(m, stripAnsi(l).length), 0);
-  const hNeedsBar = maxLineVisible > contentWidth;
-  let hThumbStart = 0, hThumbLen = hBarWidth;
-  if (hNeedsBar) {
-    // Minimum thumb length of 4 so it's always visually grab-able.
-    hThumbLen = Math.max(4, Math.round((contentWidth / maxLineVisible) * hBarWidth));
-    const hMaxThumb = Math.max(0, hBarWidth - hThumbLen);
-    const hRange = Math.max(1, maxLineVisible - contentWidth);
-    hThumbStart = Math.min(hMaxThumb, Math.round((scrollH / hRange) * hMaxThumb));
-  }
-
-  return (
-    <Box flexDirection="column" width={width} borderStyle="round" borderColor="#3D6650">
-      {/* Top section: header + log content + vertical scrollbar as a row */}
-      <Box flexDirection="row">
-        <Box flexDirection="column" flexGrow={1} paddingX={1}>
-          <Box gap={1}>
-            <Text bold color="#B9FECF">dbt logs</Text>
-            {running
-              ? <Text color="#FCD34D"><Spinner type="dots" /></Text>
-              : <Text color="#3D6650">· idle</Text>}
-            {!atBottom && (
-              <Text color="#5A8060">↕ {Math.max(1, end)}/{totalBack}</Text>
-            )}
-            {scrollH > 0 && <Text color="#5A8060">→ col {scrollH}</Text>}
-            {searchActive && (
-              <Text color="#FCD34D">/{searchQuery}/ {matchCount}</Text>
-            )}
-            <Box flexGrow={1} />
-            {copyFlash
-              ? <Text color="#4ADE80">copied!</Text>
-              : paneMode
-                ? <Text color="#7AB890">[copy]</Text>
-                : <Text color="#5A8060">Ctrl+P to scroll</Text>}
-          </Box>
-          {/* Always render exactly `height` rows. Blank rows render as a
-              single space so the pane's vertical dimension stays constant
-              from the first frame onward — no growing-pane drift. */}
-          {Array.from({ length: height }, (_, i) => {
-            const line = visible[i];
-            // For missing entries (logs.length < height) render an explicit
-            // single-space row so Ink reserves a row of vertical space.
-            if (line === undefined) return <Text key={i}>{' '}</Text>;
-
-            const isMatch = searchActive && line.toLowerCase().includes(q);
-            const leftClip = scrollH > 0;
-
-            // Match rendering — whole line forced yellow + bold.
-            if (isMatch) {
-              const tail = line.slice(scrollH).replace(/\x1b\[[\d;?]*[A-Za-z~]/g, '');
-              return (
-                <Text key={i} wrap="truncate-end" color="#FCD34D" bold>
-                  {leftClip ? '…' : ''}{tail || ' '}
-                </Text>
-              );
-            }
-
-            // Normal rendering. Compute the ANSI-stripped visible tail length
-            // so we can detect rows that became empty after h-scrolling — and
-            // render them as a single-space row instead of nothing (Ink
-            // collapses empty <Text> to 0 rows, which made the pane look
-            // shorter when many lines were shorter than scrollH).
-            const stripAnsi = (s: string) => s.replace(/\x1b\[[\d;?]*[A-Za-z~]/g, '');
-            const visibleLen = stripAnsi(line).length - scrollH;
-            if (visibleLen <= 0) {
-              // Whole row scrolled off — render `…` (if scrolled) or a blank
-              // space, guaranteed to occupy 1 row.
-              return <Text key={i} wrap="truncate-end" color="#5A8060">{leftClip ? '…' : ' '}</Text>;
-            }
-
-            return (
-              <Text key={i} wrap="truncate-end">
-                {leftClip && <Text color="#5A8060">…</Text>}
-                {sliceSpansH(parseAnsi(line), scrollH).map((sp, j) => (
-                  <Text key={j} color={sp.color} bold={sp.bold} dimColor={sp.dim}>{sp.text}</Text>
-                ))}
-              </Text>
-            );
-          })}
-        </Box>
-        {/* Vertical scrollbar column. 2 cols wide so its visual thickness
-            matches the h-scrollbar's 1-row thickness (1 col would look thin
-            since terminal cells are ~2x taller than they are wide). */}
-        <Box flexDirection="column" width={2} flexShrink={0}>
-          <Text> </Text>{/* spacer to align track with log rows, not header */}
-          {Array.from({ length: trackLen }, (_, i) => {
-            const isThumb = needsBar && i >= thumbStart && i < thumbStart + thumbLen;
-            return (
-              <Text key={i} color={isThumb ? '#FCD34D' : '#5A8060'} bold={isThumb}>
-                {isThumb ? '██' : '││'}
-              </Text>
-            );
-          })}
-        </Box>
-      </Box>
-      {/* Bottom section: horizontal scrollbar — spans the full pane width
-          inside the borders (not constrained by the inner column's padding),
-          so it visually reaches edge-to-edge. */}
-      <Box>
-        {Array.from({ length: hBarWidth }, (_, i) => {
-          const isThumb = hNeedsBar && i >= hThumbStart && i < hThumbStart + hThumbLen;
-          // Thumb uses solid block (█) which is unambiguously distinct from
-          // the rounded-border ─ glyph that sits just below the h-scrollbar.
-          // Color contrast (yellow vs olive) reinforces this.
-          return isThumb
-            ? <Text key={i} color="#FCD34D" bold>█</Text>
-            : <Text key={i} color="#5A8060">─</Text>;
-        })}
-      </Box>
-    </Box>
-  );
-}
-
 // ─── Login screen ────────────────────────────────────────────────────────────
 //
 // Shown before the main TUI when no API key is found in env or ~/.bk1/auth.json.
@@ -1380,12 +1196,11 @@ const USAGE_TAB_LABEL: Record<UsagePanelTab, string> = {
 };
 
 function UsagePanel({
-  adminKey, model, mode, paneMode, terminalMode, usageState, onExit,
+  adminKey, model, mode, terminalMode, usageState, onExit,
 }: {
   adminKey: string;
   model: { id: string; label: string };
   mode: Mode;
-  paneMode: boolean;
   terminalMode: boolean;
   usageState: UsageState;
   onExit: () => void;
@@ -1419,7 +1234,7 @@ function UsagePanel({
     <Box flexDirection="column" paddingX={2} paddingTop={1}>
       <UsagePanelTabsHeader active={tab} />
       <Box marginTop={1} flexDirection="column">
-        {tab === 'status'  && <StatusTab model={model} mode={mode} paneMode={paneMode} terminalMode={terminalMode} adminKey={adminKey} />}
+        {tab === 'status'  && <StatusTab model={model} mode={mode} terminalMode={terminalMode} adminKey={adminKey} />}
         {tab === 'usage'   && <UsageTab adminKey={adminKey} />}
         {tab === 'stats'    && <StatsTab adminKey={adminKey} granularity={granularity} metric={metric} />}
         {tab === 'projects' && <ProjectsTab />}
@@ -1450,11 +1265,10 @@ function UsagePanelTabsHeader({ active }: { active: UsagePanelTab }) {
 }
 
 function StatusTab({
-  model, mode, paneMode, terminalMode, adminKey,
+  model, mode, terminalMode, adminKey,
 }: {
   model: { id: string; label: string };
   mode: Mode;
-  paneMode: boolean;
   terminalMode: boolean;
   adminKey: string;
 }) {
@@ -1484,7 +1298,7 @@ function StatusTab({
     { label: 'Model',         value: <Text color="#C0FAD2">{model.label}  <Text color="#5A8060">({model.id})</Text></Text> },
     { label: 'Mode',          value: <Text color="#C0FAD2">{mode}</Text> },
     { label: 'Admin API key', value: <Text color={adminKey ? '#C0FAD2' : '#E08080'}>{keyHint}</Text> },
-    { label: 'Pane mode',     value: <Text color="#C0FAD2">{paneMode ? 'on' : 'off'}  <Text color="#5A8060">·</Text>  Terminal mode: {terminalMode ? 'on' : 'off'}</Text> },
+    { label: 'Terminal mode', value: <Text color="#C0FAD2">{terminalMode ? 'on' : 'off'}</Text> },
     { label: 'dbt project',   value: <Text color={dbtPresent ? '#C0FAD2' : '#E08080'}>{dbtProject}  <Text color="#5A8060">{dbtPresent ? '· present' : '· missing'}</Text></Text> },
     { label: 'Lint binary',   value: <Text color={lintBuilt ? '#C0FAD2' : '#E08080'}>~/.bk1/bk1-lint  <Text color="#5A8060">{lintBuilt ? '· built' : '· missing — run `bun run setup`'}</Text></Text> },
   ];
@@ -2006,45 +1820,11 @@ function App({ onLogout }: { onLogout: () => void }) {
   const [confirmPrompt, setConfirmPrompt] = useState<string | null>(null);
   const [confirmSelected, setConfirmSelected] = useState(0);
   const [liveTokens, setLiveTokens] = useState<TokenTotals | null>(null);
-  // dbt passthrough: typed `dbt …` commands run as subprocesses (no LLM, no tokens)
-  // and stream into the right-side log pane. dbtRunning is separate from isRunning
-  // so the user can keep chatting while a long dbt build runs.
-  const [dbtLogs, setDbtLogs] = useState<string[]>([]);
-  const [dbtRunning, setDbtRunning] = useState(false);
-  // Scroll offsets for DbtLogPane. scrollV is "lines back from bottom" (0 = follow tail);
-  // scrollH is "characters scrolled right" (0 = at left edge). New lines auto-stick to
-  // bottom only when scrollV is already 0 — otherwise the user's read position is held.
-  const [dbtScrollV, setDbtScrollV] = useState(0);
-  const [dbtScrollH, setDbtScrollH] = useState(0);
-  // Search query for highlighting matching lines in the dbt log pane. Set via
-  // the /find command; empty string disables highlighting.
-  const [dbtSearchQuery, setDbtSearchQuery] = useState('');
-  // Bounds of the rendered pane in terminal coordinates, captured at paint time so the
-  // raw mouse handler (which only knows screen col/row) can route wheel + clicks to it.
-  const dbtPaneBoundsRef = useRef<{
-    top: number; bottom: number; left: number; right: number;
-    copyLeft: number; copyRight: number; copyRow: number;
-    // Vertical scrollbar: scrollCol is the column; track[Top|Bottom] are the
-    // first/last track cell rows. Horizontal scrollbar: hbarRow is its row;
-    // hbar[Left|Right] are the first/last cells. Used by the drag handler.
-    scrollCol: number; trackTop: number; trackBottom: number;
-    hbarRow: number; hbarLeft: number; hbarRight: number;
-  } | null>(null);
-  // 'v' = dragging vertical scrollbar (cursor row → scrollV).
-  // 'h' = dragging horizontal scrollbar (cursor col → scrollH).
-  // null = not dragging.
-  const dbtDragRef = useRef<'v' | 'h' | null>(null);
-  const [copyFlash, setCopyFlash] = useState(false);
-  // Mirror dbtLogs into a ref so the raw-stdin mouse handler (mounted once with
-  // empty deps) can read the current value without re-binding on every append.
-  const dbtLogsRef = useRef<string[]>([]);
-  useEffect(() => { dbtLogsRef.current = dbtLogs; }, [dbtLogs]);
   // Mirror messages into a ref so callbacks with empty deps (e.g. submit's
   // /history handler) read the live state instead of the empty array captured
-  // at mount. Same pattern as dbtLogsRef above.
+  // at mount.
   const messagesRef = useRef<Message[]>([]);
   useEffect(() => { messagesRef.current = messages; }, [messages]);
-  const dbtProcRef = useRef<ReturnType<typeof Bun.spawn> | null>(null);
 
   const inputRef = useRef('');
   const isRunningRef = useRef(false);
@@ -2186,13 +1966,8 @@ function App({ onLogout }: { onLogout: () => void }) {
   // the Admin API key — passed to the modal directly so it can fetch series
   // data without re-reading from disk. Set to null to close.
   const [usageGraphKey, setUsageGraphKey] = useState<string | null>(null);
-  // Pane mode toggle. When ON, bk1 enables xterm mouse tracking so the dbt
-  // log pane's wheel/click/scrollbar/copy button respond again — at the cost
-  // of the terminal's native scroll/select. When OFF (default), no mouse
-  // tracking, native terminal everything. Toggled via Ctrl+P in useInput.
-  const [paneMode, setPaneMode] = useState(false);
   // Terminal mode toggle. When ON, lines submitted at the prompt run as shell
-  // commands via runShellCommand (no LLM, no tokens) — prefix with `?` to ask
+  // commands via runInlineShell (no LLM, no tokens) — prefix with `?` to ask
   // the agent. When OFF (default), submitted lines go to the agent — prefix
   // with `!` to shell out for a single command. Toggled via Ctrl+T.
   const [terminalMode, setTerminalMode] = useState(false);
@@ -2216,13 +1991,13 @@ function App({ onLogout }: { onLogout: () => void }) {
     return () => clearInterval(id);
   }, []);
 
-  // Unified mouse-tracking lifecycle. Tracking is ON if EITHER a pet mini-game
-  // is active (fetch needs to receive clicks) OR pane mode is on (dbt pane
-  // wheel/click/scrollbar). Otherwise OFF, so the terminal handles wheel/select
-  // natively (Claude Code-style). This replaces the per-callsite enable/disable
-  // calls that were leaving the terminal stuck in inconsistent states.
+  // Unified mouse-tracking lifecycle. Tracking is ON only while a pet mini-game
+  // is active (fetch needs to receive clicks). Otherwise OFF, so the terminal
+  // handles wheel/select natively — VS Code's terminal scrollback, native text
+  // selection, and wheel scroll keep working.
+  const mouseTrackingOnRef = useRef(false);
   useEffect(() => {
-    const want = activeGame !== null || paneMode;
+    const want = activeGame !== null;
     if (want === mouseTrackingOnRef.current) return;
     if (want) {
       void import('./mouse').then(m => {
@@ -2233,32 +2008,8 @@ function App({ onLogout }: { onLogout: () => void }) {
       disableMouseTracking(process.stdout);
       mouseTrackingOnRef.current = false;
     }
-  }, [activeGame, paneMode]);
-
-  // Re-evaluate the desired mouse-mode state whenever the pet flips between awake and
-  // asleep. Polled once per second while the effect is active to catch natural wake-up
-  // (sleeping_until elapses) without lifting the sleep timer into App-level reactivity.
-  // Grace period: if the user has scrolled the dbt log pane in the last 3s we keep mouse
-  // tracking ON even if the pet is "asleep" — otherwise tracking would flip off mid-scroll
-  // and the next wheel tick would go to the terminal instead of the pane.
-  const mouseTrackingOnRef = useRef(false);
-  const lastPaneScrollAtRef = useRef(0);
-  // Called on every dbt-pane scroll interaction (wheel or keyboard). Stamps the
-  // grace-period ref so the mouse-tracking poll keeps tracking ON for ~3s after
-  // the last scroll. (Previously this also put the pet to sleep — that was a
-  // workaround for eye-tracking flicker, which the direct-stdout pet overlay
-  // now handles. Auto-sleeping on scroll just disabled mouse tracking after 3s
-  // and broke the user's ability to keep scrolling the pane with the mouse.)
-  const markPaneScroll = useCallback(() => {
-    lastPaneScrollAtRef.current = Date.now();
-  }, []);
-  // Mouse tracking is intentionally never enabled. Claude Code and other
-  // well-behaved terminal apps don't capture the mouse, which lets VS Code's
-  // terminal scrollback, native text selection, and wheel scroll keep working.
-  // The cost: bk1's click-driven features (pet tap, [copy] click, scrollbar
-  // drag) no longer fire — they all have keyboard equivalents (`/pet play`,
-  // `Ctrl+Y` for copy, `PgUp/PgDn`/`Shift+↑↓` for pane scroll). Run a one-shot
-  // disable in case a previous bk1 session left the terminal in mouse mode.
+  }, [activeGame]);
+  // One-shot disable in case a previous bk1 session left the terminal in mouse mode.
   useEffect(() => {
     disableMouseTracking(process.stdout);
     mouseTrackingOnRef.current = false;
@@ -2284,136 +2035,9 @@ function App({ onLogout }: { onLogout: () => void }) {
       // and re-render the bottom bar mid-game).
       if (activeGameRef.current) return;
       const events = parseMouseEvents(data.toString('utf8'));
-      // Maps a terminal row inside the scrollbar track onto scrollV. Top of track
-      // = oldest content (max scrollV); bottom = newest (scrollV=0). Used by both
-      // the initial press and motion-while-dragging branches below.
-      const rowToScrollV = (row: number): number | null => {
-        const b = dbtPaneBoundsRef.current;
-        if (!b) return null;
-        const paneHeight = b.trackBottom - b.trackTop + 1;
-        const maxScrollV = Math.max(0, dbtLogsRef.current.length - paneHeight);
-        const range = b.trackBottom - b.trackTop;
-        if (range <= 0) return 0;
-        const clamped = Math.max(b.trackTop, Math.min(b.trackBottom, row));
-        const ratio = (clamped - b.trackTop) / range; // 0 at top, 1 at bottom
-        return Math.round((1 - ratio) * maxScrollV);
-      };
-      // Horizontal twin of rowToScrollV — maps cursor col on the h-scrollbar
-      // onto scrollH. Max scrollH = widest log line minus the pane's visible
-      // content cols (border + padding + v-scrollbar = ~5 cols of chrome).
-      const colToScrollH = (col: number): number | null => {
-        const b = dbtPaneBoundsRef.current;
-        if (!b) return null;
-        const range = b.hbarRight - b.hbarLeft;
-        if (range <= 0) return 0;
-        const contentW = Math.max(1, (b.right - b.left + 1) - 5);
-        // Strip ANSI escape codes so the max-scroll bound matches the actual
-        // visible content width (not the raw string length, which is inflated
-        // by color escapes and would let the user scroll into empty space).
-        const stripAnsi = (s: string) => s.replace(/\x1b\[[\d;?]*[A-Za-z~]/g, '');
-        const maxLine = dbtLogsRef.current.reduce((m, l) => Math.max(m, stripAnsi(l).length), 0);
-        const maxScrollH = Math.max(0, maxLine - contentW);
-        const clamped = Math.max(b.hbarLeft, Math.min(b.hbarRight, col));
-        const ratio = (clamped - b.hbarLeft) / range;
-        return Math.round(ratio * maxScrollH);
-      };
       for (const ev of events) {
-        // Release event (any button): always clear an in-progress scrollbar drag so
-        // the next motion event doesn't keep dragging without a held button.
-        if (!ev.press && !ev.motion) {
-          if (dbtDragRef.current) dbtDragRef.current = null;
-          continue;
-        }
-        if (ev.motion) {
-          // Scrollbar drag: dispatch on which bar the user grabbed.
-          if (dbtDragRef.current === 'v') {
-            const next = rowToScrollV(ev.row);
-            if (next !== null) setDbtScrollV(next);
-            continue;
-          }
-          if (dbtDragRef.current === 'h') {
-            const next = colToScrollH(ev.col);
-            if (next !== null) setDbtScrollH(next);
-            continue;
-          }
-          // Eye tracking removed. PetSpritePanel falls through to the default
-          // (forward-facing) sprite when petMousePos.col/row stay null, which
-          // they do because nothing writes to them anymore. Trade-off: pet eyes
-          // no longer follow the cursor, but we eliminate the dominant source
-          // of awake-state Ink repaints — and reliable native text selection
-          // matters more than the eye-tracking feature.
-          continue;
-        }
-        // Wheel handling: if the dbt pane is visible, scroll it (vertical by
-        // default, horizontal with Shift). If not visible, the wheel is just
-        // ignored — bk1 no longer auto-puts the pet to sleep / releases mouse
-        // tracking on wheel. That legacy "release for native scrollback"
-        // shortcut kept breaking pane scroll on cursor-position edge cases.
-        // To get the terminal's native scrollback now, use `/pet sleep`
-        // explicitly — that's the single, predictable release path.
-        if (ev.button === 'wheel-up' || ev.button === 'wheel-down') {
-          if (dbtLogsRef.current.length > 0) {
-            const step = 3;
-            if (ev.shift) {
-              setDbtScrollH(h => Math.max(0, h + (ev.button === 'wheel-up' ? -step : step)));
-            } else {
-              setDbtScrollV(v => Math.max(0, v + (ev.button === 'wheel-up' ? step : -step)));
-            }
-            markPaneScroll();
-          }
-          continue;
-        }
-        if (ev.button !== 'left' || !ev.press) continue;
-        const b = dbtPaneBoundsRef.current;
-        // Horizontal scrollbar press FIRST so it wins the (row=trackBottom,
-        // col=scrollCol) overlap when the user clicks on the visible h-bar.
-        // ±1 row tolerance absorbs the same off-by-one we hit with [copy].
-        // Exclude clicks that land exactly inside the v-scrollbar track at its
-        // dedicated column — those are intentional v-scrollbar clicks and
-        // shouldn't be hijacked by the h-bar's tolerance band.
-        if (b && Math.abs(ev.row - b.hbarRow) <= 1
-            && ev.col >= b.hbarLeft && ev.col <= b.hbarRight
-            && !((ev.col === b.scrollCol || ev.col === b.scrollCol + 1) && ev.row >= b.trackTop && ev.row <= b.trackBottom)) {
-          dbtDragRef.current = 'h';
-          const next = colToScrollH(ev.col);
-          if (next !== null) setDbtScrollH(next);
-          continue;
-        }
-        // Vertical scrollbar press.
-        if (b && (ev.col === b.scrollCol || ev.col === b.scrollCol + 1) && ev.row >= b.trackTop && ev.row <= b.trackBottom) {
-          dbtDragRef.current = 'v';
-          const next = rowToScrollV(ev.row);
-          if (next !== null) setDbtScrollV(next);
-          continue;
-        }
-        // Copy-to-clipboard hit: [copy] text in DbtLogPane header.
-        // - Hit box: ±1 row around copyRow (absorbs off-by-one in CHROME math),
-        //   col from copyLeft-2 to right (the whole right portion of the header
-        //   so click position doesn't have to be pixel-perfect on "[copy]").
-        // - Spawn: node's spawnSync with `input` — synchronously pipes the text
-        //   to pbcopy/xsel stdin. Replaces the earlier Bun.spawn calls which
-        //   weren't reliably delivering stdin before the process exited.
-        // - Strip ANSI so the clipboard gets plain text.
-        if (b
-            && ev.row >= b.copyRow - 2 && ev.row <= b.copyRow + 2
-            && ev.col >= b.copyLeft - 2 && ev.col <= b.right) {
-          const stripAnsi = (s: string) => s.replace(/\x1b\[[\d;?]*[A-Za-z~]/g, '');
-          const text = dbtLogsRef.current.map(stripAnsi).join('\n');
-          const argv: string[] = process.platform === 'darwin'
-            ? ['pbcopy']
-            : ['xsel', '--clipboard', '--input'];
-          try {
-            spawnSync(argv[0]!, argv.slice(1), { input: text });
-          } catch { /* clipboard tool not on PATH; ignore silently */ }
-          setCopyFlash(true);
-          setTimeout(() => setCopyFlash(false), 800);
-          continue;
-        }
-        // Click anywhere over the pane (other than [copy]) is absorbed so it doesn't
-        // also register as a pet-tap in the StatusFooter band below.
-        if (b && ev.col >= b.left && ev.col <= b.right && ev.row >= b.top && ev.row <= b.bottom) {
-          continue;
-        }
+        if (!ev.press || ev.motion) continue;
+        if (ev.button !== 'left') continue;
         const totalRows = process.stdout.rows ?? 24;
         // StatusFooter is the line above the HintBar; allow a 3-row band to absorb
         // terminal padding differences.
@@ -2557,25 +2181,6 @@ function App({ onLogout }: { onLogout: () => void }) {
         return;
       }
       setUsageGraphKey(adminKey);
-      return;
-    }
-    if (raw === '/find' || raw.startsWith('/find ')) {
-      // Highlight matching lines in the dbt log pane. /find with no argument
-      // clears the highlight. Local — no LLM call.
-      setInput(''); inputRef.current = ''; setSuggestionIndex(-1);
-      const query = raw.slice('/find'.length).trim();
-      setDbtSearchQuery(query);
-      const matchCount = query
-        ? dbtLogsRef.current.filter(l => l.toLowerCase().includes(query.toLowerCase())).length
-        : 0;
-      const note = query
-        ? `Highlighting "${query}" in dbt logs (${matchCount} match${matchCount === 1 ? '' : 'es'}). Run /find with no argument to clear.`
-        : `Cleared dbt log search.`;
-      setMessages(prev => [
-        ...prev,
-        { role: 'user',      content: raw },
-        { role: 'assistant', content: note },
-      ]);
       return;
     }
     if (raw === '/review' || raw === '/scroll') {
@@ -2731,17 +2336,6 @@ function App({ onLogout }: { onLogout: () => void }) {
         { role: 'user',      content: raw },
         { role: 'assistant', content: body },
       ]);
-      return;
-    }
-
-    // dbt passthrough — `dbt …` typed literally runs as a real subprocess.
-    // No LLM call, no token spend; output streams to the right-side log pane.
-    // Echo the command into the chat as a user message so the scrollback still
-    // shows what the user ran (in order with surrounding prompts).
-    if (/^dbt(\s|$)/.test(raw)) {
-      setInput(''); inputRef.current = ''; setSuggestionIndex(-1);
-      setMessages(prev => [...prev, { role: 'user', content: raw }]);
-      void runShellCommand(raw);
       return;
     }
 
@@ -2948,86 +2542,14 @@ function App({ onLogout }: { onLogout: () => void }) {
     }
   }, []);
 
-  // dbt passthrough runner. Spawned via `bash -c` so the user's quoting + flags
-  // (`-s tag:foo`, `--vars '{...}'`) round-trip the same way they would in a
-  // real shell. FORCE_COLOR=1 makes dbt emit ANSI even though stdout is a pipe;
-  // parseAnsi in DbtLogPane translates that to Ink-friendly spans.
-  const DBT_LOG_CAP = 1000;
-  const appendDbtLines = useCallback((lines: string[]) => {
-    if (lines.length === 0) return;
-    setDbtLogs(prev => {
-      const next = prev.concat(lines);
-      return next.length > DBT_LOG_CAP ? next.slice(next.length - DBT_LOG_CAP) : next;
-    });
-    // When the user is scrolled up (scrollV > 0), bump scrollV by the number of
-    // newly appended lines so their visible window stays anchored on the same
-    // content instead of sliding forward under them. When scrollV === 0 we're
-    // auto-tailing — leave it alone so the next render shows the new tail.
-    setDbtScrollV(v => v === 0 ? 0 : v + lines.length);
-  }, []);
-  const runShellCommand = useCallback(async (raw: string) => {
-    // Each new run starts with a clean pane — prior output is dropped (still
-    // available via the [copy] button before the user triggers another run).
-    setDbtLogs([`$ ${raw}`]);
-    setDbtScrollV(0);
-    setDbtScrollH(0);
-    setDbtRunning(true);
-    try {
-      const proc = Bun.spawn(['bash', '-c', raw], {
-        cwd: PROJECT_DIR,
-        stdout: 'pipe',
-        stderr: 'pipe',
-        env: { ...process.env, FORCE_COLOR: '1', CLICOLOR_FORCE: '1' },
-      });
-      dbtProcRef.current = proc;
-      const decoder = new TextDecoder();
-      const pump = async (stream: ReadableStream<Uint8Array>) => {
-        const reader = stream.getReader();
-        let buf = '';
-        for (;;) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          buf += decoder.decode(value, { stream: true });
-          const parts = buf.split('\n');
-          buf = parts.pop() ?? '';
-          if (parts.length) appendDbtLines(parts);
-        }
-        if (buf) appendDbtLines([buf]);
-      };
-      await Promise.all([pump(proc.stdout as ReadableStream<Uint8Array>),
-                         pump(proc.stderr as ReadableStream<Uint8Array>)]);
-      const code = await proc.exited;
-      appendDbtLines([`[exit ${code}]`, '']);
-      // Award coins on successful run. Only `dbt run / build / test` count as
-      // "real work"; arbitrary shell commands (`ls`, `git status`, etc.) routed
-      // through here from terminal mode or `!`-escape do not.
-      if (code === 0) {
-        const tokens = raw.trim().split(/\s+/);
-        if (tokens[0] === 'dbt') {
-          const sub = tokens[1];
-          if (sub === 'run' || sub === 'build') {
-            emitCoinEvent({ type: 'dbt_run',  delta: COIN_REWARDS.dbtRun,  reason: `dbt ${sub}` });
-          } else if (sub === 'test') {
-            emitCoinEvent({ type: 'dbt_test', delta: COIN_REWARDS.dbtTest, reason: 'dbt test' });
-          }
-        }
-      }
-    } catch (err) {
-      appendDbtLines([`error: ${err instanceof Error ? err.message : String(err)}`, '']);
-    } finally {
-      dbtProcRef.current = null;
-      setDbtRunning(false);
-    }
-  }, [appendDbtLines]);
-
   // Inline shell runner — for `!cmd` escapes and terminal-mode lines. Streams
   // stdout+stderr through the live indicator block (so the user sees output
   // as it's produced) and commits the full result as an assistant message
-  // when the process exits. The dbt log pane stays reserved for `dbt …` runs.
+  // when the process exits.
   //
   // 2>&1 in the bash invocation merges stderr into stdout so we only need to
   // pump one stream and ordering is preserved (interleaved reads of two
-  // separate streams can race). PROJECT_DIR matches runShellCommand's cwd.
+  // separate streams can race).
   const runInlineShell = useCallback(async (cmd: string) => {
     setLiveShellCmd(cmd);
     setLiveShellText('');
@@ -3053,6 +2575,19 @@ function App({ onLogout }: { onLogout: () => void }) {
         ? (code === 0 ? out : `${out}\n[exit ${code}]`)
         : (code === 0 ? '(no output)' : `[exit ${code}]`);
       setMessages(prev => [...prev, { role: 'assistant', content }]);
+      // Award coins for successful `dbt run/build/test` invocations. Arbitrary
+      // shell commands (`ls`, `git status`, etc.) don't count as "real work".
+      if (code === 0) {
+        const tokens = cmd.trim().split(/\s+/);
+        if (tokens[0] === 'dbt') {
+          const sub = tokens[1];
+          if (sub === 'run' || sub === 'build') {
+            emitCoinEvent({ type: 'dbt_run',  delta: COIN_REWARDS.dbtRun,  reason: `dbt ${sub}` });
+          } else if (sub === 'test') {
+            emitCoinEvent({ type: 'dbt_test', delta: COIN_REWARDS.dbtTest, reason: 'dbt test' });
+          }
+        }
+      }
     } catch (err) {
       setMessages(prev => [...prev, { role: 'assistant', content: `error: ${err instanceof Error ? err.message : String(err)}` }]);
     } finally {
@@ -3075,76 +2610,6 @@ function App({ onLogout }: { onLogout: () => void }) {
     // hook — react to what was actually a mouse event. Without this guard a
     // wheel scroll would put the pet to sleep and immediately wake it back up.
     if (inputChar && /\[<\d+;\d+;\d+[Mm]/.test(inputChar)) return;
-
-    // Keyboard scroll for the dbt log pane. Lets users review log history with
-    // the pet asleep (= mouse tracking off = selection works) — no mouse needed,
-    // so there's no animation/repaint cost. PgUp/PgDn = page; Shift+↑/↓ = line.
-    // Returns early so these keys don't trigger the wake-on-keypress hook below.
-    if (dbtLogsRef.current.length > 0) {
-      const paneHeight = Math.max(6, Math.floor((process.stdout.rows ?? 24) / 2));
-      const maxScrollV = Math.max(0, dbtLogsRef.current.length - paneHeight);
-      const pageStep   = Math.max(1, paneHeight - 1);
-      // Ctrl+Y: copy the current logs to the system clipboard. Lets the user
-      // copy without the mouse — important because mouse tracking is off while
-      // the pet is asleep, and clicks don't reach bk1 to hit the [copy] button.
-      if (key.ctrl && inputChar === 'y') {
-        const stripAnsi = (s: string) => s.replace(/\x1b\[[\d;?]*[A-Za-z~]/g, '');
-        const text = dbtLogsRef.current.map(stripAnsi).join('\n');
-        const argv: string[] = process.platform === 'darwin'
-          ? ['pbcopy']
-          : ['xsel', '--clipboard', '--input'];
-        try { spawnSync(argv[0]!, argv.slice(1), { input: text }); }
-        catch { /* clipboard tool not on PATH; ignore */ }
-        setCopyFlash(true);
-        setTimeout(() => setCopyFlash(false), 800);
-        return;
-      }
-      if (key.pageUp) {
-        setDbtScrollV(v => Math.min(maxScrollV, v + pageStep));
-        markPaneScroll();
-        return;
-      }
-      if (key.pageDown) {
-        setDbtScrollV(v => Math.max(0, v - pageStep));
-        markPaneScroll();
-        return;
-      }
-      if (key.shift && key.upArrow) {
-        setDbtScrollV(v => Math.min(maxScrollV, v + 1));
-        markPaneScroll();
-        return;
-      }
-      if (key.shift && key.downArrow) {
-        setDbtScrollV(v => Math.max(0, v - 1));
-        markPaneScroll();
-        return;
-      }
-      // Shift+←/→: horizontal scroll. Step by 4 cols per press. Bounded
-      // loosely by the widest log line; if the user over-scrolls, lines just
-      // appear blank and they can scroll back. No max enforcement here.
-      if (key.shift && key.leftArrow) {
-        setDbtScrollH(h => Math.max(0, h - 4));
-        markPaneScroll();
-        return;
-      }
-      if (key.shift && key.rightArrow) {
-        // Use stripped (ANSI-free) line length so we don't allow scrolling
-        // past where there's actually visible content.
-        const stripAnsi = (s: string) => s.replace(/\x1b\[[\d;?]*[A-Za-z~]/g, '');
-        const maxLine = dbtLogsRef.current.reduce((m, l) => Math.max(m, stripAnsi(l).length), 0);
-        setDbtScrollH(h => Math.min(Math.max(0, maxLine - 10), h + 4));
-        markPaneScroll();
-        return;
-      }
-      // Shift+Home (or just inputChar === '0' with Ctrl) — fast reset to col 0
-      // when the user has scrolled right and wants to get back to the line
-      // starts. Ink's Key type doesn't expose Home, so we use Ctrl+0.
-      if (key.ctrl && inputChar === '0') {
-        setDbtScrollH(0);
-        markPaneScroll();
-        return;
-      }
-    }
 
     // Any real keypress while the pet is asleep wakes it up — the closest natural
     // substitute to "click the pet to wake it" we can offer without re-enabling
@@ -3171,12 +2636,6 @@ function App({ onLogout }: { onLogout: () => void }) {
       process.stdout.write('\x1b[2J\x1b[H');
       return;
     }
-    // Ctrl+P: toggle pane mode. The unified useEffect above watches paneMode
-    // and enables/disables xterm mouse tracking accordingly.
-    if (key.ctrl && inputChar === 'p') {
-      setPaneMode(prev => !prev);
-      return;
-    }
     // Ctrl+T: toggle terminal mode (shell-passthrough at the prompt).
     if (key.ctrl && inputChar === 't') {
       terminalModeRef.current = !terminalModeRef.current;
@@ -3191,12 +2650,11 @@ function App({ onLogout }: { onLogout: () => void }) {
       // (that's the `Sonnet 4.et` glitch where typed letters bled into the model badge).
       lastEscapeAtRef.current = Date.now();
       if (isRunningRef.current) abortRef.current?.abort();
-      if (dbtProcRef.current) { try { dbtProcRef.current.kill(); } catch { /* already exited */ } }
       if (shellProcRef.current) { try { shellProcRef.current.kill(); } catch { /* already exited */ } }
       // When nothing's running, Esc clears the input — dismisses any open
       // picker (/model, /pet play, /pet feed) and acts as a general
       // "cancel current entry" affordance.
-      if (!isRunningRef.current && !dbtProcRef.current && inputRef.current.length > 0) {
+      if (!isRunningRef.current && inputRef.current.length > 0) {
         inputRef.current = '';
         setInput('');
         setSuggestionIndex(-1);
@@ -3430,7 +2888,6 @@ function App({ onLogout }: { onLogout: () => void }) {
         adminKey={usageGraphKey}
         model={MODELS[modelIdx]!}
         mode={mode}
-        paneMode={paneMode}
         terminalMode={terminalMode}
         usageState={usageStateRef.current}
         onExit={() => setUsageGraphKey(null)}
@@ -3439,7 +2896,7 @@ function App({ onLogout }: { onLogout: () => void }) {
   }
 
   // Welcome screen
-  if (messages.length === 0 && dbtLogs.length === 0) {
+  if (messages.length === 0) {
     return (
       <Box ref={containerRef} flexDirection="column" paddingTop={1}>
         <Box flexDirection="column" paddingX={2}>
@@ -3470,7 +2927,7 @@ function App({ onLogout }: { onLogout: () => void }) {
           <HRule />
           <StatusFooter sessionUsd={sessionUsd} pet={pet} renderHeight={renderHeight} coinToast={coinToast} />
           <HRule />
-          <HintBar isRunning={isRunning} paneMode={paneMode} terminalMode={terminalMode} />
+          <HintBar isRunning={isRunning} terminalMode={terminalMode} />
         </Box>
       </Box>
     );
@@ -3538,119 +2995,53 @@ function App({ onLogout }: { onLogout: () => void }) {
         )}
       </Static>
 
-      {/* Live running indicator (left) + dbt log pane (right). Wrapped in a row
-          so the pane sits alongside the live indicator in the dynamic frame.
-          Input/footer/hint stay full-width below as siblings of this row. */}
-      <Box flexDirection="row">
-        <Box flexDirection="column" paddingX={2} flexGrow={1}>
-          {isRunning && (
-            <Box flexDirection="column" marginBottom={1}>
-              <Box gap={1}>
-                <Text color="#5A8060">{liveExpanded ? '-' : '+'}</Text>
-                <Text color="#B9FECF"><Spinner type="sand" /></Text>
-                <GlowText text="mangroooooving..." />
-                {activeTool && (
-                  <Text color="#5A8060">· {activeTool}</Text>
-                )}
+      <Box flexDirection="column" paddingX={2}>
+        {isRunning && (
+          <Box flexDirection="column" marginBottom={1}>
+            <Box gap={1}>
+              <Text color="#5A8060">{liveExpanded ? '-' : '+'}</Text>
+              <Text color="#B9FECF"><Spinner type="sand" /></Text>
+              <GlowText text="mangroooooving..." />
+              {activeTool && (
+                <Text color="#5A8060">· {activeTool}</Text>
+              )}
+            </Box>
+            {lintProgress && lintProgress.phase !== 'semantic' && <LintProgressBar progress={lintProgress} />}
+            {semanticProgress && semanticProgress.agents.some(a => !a.done) && (
+              <SemanticProgressBar progress={semanticProgress} />
+            )}
+            {liveTokens && <TokenBadge tokens={liveTokens} dim />}
+            {!liveExpanded && liveText && (
+              <Box paddingLeft={4}>
+                <Text color="#3D6650">
+                  {(liveText.trim().split('\n').slice(-1)[0] ?? '').slice(0, 120)}
+                </Text>
               </Box>
-              {lintProgress && lintProgress.phase !== 'semantic' && <LintProgressBar progress={lintProgress} />}
-              {semanticProgress && semanticProgress.agents.some(a => !a.done) && (
-                <SemanticProgressBar progress={semanticProgress} />
-              )}
-              {liveTokens && <TokenBadge tokens={liveTokens} dim />}
-              {!liveExpanded && liveText && (
-                <Box paddingLeft={4}>
-                  <Text color="#3D6650">
-                    {(liveText.trim().split('\n').slice(-1)[0] ?? '').slice(0, 120)}
-                  </Text>
-                </Box>
-              )}
-              {liveExpanded && liveText && (
-                <Box flexDirection="column" paddingLeft={3}>
-                  <Text wrap="wrap" color="#7AB890">{liveText.trimEnd()}</Text>
-                </Box>
-              )}
-            </Box>
-          )}
-          {liveShellCmd && (
-            <Box flexDirection="column" marginBottom={1}>
-              <Box gap={1}>
-                <Text color="#7DD3FC">$</Text>
-                <Text color="#BAE6FD" bold>{liveShellCmd}</Text>
-                <Text color="#5A8060"><Spinner type="sand" /></Text>
-                <Text color="#3D6650">Esc to abort</Text>
+            )}
+            {liveExpanded && liveText && (
+              <Box flexDirection="column" paddingLeft={3}>
+                <Text wrap="wrap" color="#7AB890">{liveText.trimEnd()}</Text>
               </Box>
-              {liveShellText && (
-                <Box flexDirection="column" paddingLeft={2}>
-                  <Text wrap="wrap" color="#7AB890">
-                    {liveShellText.trimEnd().split('\n').slice(-12).join('\n')}
-                  </Text>
-                </Box>
-              )}
+            )}
+          </Box>
+        )}
+        {liveShellCmd && (
+          <Box flexDirection="column" marginBottom={1}>
+            <Box gap={1}>
+              <Text color="#7DD3FC">$</Text>
+              <Text color="#BAE6FD" bold>{liveShellCmd}</Text>
+              <Text color="#5A8060"><Spinner type="sand" /></Text>
+              <Text color="#3D6650">Esc to abort</Text>
             </Box>
-          )}
-        </Box>
-        {(dbtLogs.length > 0 || dbtRunning) && (() => {
-          const cols = process.stdout.columns ?? 80;
-          const paneWidth  = Math.max(44, Math.min(88, Math.floor(cols * 0.55)));
-          // Reserve room for input, footer, hints so the pane never pushes the
-          // prompt off-screen on short terminals.
-          const paneHeight = Math.max(6, Math.floor(terminalRows / 2));
-          // Pane bounds for the raw mouse handler. Computed from `terminalRows`
-          // assuming the dynamic frame is bottom-anchored (true once there's
-          // any scrollback). CHROME = the rows BELOW the pane's bottom border:
-          //   HRule(1) + InputBar(1) + StatusFooter(5) + HRule(1) + HintBar(2)
-          // = 10. Earlier this was 9 because StatusFooter was miscounted as 4
-          // rows (marginTop+content); the actual content is the full 4-row
-          // sprite (3 body + 1 legs from withLegs) PLUS marginTop = 5. That
-          // 1-row drift was why [copy] required a click one row below the
-          // visible button.
-          const CHROME   = 10;
-          const right    = cols - 2;
-          const left     = right - paneWidth + 1;
-          // -1 for pane's bottom border row, -1 for the horizontal scrollbar
-          // row that now sits just above the bottom border.
-          const bottom   = terminalRows - CHROME - 2;
-          const top      = bottom - paneHeight;             // header + log rows
-          const copyText = '[copy]';
-          const copyRow  = top;                            // header row sits at pane's top interior row
-          const copyRight = right - 3;                     // -1 border, -2 for the 2-col scrollbar
-          const copyLeft  = copyRight - copyText.length + 1;
-          // Scrollbar column sits just inside the right border. Now 2 cols
-          // wide; `scrollCol` is the LEFT edge of the bar and click checks
-          // accept both `scrollCol` and `scrollCol + 1`. Track cells span
-          // rows top+1 (one below the header) to top+paneHeight.
-          const scrollCol   = right - 2;
-          const trackTop    = top + 1;
-          const trackBottom = top + paneHeight;
-          // Horizontal scrollbar row: sits one row below the last log row
-          // (between the log area and the pane's bottom border). Spans the
-          // full width inside the borders (left+1 to right-1).
-          const hbarRow   = bottom + 1;
-          const hbarLeft  = left + 1;
-          const hbarRight = right - 1;
-          dbtPaneBoundsRef.current = {
-            top, bottom, left, right,
-            copyLeft, copyRight, copyRow,
-            scrollCol, trackTop, trackBottom,
-            hbarRow, hbarLeft, hbarRight,
-          };
-          return (
-            <Box paddingRight={2}>
-              <DbtLogPane
-                logs={dbtLogs}
-                running={dbtRunning}
-                width={paneWidth}
-                height={paneHeight}
-                scrollV={dbtScrollV}
-                scrollH={dbtScrollH}
-                copyFlash={copyFlash}
-                paneMode={paneMode}
-                searchQuery={dbtSearchQuery}
-              />
-            </Box>
-          );
-        })()}
+            {liveShellText && (
+              <Box flexDirection="column" paddingLeft={2}>
+                <Text wrap="wrap" color="#7AB890">
+                  {liveShellText.trimEnd().split('\n').slice(-12).join('\n')}
+                </Text>
+              </Box>
+            )}
+          </Box>
+        )}
       </Box>
 
       {!confirmPrompt && (isModelPicker
@@ -3676,7 +3067,7 @@ function App({ onLogout }: { onLogout: () => void }) {
           stdout.on('resize') listener at the top of App. */}
       <StatusFooter sessionUsd={sessionUsd} pet={pet} renderHeight={terminalRows} coinToast={coinToast} />
       <HRule />
-      <HintBar isRunning={isRunning} paneMode={paneMode} terminalMode={terminalMode} />
+      <HintBar isRunning={isRunning} terminalMode={terminalMode} />
     </Box>
   );
 }
