@@ -120,7 +120,7 @@ Then stop and wait for explicit approval before writing anything.`;
   },
 
   kimball: {
-    description: 'Kimball dimensional modeling consultant — Lookup, Review, or Consult modes (Data Warehouse Toolkit 3rd ed.)',
+    description: 'Kimball dimensional modeling consultant — Lookup, Review, or Consult modes.',
     usage: '/kimball <question or "review <model>">',
     expand: (args) => {
       const hasLibrary = KIMBALL_DB !== null;
