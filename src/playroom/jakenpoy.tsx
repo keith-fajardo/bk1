@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { Box, Text, useInput } from 'ink';
 import { PetSpriteLine } from '../app';
-import { petSprite, type PetState } from '../pet';
+import { petSprite, petSpriteHappy, petSpriteSad, type PetState } from '../pet';
 import type { PlayroomSidecar } from './sidecar';
 import {
   encodeMessage,
@@ -50,9 +50,14 @@ interface Props {
   peerPet: PetState;
   sidecar: PlayroomSidecar;
   onExit: () => void;
+  // Optional dismissal handler for the natural match-end path (Enter at
+  // match_over). Caller wires it to a NON-broadcasting exit so each side
+  // dismisses its own match_over screen independently without yanking the
+  // peer off theirs. Falls back to onExit if not provided.
+  onMatchDismiss?: () => void;
 }
 
-export function Jakenpoy({ pet, peerPet, sidecar, onExit }: Props) {
+export function Jakenpoy({ pet, peerPet, sidecar, onExit, onMatchDismiss }: Props) {
   const [round, setRound] = useState(1);
   const [score, setScore] = useState({ me: 0, you: 0 });
   const [phase, setPhase] = useState<Phase>({ kind: 'choosing' });
@@ -70,6 +75,14 @@ export function Jakenpoy({ pet, peerPet, sidecar, onExit }: Props) {
   // current-round choice — the symptom users hit at the round-2 transition.
   // When we advance past reveal, we drain this buffer if it matches the new round.
   const pendingPeerChoiceRef = useRef<{ round: number; choice: JakenpoyChoice } | null>(null);
+  // Tracks whether the match ended naturally (someone reached WIN_AT). When
+  // true, the unmount cleanup SKIPS broadcasting jakenpoy_quit — the peer
+  // also reached match_over on their side and is dismissing independently,
+  // so a forfeit signal would (a) be misleading and (b) trigger their
+  // onExit/exitGame path and yank them off their own match_over screen.
+  // Mid-match esc still goes through with matchEndedRef=false → broadcasts
+  // as before, preserving the forfeit behavior.
+  const matchEndedRef = useRef(false);
   // scoreRef tracks the same value as the `score` state. Critical: tryResolve
   // is captured by the useEffect([]) peer_message handler at mount time. If
   // we read `score` (the closure variable) inside tryResolve, the handler
@@ -96,6 +109,7 @@ export function Jakenpoy({ pet, peerPet, sidecar, onExit }: Props) {
     }
 
     if (nextScore.me >= WIN_AT || nextScore.you >= WIN_AT) {
+      matchEndedRef.current = true;
       setPhase({ kind: 'match_over', mine, theirs });
     } else {
       setPhase({ kind: 'reveal', mine, theirs });
@@ -128,8 +142,13 @@ export function Jakenpoy({ pet, peerPet, sidecar, onExit }: Props) {
     });
     return () => {
       offMessage();
-      // Best-effort signal to peer that we're leaving the match.
-      sidecar.send(encodeMessage({ type: 'jakenpoy_quit' })).catch(() => {});
+      // Forfeit signal — only when leaving mid-match. When the match ended
+      // naturally on both sides (matchEndedRef set by tryResolve), we skip
+      // this so the peer can dismiss their own match_over screen at their
+      // own pace instead of being kicked out by the quit handler.
+      if (!matchEndedRef.current) {
+        sidecar.send(encodeMessage({ type: 'jakenpoy_quit' })).catch(() => {});
+      }
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -189,7 +208,7 @@ export function Jakenpoy({ pet, peerPet, sidecar, onExit }: Props) {
       return;
     }
     if (phase.kind === 'match_over') {
-      if (key.return) onExit();
+      if (key.return) (onMatchDismiss ?? onExit)();
     }
   });
 
@@ -198,6 +217,24 @@ export function Jakenpoy({ pet, peerPet, sidecar, onExit }: Props) {
 
   const iLost = phase.kind === 'match_over' && score.you > score.me;
   const youLost = phase.kind === 'match_over' && score.me > score.you;
+
+  // Per-side facial expression for the current screen.
+  //   reveal: this round's winner is happy, loser is sad, tie = neutral.
+  //   match_over: overall winner happy, loser sad.
+  //   choosing: neutral on both sides.
+  // Drives FighterPair's sprite selection — sprite swaps in-place so neither
+  // pet gets re-mounted between rounds (would flash and re-trigger animations).
+  type Mood = 'happy' | 'sad' | 'neutral';
+  let myMood: Mood = 'neutral';
+  let theirMood: Mood = 'neutral';
+  if (phase.kind === 'reveal') {
+    const r = jakenpoyWinner(phase.mine, phase.theirs);
+    if (r === 'me')  { myMood = 'happy'; theirMood = 'sad';   }
+    if (r === 'you') { myMood = 'sad';   theirMood = 'happy'; }
+  } else if (phase.kind === 'match_over') {
+    if (score.me > score.you) { myMood = 'happy'; theirMood = 'sad';   }
+    else                      { myMood = 'sad';   theirMood = 'happy'; }
+  }
 
   return (
     <Box flexDirection="column" paddingX={1} paddingY={0}>
@@ -223,6 +260,8 @@ export function Jakenpoy({ pet, peerPet, sidecar, onExit }: Props) {
           theirsLabel={fighterLabel(phase, 'you', theirLocked ? '?' : null)}
           iLost={iLost}
           youLost={youLost}
+          myMood={myMood}
+          theirMood={theirMood}
         />
 
         <Text> </Text>
@@ -301,7 +340,7 @@ function fighterLabel(phase: Phase, side: 'me' | 'you', placeholder: JakenpoyCho
 }
 
 function FighterPair({
-  pet, peerPet, mineLabel, theirsLabel, iLost, youLost,
+  pet, peerPet, mineLabel, theirsLabel, iLost, youLost, myMood, theirMood,
 }: {
   pet: PetState;
   peerPet: PetState;
@@ -309,9 +348,15 @@ function FighterPair({
   theirsLabel: string;
   iLost: boolean;
   youLost: boolean;
+  myMood: 'happy' | 'sad' | 'neutral';
+  theirMood: 'happy' | 'sad' | 'neutral';
 }) {
-  const mineSprite = petSprite(pet);
-  const peerSprite = petSprite(peerPet);
+  const spriteFor = (p: PetState, m: 'happy' | 'sad' | 'neutral') =>
+    m === 'happy' ? petSpriteHappy(p)
+    : m === 'sad' ? petSpriteSad(p)
+    : petSprite(p);
+  const mineSprite = spriteFor(pet, myMood);
+  const peerSprite = spriteFor(peerPet, theirMood);
   const yourName = pet.name ?? 'motchi';
   const peerName = peerPet.name ?? 'friend';
   return (

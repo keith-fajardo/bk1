@@ -379,6 +379,27 @@ const ADULT_SPRITE_LOOK_DR: string[] = [
   PET_SPRITE_SENTINEL + 'BBBBBBBBB',
 ];
 
+// Happy variant — yellow "blink-color" eyes at the normal eye position. Reads
+// as lit-up / sparkle vs. the default black eyes. Used in Jakenpoy when the
+// pet wins a round or the match. Reuses the existing Y cell (▀ fg=PET_BLINK
+// bg=PET_BODY) so no new glyph mappings are needed.
+const ADULT_SPRITE_HAPPY: string[] = [
+  PET_SPRITE_SENTINEL + 'BBBBBBBBB',
+  PET_SPRITE_SENTINEL + 'BBYBBBYBB',
+  PET_SPRITE_SENTINEL + 'BBBBBBBBB',
+];
+
+// Sad variant — eyes drooped to the lower half of the middle row (M cell:
+// ▄ fg=eye bg=body), reads as downcast / mope. Visually overlaps with
+// LOOK_DOWN's encoding because both express "eyes in the lower half"; that's
+// fine — they're never used at the same time (LOOK_DOWN is mouse-tracking,
+// SAD is jakenpoy-only).
+const ADULT_SPRITE_SAD: string[] = [
+  PET_SPRITE_SENTINEL + 'BBBBBBBBB',
+  PET_SPRITE_SENTINEL + 'BBMBBBMBB',
+  PET_SPRITE_SENTINEL + 'BBBBBBBBB',
+];
+
 // Egg: pre-hatch, doesn't share the body design. Kept compact since incubation has
 // its own dedicated view (no stats, no mood) — the sprite is decorative only.
 const EGG_SPRITE: string[] = [
@@ -458,6 +479,16 @@ export function petSpriteLookDL(state: PetState, now: Date = new Date()): string
 }
 export function petSpriteLookDR(state: PetState, now: Date = new Date()): string[] {
   return stage(state, now) === 'egg' ? EGG_SPRITE : withLegs(ADULT_SPRITE_LOOK_DR);
+}
+
+// Happy / sad sprite variants — used by the Jakenpoy minigame to reflect
+// win/lose state on each pet during reveal + match-over phases. Eggs don't
+// emote; they keep their inert sprite.
+export function petSpriteHappy(state: PetState, now: Date = new Date()): string[] {
+  return stage(state, now) === 'egg' ? EGG_SPRITE : withLegs(ADULT_SPRITE_HAPPY);
+}
+export function petSpriteSad(state: PetState, now: Date = new Date()): string[] {
+  return stage(state, now) === 'egg' ? EGG_SPRITE : withLegs(ADULT_SPRITE_SAD);
 }
 
 function statBar(value: number, width = 10): string {
