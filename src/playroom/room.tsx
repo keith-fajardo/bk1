@@ -9,6 +9,9 @@ import { Jakenpoy } from './jakenpoy';
 import { JakenpoySpectator } from './jakenpoy-spectator';
 import { Race } from './race';
 import { RaceSpectator } from './race-spectator';
+import { Artillery } from './artillery';
+import { LongJump } from './longjump';
+import { ShotPut } from './shotput';
 
 type LobbyState =
   | { kind: 'starting' }
@@ -24,18 +27,20 @@ export type LobbyMode =
   | { kind: 'create' }
   | { kind: 'join'; pin?: string };
 
-type SubScreen = 'lobby' | 'jakenpoy' | 'race';
+type SubScreen = 'lobby' | 'jakenpoy' | 'race' | 'artillery' | 'longjump' | 'shotput';
 
 // In-room actions, in the order shown to the user. The arrow-key cursor
 // in the connected state cycles through this list; Enter executes; the
 // `shortcut` letter is also accepted as a direct accelerator.
-type ActionId = 'jakenpoy' | 'race' | 'space-impact' | 'cycle-color' | 'change-alias';
+type ActionId = 'jakenpoy' | 'race' | 'longjump' | 'shotput' | 'artillery' | 'cycle-color' | 'change-alias';
 const CONNECTED_ACTIONS: { id: ActionId; label: string; shortcut: string; disabled?: boolean }[] = [
   { id: 'jakenpoy',     label: 'Jakenpoy',                shortcut: 'j' },
-  { id: 'race',         label: 'Race',                    shortcut: 'r' },
-  { id: 'space-impact', label: 'Space Impact (soon)',     shortcut: 's', disabled: true },
+  { id: 'race',         label: 'Steeplechase',            shortcut: 'r' },
+  { id: 'longjump',     label: 'Long Jump',               shortcut: 'p' },
+  { id: 'shotput',      label: 'Shot Put',                shortcut: 's' },
+  { id: 'artillery',    label: 'Artillery',               shortcut: 'a' },
   { id: 'cycle-color',  label: 'Cycle pet color',         shortcut: 'c' },
-  { id: 'change-alias', label: 'Change alias',            shortcut: 'a' },
+  { id: 'change-alias', label: 'Change alias',            shortcut: 'l' },
 ];
 
 interface Props {
@@ -193,7 +198,7 @@ export function PlayroomLobby({ mode, pet, sessionAlias, onSetAlias, onExit, onC
     sidecarRef.current?.send(buildHello()).catch(() => {});
   }, [pet.color, sessionAlias, state.kind]);
 
-  const launchGame = (game: 'jakenpoy' | 'race') => {
+  const launchGame = (game: 'jakenpoy' | 'race' | 'artillery' | 'longjump' | 'shotput') => {
     sidecarRef.current?.send(encodeMessage({ type: 'game_started', game })).catch(() => {});
     setSubscreen(game);
   };
@@ -212,13 +217,34 @@ export function PlayroomLobby({ mode, pet, sessionAlias, onSetAlias, onExit, onC
   const dismissMatch = () => {
     setSubscreen('lobby');
   };
+
+  // Input lockout after returning from a game. Race/Long Jump's continuous
+  // mash mechanic leaves a tail of keystrokes that the OS terminal buffers
+  // and dispatches a few ms after the game unmounts. Without a lockout,
+  // those leftover mashes hit the lobby useInput as menu shortcuts ('r'
+  // launches race again, 'a' launches artillery, etc.) — what the user
+  // sees as "the keys appearing in the lobby after the game ends."
+  //
+  // A 400ms quiet window is enough to drain the buffer in practice. The
+  // window is only armed when transitioning FROM a game TO lobby, so the
+  // initial entry into the playroom isn't affected.
+  const inputLockoutUntilRef = useRef(0);
+  const prevSubscreenRef = useRef<SubScreen>('lobby');
+  useEffect(() => {
+    if (subscreen === 'lobby' && prevSubscreenRef.current !== 'lobby') {
+      inputLockoutUntilRef.current = Date.now() + 400;
+    }
+    prevSubscreenRef.current = subscreen;
+  }, [subscreen]);
   const runAction = (id: ActionId): void => {
     switch (id) {
       case 'jakenpoy':     launchGame('jakenpoy'); return;
       case 'race':         launchGame('race'); return;
+      case 'longjump':     launchGame('longjump'); return;
+      case 'shotput':      launchGame('shotput'); return;
+      case 'artillery':    launchGame('artillery'); return;
       case 'cycle-color':  if (onCycleColor) onCycleColor(); return;
       case 'change-alias': setAliasEditing({ value: sessionAlias ?? '' }); return;
-      case 'space-impact': /* not yet implemented — picker shows it disabled */ return;
     }
   };
 
@@ -228,7 +254,7 @@ export function PlayroomLobby({ mode, pet, sessionAlias, onSetAlias, onExit, onC
     // the user is stuck inside the placeholder with no way back. Apply this
     // BEFORE the `subscreen !== 'lobby'` early return.
     const isInGamePlaceholder =
-      (subscreen === 'jakenpoy' || subscreen === 'race') &&
+      (subscreen === 'jakenpoy' || subscreen === 'race' || subscreen === 'artillery' || subscreen === 'longjump' || subscreen === 'shotput') &&
       roleRef.current !== 'spectator' &&
       (state.kind !== 'connected' || !peerPet);
     if (isInGamePlaceholder && key.escape) {
@@ -237,6 +263,10 @@ export function PlayroomLobby({ mode, pet, sessionAlias, onSetAlias, onExit, onC
     }
 
     if (subscreen !== 'lobby') return;
+
+    // Drain any leftover game-mash keystrokes before letting the lobby
+    // see them. See inputLockoutUntilRef definition above.
+    if (Date.now() < inputLockoutUntilRef.current) return;
 
     // Alias-edit text field takes priority over everything else when active.
     // Esc cancels (returns to menu without saving); Enter saves the trimmed
@@ -296,6 +326,9 @@ export function PlayroomLobby({ mode, pet, sessionAlias, onSetAlias, onExit, onC
       }
       if (input === 'j') { launchGame('jakenpoy'); return; }
       if (input === 'r') { launchGame('race'); return; }
+      if (input === 'a') { launchGame('artillery'); return; }
+      if (input === 'p') { launchGame('longjump'); return; }
+      if (input === 's') { launchGame('shotput'); return; }
       return;
     }
 
@@ -334,9 +367,30 @@ export function PlayroomLobby({ mode, pet, sessionAlias, onSetAlias, onExit, onC
   // Now we render a clear waiting placeholder.
   const sidecar = sidecarRef.current;
 
-  const isGameSubscreen = subscreen === 'jakenpoy' || subscreen === 'race';
+  const isGameSubscreen = subscreen === 'jakenpoy' || subscreen === 'race' || subscreen === 'artillery' || subscreen === 'longjump' || subscreen === 'shotput';
   if (isGameSubscreen && sidecar) {
     if (role === 'spectator') {
+      // Artillery doesn't have a dedicated spectator view yet — fall back
+      // to a no-op placeholder via the race spectator's container shell.
+      // (Spectators can still leave via esc; the relay routes data through
+      // them but they won't see live aim/fire UI.)
+      if (subscreen === 'artillery' || subscreen === 'longjump' || subscreen === 'shotput') {
+        // No dedicated spectator views for these yet. Spectators can leave
+        // via esc; the relay still routes data, just no live UI for them.
+        return (
+          <Box flexDirection="column" paddingX={1} paddingY={0}>
+            <Box>
+              <Text color="cyan" bold>{subscreen}</Text>
+              <Box flexGrow={1} />
+              <Text color="gray">spectating</Text>
+            </Box>
+            <Box flexDirection="column" marginY={1} paddingX={2} minHeight={14}>
+              <Text color="gray">spectator view for {subscreen} isn't implemented yet.</Text>
+              <Text color="gray">press esc to return to the lobby.</Text>
+            </Box>
+          </Box>
+        );
+      }
       const SpecComponent = subscreen === 'jakenpoy' ? JakenpoySpectator : RaceSpectator;
       return (
         <SpecComponent
@@ -351,6 +405,15 @@ export function PlayroomLobby({ mode, pet, sessionAlias, onSetAlias, onExit, onC
     if (state.kind === 'connected' && peerPet) {
       if (subscreen === 'jakenpoy') {
         return <Jakenpoy pet={pet} peerPet={peerPet} sidecar={sidecar} onExit={exitGame} onMatchDismiss={dismissMatch} />;
+      }
+      if (subscreen === 'artillery') {
+        return <Artillery pet={pet} peerPet={peerPet} sidecar={sidecar} role={role} onExit={exitGame} onMatchDismiss={dismissMatch} />;
+      }
+      if (subscreen === 'longjump') {
+        return <LongJump pet={pet} peerPet={peerPet} sidecar={sidecar} onExit={exitGame} onMatchDismiss={dismissMatch} />;
+      }
+      if (subscreen === 'shotput') {
+        return <ShotPut pet={pet} peerPet={peerPet} sidecar={sidecar} onExit={exitGame} onMatchDismiss={dismissMatch} />;
       }
       return <Race pet={pet} peerPet={peerPet} sidecar={sidecar} onExit={exitGame} onMatchDismiss={dismissMatch} />;
     }

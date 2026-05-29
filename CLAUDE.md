@@ -93,6 +93,20 @@ silently referenced a non-existent field and the LLM fell back to the wrong one.
 - Don't add backwards-compat shims when changing internal APIs — just update callers.
 - Match the surrounding style. The codebase trends concise.
 
+## Adding or changing a model
+
+When introducing a new Claude model (or changing the default), update all of these so the
+picker, cost tracking, and defaults stay in sync. Verify the exact model ID against the
+API first (the bare alias, e.g. `claude-opus-4-8`, not a guessed date suffix):
+
+- [src/app.tsx](src/app.tsx) — add `{ id, label }` to the `MODELS` picker list and a
+  matching line in the `MODEL_DESCS` map.
+- [src/pricing.ts](src/pricing.ts) — add the ID to `MODEL_RATES` with its rate tier.
+  `rateFor` only strips `-YYYYMMDD` suffixes, so a new alias that isn't a date variant of
+  an existing entry must be added explicitly or cost tracking falls through.
+- [src/agent.ts](src/agent.ts) — only if changing the default `MODEL` / `SUB_AGENT_MODEL`.
+  Otherwise the ID is selectable via the picker or `ANTHROPIC_MODEL` env var.
+
 ## Things to avoid
 
 - Don't modify a target dbt project's CLAUDE.md from inside any skill. bk1 reads it as

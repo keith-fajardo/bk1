@@ -8,7 +8,10 @@ import type { PetState } from '../pet';
 import type { PlayroomSidecar } from './sidecar';
 import { parseGameMessage } from './messages';
 
-const TRACK_LEN = 40;
+const TRACK_LEN = 60;             // must match race.tsx (steeplechase rendering)
+const TRACK_METERS = 3000;
+const METERS_PER_CELL = TRACK_METERS / TRACK_LEN;
+const HURDLE_POSITIONS: ReadonlySet<number> = new Set([10, 20, 30, 40, 50]);
 
 interface State {
   hostCol: number;
@@ -94,7 +97,7 @@ export function RaceSpectator({ hostPet, joinerPet, sidecar, onExit }: Props) {
   return (
     <Box flexDirection="column" paddingX={1} paddingY={0}>
       <Box>
-        <Text color="cyan" bold>race</Text>
+        <Text color="cyan" bold>steeplechase</Text>
         <Box flexGrow={1} />
         <Text color="gray">spectating · {headerStatus}</Text>
       </Box>
@@ -138,18 +141,32 @@ function TrackLine({
 }: {
   name: string; col: number; finished: number | null; ready: boolean;
 }) {
-  const tokenLeft = '·'.repeat(col);
-  const tokenRight = '·'.repeat(Math.max(0, TRACK_LEN - col));
-  const token = finished !== null ? '⚑' : '→';
+  // Per-cell composition with hurdles, run-length compressed (avoids the
+  // Yoga node-count crash that hits with too many sibling <Text> nodes).
+  const cells: { ch: string; color: string }[] = [];
+  for (let i = 0; i < TRACK_LEN; i++) {
+    if (i === col) {
+      cells.push({ ch: finished !== null ? '⚑' : '→', color: 'cyan' });
+    } else if (HURDLE_POSITIONS.has(i)) {
+      cells.push({ ch: '▮', color: 'yellow' });
+    } else {
+      cells.push({ ch: '·', color: 'gray' });
+    }
+  }
+  const runs: { color: string; text: string }[] = [];
+  for (const c of cells) {
+    const last = runs[runs.length - 1];
+    if (last && last.color === c.color) last.text += c.ch;
+    else runs.push({ color: c.color, text: c.ch });
+  }
   const timeStr = finished !== null ? `${(finished / 1000).toFixed(1)}s` : (ready ? 'ready' : '');
+  const meters = Math.min(TRACK_METERS, Math.round(col * METERS_PER_CELL));
   return (
     <Box flexDirection="row">
       <Text>{name.padEnd(10)}</Text>
-      <Text color="gray">{tokenLeft}</Text>
-      <Text color="cyan">{token}</Text>
-      <Text color="gray">{tokenRight}</Text>
+      {runs.map((r, i) => <Text key={i} color={r.color}>{r.text}</Text>)}
       <Text>|</Text>
-      <Text>  {timeStr}</Text>
+      <Text>  {timeStr || `${meters}m`}</Text>
     </Box>
   );
 }

@@ -12,7 +12,7 @@ export type GameMessage =
   | { type: 'hello'; pet: PetState }
   // Sent by whichever player launches a game from the lobby; everyone else
   // (the other player + any spectators) auto-routes into that game's view.
-  | { type: 'game_started'; game: 'jakenpoy' | 'race' }
+  | { type: 'game_started'; game: 'jakenpoy' | 'race' | 'artillery' | 'longjump' | 'shotput' }
   // Sent by whoever exits a game (esc or match-over → ↵). Returns all
   // viewers to the lobby.
   | { type: 'game_ended' }
@@ -21,7 +21,29 @@ export type GameMessage =
   | { type: 'race_ready' }
   | { type: 'race_position'; col: number }
   | { type: 'race_finished'; elapsed_ms: number }
-  | { type: 'race_quit' };
+  | { type: 'race_quit' }
+  // Artillery (Gunbound-style turn-based duel). The active player's UI
+  // mutates angle/power locally; only the COMMITTED shot crosses the wire.
+  // Both clients then simulate the trajectory deterministically from
+  // {angle, power, wind} — wind is derived per turn from a shared seed
+  // (turn number), so no separate wind broadcast is needed.
+  | { type: 'artillery_ready' }
+  | { type: 'artillery_fire'; angle: number; power: number }
+  | { type: 'artillery_quit' }
+  // Long Jump (Track-&-Field-style mash-to-run + space-to-jump). No live
+  // runup-position broadcasts — runup is local on each side. The committed
+  // jump's outcome is the only thing that crosses the wire:
+  //   distance_m — landed metres (0 on foul)
+  //   fouled     — true if the space press happened past the foul line
+  | { type: 'longjump_ready' }
+  | { type: 'longjump_finished'; distance_m: number; fouled: boolean }
+  | { type: 'longjump_quit' }
+  // Shot Put — aim angle, charge power, time the release.
+  //   distance_m — landed metres (0 on foul)
+  //   fouled     — release came too late / over-rotation out of circle
+  | { type: 'shotput_ready' }
+  | { type: 'shotput_finished'; distance_m: number; fouled: boolean }
+  | { type: 'shotput_quit' };
 
 export function encodeMessage(msg: GameMessage): string {
   return JSON.stringify(msg);
@@ -53,7 +75,7 @@ export function parseGameMessage(line: string): GameMessage | null {
       return { type: 'jakenpoy_quit' };
     case 'game_started': {
       const game = (raw as { game?: unknown }).game;
-      if (game !== 'jakenpoy' && game !== 'race') return null;
+      if (game !== 'jakenpoy' && game !== 'race' && game !== 'artillery' && game !== 'longjump' && game !== 'shotput') return null;
       return { type: 'game_started', game };
     }
     case 'game_ended':
@@ -72,6 +94,39 @@ export function parseGameMessage(line: string): GameMessage | null {
     }
     case 'race_quit':
       return { type: 'race_quit' };
+    case 'artillery_ready':
+      return { type: 'artillery_ready' };
+    case 'artillery_fire': {
+      const angle = (raw as { angle?: unknown }).angle;
+      const power = (raw as { power?: unknown }).power;
+      if (typeof angle !== 'number' || !Number.isFinite(angle)) return null;
+      if (typeof power !== 'number' || !Number.isFinite(power)) return null;
+      return { type: 'artillery_fire', angle, power };
+    }
+    case 'artillery_quit':
+      return { type: 'artillery_quit' };
+    case 'longjump_ready':
+      return { type: 'longjump_ready' };
+    case 'longjump_finished': {
+      const d = (raw as { distance_m?: unknown }).distance_m;
+      const fouled = (raw as { fouled?: unknown }).fouled;
+      if (typeof d !== 'number' || !Number.isFinite(d) || d < 0) return null;
+      if (typeof fouled !== 'boolean') return null;
+      return { type: 'longjump_finished', distance_m: d, fouled };
+    }
+    case 'longjump_quit':
+      return { type: 'longjump_quit' };
+    case 'shotput_ready':
+      return { type: 'shotput_ready' };
+    case 'shotput_finished': {
+      const d = (raw as { distance_m?: unknown }).distance_m;
+      const fouled = (raw as { fouled?: unknown }).fouled;
+      if (typeof d !== 'number' || !Number.isFinite(d) || d < 0) return null;
+      if (typeof fouled !== 'boolean') return null;
+      return { type: 'shotput_finished', distance_m: d, fouled };
+    }
+    case 'shotput_quit':
+      return { type: 'shotput_quit' };
     default:
       return null;
   }
