@@ -9,10 +9,10 @@
 // installed, or VS Code closed) and the snapshot is stale or irrelevant.
 
 import { existsSync, readFileSync, statSync } from 'fs';
-import { homedir } from 'os';
 import { join } from 'path';
+import { BK1_HOME } from './bk1-home';
 
-export const IDE_CONTEXT_PATH   = join(homedir(), '.bk1', 'ide-context.json');
+export const IDE_CONTEXT_PATH   = join(BK1_HOME, 'ide-context.json');
 const IDE_CONTEXT_TTL_MS        = 15_000;
 
 export interface IdeContext {

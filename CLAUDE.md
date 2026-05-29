@@ -34,8 +34,11 @@ sidecars/
 vscode-ext/         Optional VS Code companion extension — streams the active file
                     path + selection to ~/.bk1/ide-context.json, which
                     src/ide-context.ts reads and injects as a <system-reminder>
-                    each turn (mirrors Claude Code's <ide_opened_file>)
+                    each turn (mirrors Claude Code's <ide_opened_file>).
+                    Also auto-downloads the bk1 binary + sidecars from GitHub
+                    Releases on first activation (see "Distribution" below).
 scripts/install.sh  One-shot setup: builds binary, installs to skill dir, bun install
+.github/workflows/  release.yml builds per-platform tarballs on `v*` tags
 tests/              bun:test suites (aggregation correctness, skill contract)
 ```
 
@@ -106,6 +109,39 @@ API first (the bare alias, e.g. `claude-opus-4-8`, not a guessed date suffix):
   an existing entry must be added explicitly or cost tracking falls through.
 - [src/agent.ts](src/agent.ts) — only if changing the default `MODEL` / `SUB_AGENT_MODEL`.
   Otherwise the ID is selectable via the picker or `ANTHROPIC_MODEL` env var.
+
+## Distribution
+
+bk1 ships two ways. The bk1 source has to support both, which is why path
+resolution is split between user data and bundled assets.
+
+**Standalone** — user runs `scripts/install.sh` (or `bun run build:all`). bk1
+binary lands in `~/.local/bin/bk1`, sidecars and bundled DB in `~/.bk1/`,
+user data also in `~/.bk1/`. Single directory for everything.
+
+**VS Code extension** — extension auto-downloads the platform-matched release
+tarball to `<extension-globalStorage>/bk1/<version>/` on first activation
+(see [vscode-ext/src/bk1-loader.ts](vscode-ext/src/bk1-loader.ts)). bk1
+binary + sidecars + kimball.db all live there; user data stays at `~/.bk1/`
+so it survives extension upgrades.
+
+The two locations are reconciled in [src/bk1-home.ts](src/bk1-home.ts):
+
+- `BK1_HOME` — always `~/.bk1` (env-overridable). User data only:
+  auth.json, pet.json, usage.db, ide-context.json (written by the extension,
+  read by bk1).
+- `bk1AssetsDir()` — sibling-of-binary first, then `~/.bk1`. Returns where
+  to find bk1-lint and kimball/kimball.db. Used by
+  [src/skills.ts](src/skills.ts), [src/kimball.ts](src/kimball.ts), and the
+  `lintBuilt` status check in [src/app.tsx](src/app.tsx).
+
+**Releasing.** Tag `v<x.y.z>` on main; [.github/workflows/release.yml](.github/workflows/release.yml)
+builds darwin-arm64 and linux-x64 tarballs (bk1, bk1-lint, kimball/kimball.db
+at the tarball root) and attaches them to the GitHub Release. The tag version
+**must** match `BK1_VERSION` in [vscode-ext/src/bk1-loader.ts](vscode-ext/src/bk1-loader.ts)
+and the `version` field in [vscode-ext/package.json](vscode-ext/package.json) —
+the extension fetches `bk1-<BK1_VERSION>-<platform>.tar.gz` from the
+`v<BK1_VERSION>` release, so a mismatch means a 404 on first activation.
 
 ## Things to avoid
 

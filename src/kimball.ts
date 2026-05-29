@@ -7,13 +7,13 @@
 
 import { Database } from 'bun:sqlite';
 import { existsSync } from 'fs';
-import { homedir } from 'os';
 import { join } from 'path';
+import { bk1AssetsDir } from './bk1-home';
 
 // Resolve the DB the same way the /kimball skill resolves the knowledge directory:
 // installed location first, then repo-relative dev path.
 function resolveDbPath(): string | null {
-  const installed = join(homedir(), '.bk1/kimball/kimball.db');
+  const installed = join(bk1AssetsDir(), 'kimball/kimball.db');
   if (existsSync(installed)) return installed;
   const dev = join(import.meta.dir, '..', 'skills_data/kimball/kimball.db');
   if (existsSync(dev)) return dev;

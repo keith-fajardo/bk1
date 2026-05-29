@@ -2,7 +2,7 @@
   "name": "bk1-context",
   "displayName": "bk1 IDE Context",
   "description": "bk1 dbt coding agent — IDE context bridge + embedded terminal.",
-  "version": "0.3.2",
+  "version": "0.4.0",
   "publisher": "mangrove",
   "private": true,
   "engines": {

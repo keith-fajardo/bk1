@@ -8,6 +8,7 @@ import type Anthropic from '@anthropic-ai/sdk';
 import { runAgent, AgentAbortedError, resetAnthropicClient, type TokenUsage } from './agent';
 import { PROJECT_DIR } from './tools';
 import { LINT_REPORT_PATH } from './state';
+import { bk1AssetsDir } from './bk1-home';
 import { readIdeContextBlock, readIdeContextRaw, type IdeContext } from './ide-context';
 import { SKILLS, expandSkill } from './skills';
 import { getStoredKey, storeKey, clearStoredKey, isValidKeyShape, authFilePath, getStoredAdminKey, storeAdminKey } from './auth';
@@ -1351,7 +1352,7 @@ function StatusTab({
   // appears on screen so an over-the-shoulder reader / screenshot / screen
   // share can't recover any part of it.
   const keyHint = adminKey ? 'stored' : 'not stored';
-  const lintBuilt = existsSync(`${process.env.HOME}/.bk1/bk1-lint`);
+  const lintBuilt = existsSync(`${bk1AssetsDir()}/bk1-lint`);
   const dbtProject = `${PROJECT_DIR}/dbt_project.yml`;
   const dbtPresent = existsSync(dbtProject);
 
