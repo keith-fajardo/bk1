@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { ensureBk1 } from './bk1-loader';
 
 const CONTEXT_DIR  = path.join(os.homedir(), '.bk1');
 const CONTEXT_FILE = path.join(CONTEXT_DIR, 'ide-context.json');
@@ -25,16 +26,30 @@ interface IdeContext {
 // ---------------------------------------------------------------------------
 
 let bk1Terminal: vscode.Terminal | undefined;
+let openingBk1 = false;
 
-function openBk1(extensionUri: vscode.Uri) {
+async function openBk1(ctx: vscode.ExtensionContext) {
   if (bk1Terminal) {
     bk1Terminal.show();
     return;
   }
+  // Guard against the user mashing the "Open bk1" button while the first-run
+  // download is still in progress — withProgress doesn't queue, so we'd kick
+  // off a second download into the same directory.
+  if (openingBk1) return;
+  openingBk1 = true;
+
+  let shellPath: string;
+  try {
+    shellPath = await ensureBk1(ctx);
+  } catch (err) {
+    openingBk1 = false;
+    const msg = err instanceof Error ? err.message : String(err);
+    void vscode.window.showErrorMessage(`bk1: ${msg}`);
+    return;
+  }
 
   const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || os.homedir();
-  const bk1Bin = path.join(os.homedir(), '.local', 'bin', 'bk1');
-  const shellPath = fs.existsSync(bk1Bin) ? bk1Bin : 'bk1';
 
   // viewColumn: Beside opens bk1 in a new editor group to the side of the
   // currently active one (Claude Code-style split layout). Without this,
@@ -44,10 +59,11 @@ function openBk1(extensionUri: vscode.Uri) {
     name: 'bk1',
     shellPath,
     cwd,
-    iconPath: vscode.Uri.joinPath(extensionUri, 'media', 'icon.svg'),
+    iconPath: vscode.Uri.joinPath(ctx.extensionUri, 'media', 'icon.svg'),
     location: { viewColumn: vscode.ViewColumn.Beside },
   });
 
+  openingBk1 = false;
   bk1Terminal.show();
 }
 
@@ -237,7 +253,7 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(
     vscode.window.registerTreeDataProvider('bk1.status', statusProvider),
     vscode.window.registerTreeDataProvider('bk1.log', logProvider),
-    vscode.commands.registerCommand('bk1.open', () => openBk1(context.extensionUri)),
+    vscode.commands.registerCommand('bk1.open', () => openBk1(context)),
     vscode.commands.registerCommand('bk1.stop', () => stopBk1()),
     vscode.window.onDidCloseTerminal(t => { if (t === bk1Terminal) bk1Terminal = undefined; }),
     vscode.window.onDidChangeActiveTextEditor(scheduleWrite),

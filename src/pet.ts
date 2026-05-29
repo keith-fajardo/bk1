@@ -22,10 +22,10 @@
 // can inject arbitrary times without timer mocking or sleep().
 
 import { existsSync, readFileSync, writeFileSync, mkdirSync, chmodSync } from 'fs';
-import { homedir } from 'os';
 import { join, dirname } from 'path';
+import { BK1_HOME } from './bk1-home';
 
-const PET_FILE = join(homedir(), '.bk1', 'pet.json');
+const PET_FILE = join(BK1_HOME, 'pet.json');
 
 export interface PetState {
   name: string | null;          // null until /pet name <name> is run

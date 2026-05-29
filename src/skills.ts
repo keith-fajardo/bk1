@@ -1,8 +1,10 @@
 import { existsSync } from 'fs';
-import { homedir } from 'os';
 import { join } from 'path';
+import { bk1AssetsDir } from './bk1-home';
 
-const SKILL_DIR = join(homedir(), '.bk1');
+// Holds the bk1-lint binary + bundled kimball DB. Skill prompts substitute this
+// into the binary_path argument they tell the LLM to call lint_run with.
+const SKILL_DIR = bk1AssetsDir();
 
 // /kimball is satisfied entirely by the bundled SQLite DB — no markdown needed at runtime.
 // Detect the DB at either the installed location (deployed by scripts/install.sh) or the

@@ -15,11 +15,11 @@
 // more robust on shared boxes; can be added later behind the same API.
 
 import { existsSync, readFileSync, writeFileSync, unlinkSync, chmodSync, mkdirSync } from 'fs';
-import { homedir } from 'os';
 import { join, dirname } from 'path';
+import { BK1_HOME } from './bk1-home';
 
-const AUTH_FILE = join(homedir(), '.bk1', 'auth.json');
-const ADMIN_AUTH_FILE = join(homedir(), '.bk1', 'admin-auth.json');
+const AUTH_FILE = join(BK1_HOME, 'auth.json');
+const ADMIN_AUTH_FILE = join(BK1_HOME, 'admin-auth.json');
 
 interface StoredAuth {
   apiKey: string;

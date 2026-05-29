@@ -11,11 +11,10 @@
 
 import { Database } from 'bun:sqlite';
 import { mkdirSync, existsSync } from 'node:fs';
-import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { BK1_HOME } from './bk1-home';
 
-const BK1_HOME = join(homedir(), '.bk1');
-const DB_PATH  = join(BK1_HOME, 'usage.db');
+const DB_PATH = join(BK1_HOME, 'usage.db');
 
 let db: Database | null = null;
 

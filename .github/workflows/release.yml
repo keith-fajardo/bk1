@@ -1,0 +1,72 @@
+name: Release
+
+# Builds per-platform bk1 tarballs and attaches them to a GitHub Release when a
+# v* tag is pushed. The VS Code extension's auto-downloader (vscode-ext/src/bk1-
+# loader.ts) fetches these tarballs by tag + platform on first activation.
+#
+# Tarball layout: bk1, bk1-lint, kimball/kimball.db at the root. bk1 resolves
+# its sidecars sibling-of-binary at runtime (see src/bk1-home.ts).
+#
+# Tag scheme: v<major>.<minor>.<patch>, matching BK1_VERSION in bk1-loader.ts.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            platform: darwin-arm64
+            bun_target: bun-darwin-arm64
+          - runner: ubuntu-22.04
+            platform: linux-x64
+            bun_target: bun-linux-x64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install JS deps
+        run: bun install --frozen-lockfile
+
+      - name: Build bk1-lint
+        working-directory: sidecars/lint
+        run: cargo build --release --quiet
+
+      - name: Compile bk1 binary
+        run: bun build --compile --target=${{ matrix.bun_target }} --outfile bk1 src/app.tsx
+
+      - name: Stage release artifacts
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          STAGE="bk1-${VERSION}-${{ matrix.platform }}"
+          mkdir -p "$STAGE/kimball"
+          cp bk1 "$STAGE/bk1"
+          cp sidecars/lint/target/release/bk1-lint "$STAGE/bk1-lint"
+          cp skills_data/kimball/kimball.db "$STAGE/kimball/kimball.db"
+          chmod +x "$STAGE/bk1" "$STAGE/bk1-lint"
+          tar -czf "${STAGE}.tar.gz" -C "$STAGE" .
+          shasum -a 256 "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256"
+          echo "STAGE=$STAGE" >> "$GITHUB_ENV"
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ env.STAGE }}.tar.gz
+            ${{ env.STAGE }}.tar.gz.sha256
+          generate_release_notes: true
