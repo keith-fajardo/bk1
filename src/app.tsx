@@ -9,6 +9,7 @@ import { runAgent, AgentAbortedError, resetAnthropicClient, type TokenUsage } fr
 import { PROJECT_DIR } from './tools';
 import { LINT_REPORT_PATH } from './state';
 import { bk1AssetsDir } from './bk1-home';
+import { BK1_VERSION } from './version';
 import { readIdeContextBlock, readIdeContextRaw, type IdeContext } from './ide-context';
 import { SKILLS, expandSkill } from './skills';
 import { getStoredKey, storeKey, clearStoredKey, isValidKeyShape, authFilePath, getStoredAdminKey, storeAdminKey } from './auth';
@@ -306,7 +307,7 @@ function HintBar({ isRunning, terminalMode }: { isRunning: boolean; terminalMode
         ? <Text color="#3D6650">t  toggle output   Esc  stop agent   Ctrl+C  exit</Text>
         : terminalMode
           ? <Text color="#7DD3FC">TERMINAL MODE — input runs as shell   ? prefix  ask agent   Ctrl+T  back to prompt   Ctrl+C exit</Text>
-          : <Text color="#B9FECF">PROMPT MODE — input sent to agent   ! prefix  run shell   Shift+Enter  newline   Tab switch mode   Shift+Tab switch model   Ctrl+T  terminal mode   Ctrl+C exit</Text>
+          : <Text color="#B9FECF">PROMPT MODE — input sent to agent   ! prefix  run shell   Opt+Enter  newline   Tab switch mode   Shift+Tab switch model   Ctrl+T  terminal mode   Ctrl+C exit</Text>
       }
     </Box>
   );
@@ -1384,7 +1385,7 @@ function StatusTab({
   const dbtPresent = existsSync(dbtProject);
 
   const rows: { label: string; value: React.ReactNode }[] = [
-    { label: 'Version',       value: <Text color="#C0FAD2">bk1 v0.1.0</Text> },
+    { label: 'Version',       value: <Text color="#C0FAD2">bk1 v{BK1_VERSION}</Text> },
     { label: 'Project',       value: <Text color="#C0FAD2">{PROJECT_DIR}</Text> },
     { label: 'Branch',        value: <Text color="#C0FAD2">{branch}</Text> },
     { label: 'Model',         value: <Text color="#C0FAD2">{model.label}  <Text color="#5A8060">({model.id})</Text></Text> },
@@ -3056,10 +3057,26 @@ function App({ onLogout }: { onLogout: () => void }) {
       return;
     }
 
-    // Shift+Enter arrives as the modifyOtherKeys escape sequence (CSI 27;2;13~).
-    // It bypasses Ink's `key.return` flag — Ink only reports raw \r as return —
-    // so detect it from the inputChar before the CSI stripper would erase it.
-    // Inserts a newline into the buffer; plain Enter still submits below.
+    // Multi-line triggers, in order of reliability:
+    //
+    //   1. Alt+Enter (Option+Enter on Mac) — `key.meta && key.return`. The
+    //      Option key always prepends ESC at the byte level, which Ink reports
+    //      as `key.meta`. Works in every terminal because it doesn't depend on
+    //      modifyOtherKeys / kitty / any terminal protocol. This is the
+    //      primary advertised shortcut.
+    //   2. Shift+Enter via modifyOtherKeys (CSI 27;2;13~) or kitty CSI u
+    //      (CSI 13;2u) — only fires if Ink's keypress parser lets the escape
+    //      through to inputChar. A parallel raw-stdin listener (further down
+    //      in this component) handles the case where Ink filters them.
+    //
+    // Plain Enter still submits in the branch below.
+    if (key.meta && key.return) {
+      const next = inputRef.current + '\n';
+      inputRef.current = next;
+      setInput(next);
+      setSuggestionIndex(-1);
+      return;
+    }
     if (inputChar && isShiftEnter(inputChar)) {
       const next = inputRef.current + '\n';
       inputRef.current = next;
@@ -3180,7 +3197,7 @@ function App({ onLogout }: { onLogout: () => void }) {
           <Box marginTop={1} flexDirection="column">
             <Box gap={1}>
               <Text bold color="#C0FAD2">bk1</Text>
-              <Text color="#5A8060">v0.1.0</Text>
+              <Text color="#5A8060">v{BK1_VERSION}</Text>
             </Box>
             <Text color="#5A8060"><Text color="#C0FAD2">{MODELS[modelIdx]!.label}</Text> · dbt Coding Agent by Keith Fajardo @ Mangrove Digital</Text>
             <Text color="#5A8060">{PROJECT_DIR}</Text>
@@ -3229,7 +3246,7 @@ function App({ onLogout }: { onLogout: () => void }) {
             <Box marginTop={1} flexDirection="column">
               <Box gap={1}>
                 <Text bold color="#C0FAD2">bk1</Text>
-                <Text color="#5A8060">v0.1.0</Text>
+                <Text color="#5A8060">v{BK1_VERSION}</Text>
               </Box>
               <Text color="#5A8060"><Text color="#C0FAD2">{MODELS[modelIdx]!.label}</Text> · dbt Coding Agent by Keith Fajardo @ Mangrove Digital</Text>
               <Text color="#5A8060">{PROJECT_DIR}</Text>
