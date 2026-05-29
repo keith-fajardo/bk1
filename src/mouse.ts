@@ -107,11 +107,35 @@ export function disableModifyOtherKeys(out: NodeJS.WriteStream): void {
   out.write('\x1b[>4;0m');
 }
 
+// Kitty keyboard protocol level 1 ("disambiguate") — an alternate, more modern
+// way to make the terminal report Shift+Enter as a distinct escape sequence.
+// Belt-and-suspenders with modifyOtherKeys: different terminals honor different
+// subsets, so enabling both maximizes coverage. VS Code's xterm.js doesn't
+// emit modifyOtherKeys for Enter specifically but does honor kitty's CSI u
+// reporting; iTerm2 / Apple Terminal honor modifyOtherKeys but not kitty.
+//
+// Under kitty level 1, Shift+Enter arrives as `\x1b[13;2u`:
+//   - 13 is the Enter keycode (same as modifyOtherKeys)
+//   - 2 is the Shift modifier (same encoding: 1=none, 2=shift, 3=alt, 5=ctrl)
+//   - u suffix distinguishes kitty CSI from modifyOtherKeys (~ suffix)
+//
+// Enable pushes a new level onto the terminal's mode stack; disable pops it.
+// Using push/pop instead of explicit level lets us coexist with any caller
+// that already enabled the protocol (rare today but defensive against future
+// integrations).
+export function enableKittyKeyboard(out: NodeJS.WriteStream): void {
+  out.write('\x1b[>1u');
+}
+
+export function disableKittyKeyboard(out: NodeJS.WriteStream): void {
+  out.write('\x1b[<u');
+}
+
 // Detects the Shift+Enter escape sequence in an input chunk. Returns true if
-// any Shift+Enter byte sequence is present. Caller is responsible for treating
-// it as a newline insertion and stripping it from the buffer before re-using
-// the chunk as printable input.
-const SHIFT_ENTER_RE = /\x1b?\[27;2;13~/;
+// EITHER the modifyOtherKeys form (CSI 27;2;13~) or the kitty CSI u form
+// (CSI 13;2u) is present. Caller treats a true result as a newline insertion.
+const SHIFT_ENTER_MODIFY_OTHER = /\x1b?\[27;2;13~/;
+const SHIFT_ENTER_KITTY        = /\x1b?\[13;2u/;
 export function isShiftEnter(inputChar: string): boolean {
-  return SHIFT_ENTER_RE.test(inputChar);
+  return SHIFT_ENTER_MODIFY_OTHER.test(inputChar) || SHIFT_ENTER_KITTY.test(inputChar);
 }

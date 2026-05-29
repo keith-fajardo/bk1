@@ -25,7 +25,7 @@ import {
   FOODS, addCoins, petColorHex, PET_COLOR_NAMES, DEFAULT_PET_COLOR,
   type PetState,
 } from './pet';
-import { disableMouseTracking, parseMouseEvents, enableModifyOtherKeys, disableModifyOtherKeys, isShiftEnter } from './mouse';
+import { disableMouseTracking, parseMouseEvents, enableModifyOtherKeys, disableModifyOtherKeys, enableKittyKeyboard, disableKittyKeyboard, isShiftEnter } from './mouse';
 import { GAMES } from './games';
 
 // Multiplayer games live inside the playroom modal (not in GAMES), but should
@@ -1898,6 +1898,7 @@ function AppShell() {
     const restore = () => {
       disableMouseTracking(process.stdout);
       disableModifyOtherKeys(process.stdout);
+      disableKittyKeyboard(process.stdout);
     };
     process.on('exit', restore);
     process.on('SIGINT', () => { restore(); process.exit(0); });
@@ -1909,14 +1910,22 @@ function AppShell() {
     };
   }, []);
 
-  // Enable xterm modifyOtherKeys mode 2 so the terminal reports Shift+Enter as
-  // a distinct escape sequence (CSI 27;2;13~) instead of collapsing it to bare
-  // \r. The input handler detects that sequence and inserts a literal newline
-  // into the buffer instead of submitting. Terminals that don't support the
-  // mode ignore the sequence and Shift+Enter degrades to plain Enter.
+  // Enable both xterm modifyOtherKeys mode 2 AND kitty keyboard protocol level
+  // 1 so the terminal reports Shift+Enter as a distinct escape sequence. We
+  // need both because no single mode covers every terminal:
+  //   - iTerm2 / Apple Terminal honor modifyOtherKeys (CSI 27;2;13~)
+  //   - VS Code's xterm.js honors kitty CSI u (CSI 13;2u) but not
+  //     modifyOtherKeys for Enter specifically
+  // The detector accepts either form, so whichever the terminal emits wins.
+  // Unsupported terminals ignore both enable sequences and Shift+Enter
+  // degrades gracefully to plain Enter (submits the buffer).
   useEffect(() => {
     enableModifyOtherKeys(process.stdout);
-    return () => disableModifyOtherKeys(process.stdout);
+    enableKittyKeyboard(process.stdout);
+    return () => {
+      disableModifyOtherKeys(process.stdout);
+      disableKittyKeyboard(process.stdout);
+    };
   }, []);
 
 
