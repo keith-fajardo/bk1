@@ -398,20 +398,30 @@ function InputBar({ input, isRunning, mode, modelLabel, maskInput, terminalMode 
   const lines = display.split('\n');
   if (lines.length > 1) {
     const last = lines.length - 1;
+    // Each continuation line needs its own Box wrapper, not a bare Text child.
+    // Ink's flex column layout treats bare Text children as inline content
+    // that can merge with sibling rows; wrapping in Box forces a real flex
+    // item per row. The model label is omitted from multi-line render so it
+    // can't end up on a half-rendered "continuation" row — single-line
+    // already shows it, and during active multi-line edit the user doesn't
+    // need to see it.
     return (
       <Box paddingX={2} flexDirection="column">
-        <Box gap={1}>
+        <Box>
           <Text color={badgeColor} bold>{badgeLabel}</Text>
+          <Text> </Text>
           <Text color={accent}>{promptChar}</Text>
+          <Text> </Text>
           <Text color={text}>{lines[0]}</Text>
         </Box>
         {lines.slice(1, last).map((line, i) => (
-          <Text key={i} color={text}>  {line}</Text>
+          <Box key={i}>
+            <Text color={text}>  {line}</Text>
+          </Box>
         ))}
-        <Box gap={1}>
+        <Box>
           <Text color={text}>  {lines[last]}</Text>
           <Text color={accent}>█</Text>
-          <Text color="#3D6650">  {modelLabel}</Text>
         </Box>
       </Box>
     );
@@ -3267,14 +3277,22 @@ function App({ onLogout }: { onLogout: () => void }) {
             {msg.role === 'user' ? (() => {
               // Right-aligned bordered bubble so the user can visually distinguish
               // their own prompts from the agent's left-aligned plain output.
+              // Each newline-separated line renders as its own Text inside a
+              // column-direction Box. Ink's wrap="wrap" on a single Text element
+              // with embedded \n sometimes collapses the newlines when the
+              // parent Box has a fixed width — splitting + flexDirection=column
+              // sidesteps that path entirely.
               const cols = process.stdout.columns ?? 80;
-              const longest = Math.max(...msg.content.split('\n').map(l => l.length));
+              const bubbleLines = msg.content.split('\n');
+              const longest = Math.max(...bubbleLines.map(l => l.length));
               const maxInner = Math.max(20, Math.floor(cols * 0.6));
               const innerW = Math.min(maxInner, longest);
               return (
                 <Box justifyContent="flex-end">
-                  <Box borderStyle="round" borderColor="#6B5E8C" paddingX={1} width={innerW + 4}>
-                    <Text backgroundColor="#2E2940" color="#D8CFEF" wrap="wrap">{msg.content}</Text>
+                  <Box borderStyle="round" borderColor="#6B5E8C" paddingX={1} width={innerW + 4} flexDirection="column">
+                    {bubbleLines.map((line, j) => (
+                      <Text key={j} backgroundColor="#2E2940" color="#D8CFEF" wrap="wrap">{line || ' '}</Text>
+                    ))}
                   </Box>
                 </Box>
               );
