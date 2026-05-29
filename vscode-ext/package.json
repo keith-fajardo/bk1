@@ -2,7 +2,7 @@
   "name": "bk1-context",
   "displayName": "bk1 - dbt coding agent",
   "description": "Coding agent for dbt projects — reviews modeling against Kimball and lints folders against dbt best practices",
-  "version": "0.4.14",
+  "version": "0.4.15",
   "publisher": "keithfajardo",
   "private": true,
   "icon": "media/icon.png",
@@ -71,7 +71,21 @@
           "group": "navigation"
         }
       ]
-    }
+    },
+    "keybindings": [
+      {
+        "key": "ctrl+t",
+        "command": "workbench.action.terminal.sendSequence",
+        "args": { "text": "\u0014" },
+        "when": "bk1.terminalFocused"
+      },
+      {
+        "key": "ctrl+l",
+        "command": "workbench.action.terminal.sendSequence",
+        "args": { "text": "\u000c" },
+        "when": "bk1.terminalFocused"
+      }
+    ]
   },
   "scripts": {
     "build": "tsc -p .",
