@@ -51,17 +51,26 @@ jobs:
     if: needs.gate.outputs.should_release == 'true'
     strategy:
       fail-fast: false
+      # Both macOS arches build on the arm64 runner (macos-14): bun and cargo
+      # cross-compile to x86_64 via bun_target / rust_target. This avoids the
+      # macos-13 (Intel) runner, whose queue times are long and unpredictable
+      # and would otherwise block the whole release (the homebrew job needs all
+      # legs). rust_target is passed to cargo for every leg so the artifact path
+      # is uniform; for a native leg it's just an explicit host triple.
       matrix:
         include:
           - runner: macos-14
             platform: darwin-arm64
             bun_target: bun-darwin-arm64
-          - runner: macos-13
+            rust_target: aarch64-apple-darwin
+          - runner: macos-14
             platform: darwin-x64
             bun_target: bun-darwin-x64
+            rust_target: x86_64-apple-darwin
           - runner: ubuntu-22.04
             platform: linux-x64
             bun_target: bun-linux-x64
+            rust_target: x86_64-unknown-linux-gnu
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -71,13 +80,15 @@ jobs:
           bun-version: latest
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
 
       - name: Install JS deps
         run: bun install --frozen-lockfile
 
       - name: Build bk1-lint
         working-directory: sidecars/lint
-        run: cargo build --release --quiet
+        run: cargo build --release --target ${{ matrix.rust_target }} --quiet
 
       - name: Compile bk1 binary
         # --define process.env.DEV='"false"': inlines DEV as the literal string
@@ -96,7 +107,7 @@ jobs:
           STAGE="bk1-${VERSION}-${{ matrix.platform }}"
           mkdir -p "$STAGE/kimball"
           cp bk1 "$STAGE/bk1"
-          cp sidecars/lint/target/release/bk1-lint "$STAGE/bk1-lint"
+          cp sidecars/lint/target/${{ matrix.rust_target }}/release/bk1-lint "$STAGE/bk1-lint"
           cp skills_data/kimball/kimball.db "$STAGE/kimball/kimball.db"
           chmod +x "$STAGE/bk1" "$STAGE/bk1-lint"
           tar -czf "${STAGE}.tar.gz" -C "$STAGE" .
