@@ -2,7 +2,7 @@ import { useState, useRef, useCallback, useMemo, useEffect } from 'react';
 import { existsSync, mkdirSync, writeFileSync } from 'fs';
 import { homedir } from 'os';
 import { spawnSync } from 'node:child_process';
-import { render, Box, Text, Static, useInput, measureElement, type DOMElement } from 'ink';
+import { render, Box, Text, Static, useInput, measureElement, type DOMElement, type Instance } from 'ink';
 import Spinner from 'ink-spinner';
 import type Anthropic from '@anthropic-ai/sdk';
 import { runAgent, AgentAbortedError, resetAnthropicClient, type TokenUsage } from './agent';
@@ -29,6 +29,13 @@ import {
 } from './pet';
 import { disableMouseTracking, parseMouseEvents, enableModifyOtherKeys, disableModifyOtherKeys, enableKittyKeyboard, disableKittyKeyboard, isShiftEnter, normalizeKittyKeys } from './mouse';
 import { GAMES } from './games';
+
+// The Ink render() instance, set once at startup (bottom of file). The resize
+// handler uses inkInstance.clear() to reset Ink's log-update line tracking, which
+// the terminal's line-rewrap on resize otherwise desyncs (leaving a duplicated
+// input bar). Module-scoped because render() happens outside the component tree.
+let inkInstance: Instance | null = null;
+function setInkInstance(instance: Instance) { inkInstance = instance; }
 
 // Multiplayer games live inside the playroom modal (not in GAMES), but should
 // still appear in the /pet play picker so users can discover them. Picking
@@ -2202,19 +2209,33 @@ function App({ onLogout }: { onLogout: () => void }) {
   // so the calculation needs to follow window resizes. Ink doesn't expose a
   // ready-made hook, so we listen to stdout's resize event ourselves.
   const [terminalRows, setTerminalRows] = useState(process.stdout.rows ?? 24);
+  // Bumped by the resize handler to force Ink to re-emit the live frame after we
+  // clear it. Read once below so the dependency is real and React can't elide it.
+  const [resizeNonce, setResizeNonce] = useState(0);
   useEffect(() => {
-    // Debounce so a drag-resize doesn't flicker the screen on every pixel tick.
-    // The clear sequence (\x1b[3J\x1b[H\x1b[2J — clear scrollback + cursor home
-    // + clear screen) wipes ghost InputBar copies that Ink can leave behind
-    // when the live-area cursor position drifts during resize. Ink's next paint
-    // fills the empty terminal back in cleanly.
+    // Resize handling. Two failure modes to thread between:
+    //
+    //   1. Clearing scrollback (\x1b[3J) destroys the conversation history, because
+    //      it lives in Ink's <Static> output which Ink won't reprint on a normal
+    //      render. So we never touch scrollback.
+    //   2. NOT clearing leaves a duplicated input bar: on resize the terminal rewraps
+    //      the on-screen live frame, which desyncs log-update's eraseLines() math
+    //      (it erases a line count measured at the old width), so the old frame isn't
+    //      fully erased before the new one is drawn.
+    //
+    // The fix is to clear ONLY the live region (cursor to end of screen, \x1b[J —
+    // which leaves the Static scrollback above the cursor intact) and reset Ink's
+    // log-update tracking via inkInstance.clear(), then force a repaint by bumping
+    // resizeNonce. Debounced so a drag-resize doesn't thrash on every pixel tick.
     let resizeTimer: ReturnType<typeof setTimeout> | undefined;
     const onResize = () => {
       setTerminalRows(process.stdout.rows ?? 24);
       if (resizeTimer) clearTimeout(resizeTimer);
       resizeTimer = setTimeout(() => {
-        process.stdout.write('\x1b[3J\x1b[H\x1b[2J');
-      }, 150);
+        inkInstance?.clear();        // reset log-update line tracking (erases old frame)
+        process.stdout.write('\x1b[J'); // mop up any rewrap residue below the cursor
+        setResizeNonce(n => n + 1);  // force Ink to re-emit the live frame cleanly
+      }, 120);
     };
     process.stdout.on('resize', onResize);
     return () => {
@@ -3091,10 +3112,14 @@ function App({ onLogout }: { onLogout: () => void }) {
     if (key.ctrl && inputChar === 'c') process.exit(0);
     // Ctrl+L force-redraws the UI — recovery hatch when the terminal's cursor gets
     // out of sync with Ink (e.g. after a stray escape sequence from Option+key in
-    // VS Code's xterm.js, or a window resize). Clears scrollback below the cursor
-    // and resets to row 1 col 1; Ink's next paint fills it back in correctly.
+    // VS Code's xterm.js, or a window resize).
     if (key.ctrl && inputChar === 'l') {
-      process.stdout.write('\x1b[2J\x1b[H');
+      // Force a full redraw via Ink's own resize path: re-emitting 'resize' makes Ink
+      // recalculate layout and reprint (clearTerminal + fullStaticOutput + output when
+      // content is taller than the screen), so the conversation history is rewritten
+      // rather than left blanked. A bare \x1b[2J would clear the visible frame without
+      // telling Ink to repaint, leaving an empty screen until the next state change.
+      process.stdout.emit('resize');
       return;
     }
     // Ctrl+T: toggle terminal mode (shell-passthrough at the prompt).
@@ -3481,7 +3506,7 @@ function App({ onLogout }: { onLogout: () => void }) {
             <Text color="#5A8060">{PROJECT_DIR}</Text>
           </Box>
         </Box>
-        <Box marginTop={1} flexDirection="column">
+        <Box key={`live-${resizeNonce}`} marginTop={1} flexDirection="column">
           {isModelPicker
             ? <ModelPicker currentIdx={modelIdx} />
             : isPetPlayroomPicker
@@ -3576,7 +3601,10 @@ function App({ onLogout }: { onLogout: () => void }) {
         )}
       </Static>
 
-      <Box flexDirection="column" paddingX={2}>
+      {/* key includes resizeNonce so a resize remounts ONLY this live frame (not the
+          Static blocks above), guaranteeing Ink emits fresh output after we clear the
+          rewrap-ghosted copy. */}
+      <Box key={`live-${resizeNonce}`} flexDirection="column" paddingX={2}>
         {isRunning && (
           <Box flexDirection="column" marginBottom={1}>
             <Box gap={1}>
@@ -3671,4 +3699,8 @@ process.on('uncaughtException', (err: NodeJS.ErrnoException) => {
   throw err;
 });
 
-render(<AppShell />);
+// Capture the Ink instance so the resize handler can ask Ink to re-emit the live
+// frame. On resize the terminal rewraps existing lines, which desyncs log-update's
+// erase math and leaves a duplicated input bar; clear() resets that tracking so the
+// next paint is clean. See the resize useEffect in App.
+setInkInstance(render(<AppShell />));
