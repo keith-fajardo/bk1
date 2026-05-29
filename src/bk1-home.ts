@@ -14,7 +14,7 @@
 //                for the legacy install.sh layout, then to the repo for
 //                `bun src/app.tsx` dev mode.
 
-import { existsSync } from 'node:fs';
+import { existsSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -23,7 +23,10 @@ export const BK1_HOME = process.env.BK1_HOME ?? join(homedir(), '.bk1');
 export function bk1AssetsDir(): string {
   // When bk1 is run as the compiled binary, process.execPath is that binary,
   // so its siblings are the release-tarball assets (extension-managed install).
-  const siblingDir = dirname(process.execPath);
+  // realpathSync resolves a Homebrew-style `bin/bk1 -> libexec/bk1` symlink so
+  // the assets are found in libexec (where the formula keeps them together)
+  // rather than the symlink's bin dir.
+  const siblingDir = dirname(realpathSync(process.execPath));
   if (existsSync(join(siblingDir, 'bk1-lint'))) return siblingDir;
   // Standalone install layout (scripts/install.sh).
   if (existsSync(join(BK1_HOME, 'bk1-lint'))) return BK1_HOME;
