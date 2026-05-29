@@ -250,13 +250,37 @@ export function activate(context: vscode.ExtensionContext) {
   statusProvider = new StatusProvider();
   logProvider    = new LogProvider();
 
+  // Maintain a context key that's true exactly when bk1's terminal is the
+  // active one. The Ctrl+T / Ctrl+L keybindings in package.json are gated on
+  // this so they only intercept (and forward bytes 0x14 / 0x0C to bk1) when
+  // the user is actually in the bk1 terminal — leaving every other terminal,
+  // editor, and panel's Ctrl+T / Ctrl+L behavior unchanged.
+  const setFocusContext = (focused: boolean) => {
+    void vscode.commands.executeCommand('setContext', 'bk1.terminalFocused', focused);
+  };
+  setFocusContext(false);
+
   context.subscriptions.push(
     vscode.window.registerTreeDataProvider('bk1.status', statusProvider),
     vscode.window.registerTreeDataProvider('bk1.log', logProvider),
     vscode.commands.registerCommand('bk1.open', () => openBk1(context)),
     vscode.commands.registerCommand('bk1.stop', () => stopBk1()),
-    vscode.window.onDidCloseTerminal(t => { if (t === bk1Terminal) bk1Terminal = undefined; }),
-    vscode.window.onDidChangeActiveTextEditor(scheduleWrite),
+    vscode.window.onDidCloseTerminal(t => {
+      if (t === bk1Terminal) {
+        bk1Terminal = undefined;
+        setFocusContext(false);
+      }
+    }),
+    vscode.window.onDidChangeActiveTerminal(t => {
+      setFocusContext(t !== undefined && t === bk1Terminal);
+    }),
+    vscode.window.onDidChangeActiveTextEditor(editor => {
+      // Active editor changes mean the focus left whatever terminal was
+      // active. Clear the bk1-focused state so Ctrl+T / Ctrl+L revert to
+      // their default behavior in editors and other panels.
+      if (editor) setFocusContext(false);
+      scheduleWrite();
+    }),
     vscode.window.onDidChangeTextEditorSelection(scheduleWrite),
     vscode.workspace.onDidCloseTextDocument(scheduleWrite),
   );
