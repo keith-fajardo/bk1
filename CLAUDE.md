@@ -137,11 +137,21 @@ The two locations are reconciled in [src/bk1-home.ts](src/bk1-home.ts):
 
 **Releasing.** Tag `v<x.y.z>` on main; [.github/workflows/release.yml](.github/workflows/release.yml)
 builds darwin-arm64 and linux-x64 tarballs (bk1, bk1-lint, kimball/kimball.db
-at the tarball root) and attaches them to the GitHub Release. The tag version
-**must** match `BK1_VERSION` in [vscode-ext/src/bk1-loader.ts](vscode-ext/src/bk1-loader.ts)
-and the `version` field in [vscode-ext/package.json](vscode-ext/package.json) —
-the extension fetches `bk1-<BK1_VERSION>-<platform>.tar.gz` from the
-`v<BK1_VERSION>` release, so a mismatch means a 404 on first activation.
+at the tarball root) and attaches them to the GitHub Release. Three things
+**must** match per release, or something downstream breaks:
+
+- `version` in [package.json](package.json) — shown in the banner via
+  [src/version.ts](src/version.ts) which imports the JSON. Bun bundles this
+  into the compiled binary at build time.
+- `BK1_VERSION` in [vscode-ext/src/bk1-loader.ts](vscode-ext/src/bk1-loader.ts) —
+  drives the URL the extension fetches: `bk1-<BK1_VERSION>-<platform>.tar.gz`
+  from the `v<BK1_VERSION>` release. Mismatch = 404 on first activation.
+- The git tag (`v<x.y.z>`).
+
+The `version` in [vscode-ext/package.json](vscode-ext/package.json) is independent
+of the above — it's the marketplace version of the extension itself and can
+bump out of lockstep with the bk1 release (e.g. ship a cosmetic extension
+update without rebuilding bk1).
 
 ## Things to avoid
 
