@@ -3,6 +3,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { ensureBk1 } from './bk1-loader';
+import { recordTerminal, forgetTerminal, reapOrphans } from './process-registry';
 
 const CONTEXT_DIR  = path.join(os.homedir(), '.bk1');
 const CONTEXT_FILE = path.join(CONTEXT_DIR, 'ide-context.json');
@@ -26,6 +27,7 @@ interface IdeContext {
 // ---------------------------------------------------------------------------
 
 let bk1Terminal: vscode.Terminal | undefined;
+let bk1Pid: number | undefined;
 let openingBk1 = false;
 
 async function openBk1(ctx: vscode.ExtensionContext) {
@@ -64,10 +66,29 @@ async function openBk1(ctx: vscode.ExtensionContext) {
   });
 
   openingBk1 = false;
-  bk1Terminal.show();
+  const term = bk1Terminal;
+  term.show();
+
+  // Track the real child PID so we can guarantee it dies even if dispose()
+  // doesn't — and so a future host can reap it if this one crashes. processId
+  // resolves once the pty's shell (bk1) has spawned. Pin to `term`: if it was
+  // stopped/replaced before the promise resolved, don't record a stale PID.
+  void term.processId.then((pid) => {
+    if (pid !== undefined && bk1Terminal === term) {
+      bk1Pid = pid;
+      recordTerminal(pid);
+    }
+  });
 }
 
 function stopBk1() {
+  // Don't trust dispose() alone to take the child down — explicitly signal the
+  // tracked PID too. bk1 exits on SIGTERM (see src/app.tsx).
+  if (bk1Pid !== undefined) {
+    try { process.kill(bk1Pid, 'SIGTERM'); } catch { /* already exited */ }
+    forgetTerminal(bk1Pid);
+    bk1Pid = undefined;
+  }
   bk1Terminal?.dispose();
   bk1Terminal = undefined;
 }
@@ -260,6 +281,11 @@ export function activate(context: vscode.ExtensionContext) {
   };
   setFocusContext(false);
 
+  // Kill any bk1 left behind by a prior host that crashed before disposing its
+  // terminal. Safe with multiple windows: only PIDs whose owning host is gone
+  // (dead, or its PID reused) are reaped (see process-registry.ts).
+  void reapOrphans();
+
   context.subscriptions.push(
     vscode.window.registerTreeDataProvider('bk1.status', statusProvider),
     vscode.window.registerTreeDataProvider('bk1.log', logProvider),
@@ -267,6 +293,9 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('bk1.stop', () => stopBk1()),
     vscode.window.onDidCloseTerminal(t => {
       if (t === bk1Terminal) {
+        // The tab was closed (bk1 already exited via its pty closing) — just
+        // drop our bookkeeping so the reaper never chases a dead PID.
+        if (bk1Pid !== undefined) { forgetTerminal(bk1Pid); bk1Pid = undefined; }
         bk1Terminal = undefined;
         setFocusContext(false);
       }

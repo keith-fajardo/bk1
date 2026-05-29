@@ -491,6 +491,9 @@ function InputBar({ input, isRunning, mode, modelLabel, maskInput, terminalMode 
   const lines = display.split('\n');
   if (lines.length > 1) {
     const last = lines.length - 1;
+    // Continuation lines align under line 0's text, which begins after the badge,
+    // a space, the prompt char, and a space — badgeLabel.length + 3 columns in.
+    const contIndent = ' '.repeat(badgeLabel.length + 3);
     // Each continuation line needs its own Box wrapper, not a bare Text child.
     // Ink's flex column layout treats bare Text children as inline content
     // that can merge with sibling rows; wrapping in Box forces a real flex
@@ -509,11 +512,11 @@ function InputBar({ input, isRunning, mode, modelLabel, maskInput, terminalMode 
         </Box>
         {lines.slice(1, last).map((line, i) => (
           <Box key={i}>
-            <Text color={text}>  {line}</Text>
+            <Text color={text}>{contIndent}{line}</Text>
           </Box>
         ))}
         <Box>
-          <Text color={text}>  {lines[last]}</Text>
+          <Text color={text}>{contIndent}{lines[last]}</Text>
           <Text color={accent}>█</Text>
         </Box>
       </Box>
@@ -2041,13 +2044,36 @@ function AppShell() {
       disableModifyOtherKeys(process.stdout);
       disableKittyKeyboard(process.stdout);
     };
+    // Exit when the controlling terminal goes away. Under the VS Code extension
+    // bk1 runs as the shell of a pty the extension owns; if the extension host
+    // dies without disposing the terminal (a crash, a hard window kill, a
+    // reload), the pty's master end closes but nothing tells us to stop — and we
+    // linger as an orphan holding the whole React tree + SQLite in memory. Those
+    // orphans stack across reloads into real memory pressure. The extension's
+    // deactivate()/dispose() can't be relied on (a crashed host never runs it),
+    // so we detect the dead terminal ourselves and exit. The signals: EOF on
+    // stdin ('end'), an EIO read error on stdin, SIGHUP, and a failed stdout
+    // frame write all mean there is no terminal left to talk to.
+    const die = () => { restore(); process.exit(0); };
+    const onStreamErr = (err: NodeJS.ErrnoException) => {
+      if (err && (err.code === 'EIO' || err.code === 'EPIPE' || err.code === 'ENXIO' || err.code === 'EBADF')) die();
+    };
     process.on('exit', restore);
-    process.on('SIGINT', () => { restore(); process.exit(0); });
-    process.on('SIGTERM', restore);
+    process.on('SIGINT', die);
+    process.on('SIGTERM', die);
+    process.on('SIGHUP', die);
+    process.stdin.on('end', die);
+    process.stdin.on('error', onStreamErr);
+    process.stdout.on('error', onStreamErr);
     return () => {
       restore();
       process.off('exit', restore);
-      process.off('SIGTERM', restore);
+      process.off('SIGINT', die);
+      process.off('SIGTERM', die);
+      process.off('SIGHUP', die);
+      process.stdin.off('end', die);
+      process.stdin.off('error', onStreamErr);
+      process.stdout.off('error', onStreamErr);
     };
   }, []);
 
@@ -2074,7 +2100,7 @@ function AppShell() {
     stdin.emit = ((event: string, ...rest: unknown[]) => {
       if (event === 'data') {
         const s = String(rest[0]);
-        if (s.includes('\x1b[27u') || s.includes('\x1b[9;2u')) rest[0] = normalizeKittyKeys(s);
+        if (s.includes('\x1b[27u') || s.includes('\x1b[9;2u') || /\x1b\[\d+;5u/.test(s)) rest[0] = normalizeKittyKeys(s);
       }
       return realEmit(event, ...(rest as []));
     }) as typeof stdin.emit;
@@ -3628,5 +3654,21 @@ function App({ onLogout }: { onLogout: () => void }) {
     </Box>
   );
 }
+
+// Backstop for a pty that breaks mid-frame. When the terminal is yanked out
+// from under us a write can fault before the stdin-EOF / SIGHUP handlers above
+// get a turn — surfacing as an EIO/EPIPE stream error or the null-deref Ink
+// throws writing to a dead stdout. Either way the terminal is already gone, so
+// swallow it and exit cleanly: no crash report, no orphan. Genuine logic errors
+// (terminal still live) crash as usual so bugs stay visible. The 'exit' handler
+// registered in AppShell restores the terminal modes on the way out.
+process.on('uncaughtException', (err: NodeJS.ErrnoException) => {
+  const code = err?.code;
+  const terminalGone = process.stdin.readable === false || process.stdout.destroyed || process.stdout.writableEnded;
+  if (terminalGone || code === 'EIO' || code === 'EPIPE' || code === 'ENXIO' || code === 'EBADF') {
+    process.exit(0);
+  }
+  throw err;
+});
 
 render(<AppShell />);
