@@ -212,4 +212,4 @@ See [`CLAUDE.md`](CLAUDE.md) for conventions when modifying bk1 itself (vs. dbt 
 
 ## License
 
-TBD.
+[Apache License 2.0](LICENSE). Copyright Mangrove.
