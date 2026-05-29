@@ -27,7 +27,7 @@ import {
   FOODS, addCoins, petColorHex, PET_COLOR_NAMES, DEFAULT_PET_COLOR,
   type PetState,
 } from './pet';
-import { disableMouseTracking, parseMouseEvents, enableModifyOtherKeys, disableModifyOtherKeys, enableKittyKeyboard, disableKittyKeyboard, isShiftEnter } from './mouse';
+import { disableMouseTracking, parseMouseEvents, enableModifyOtherKeys, disableModifyOtherKeys, enableKittyKeyboard, disableKittyKeyboard, isShiftEnter, normalizeKittyKeys } from './mouse';
 import { GAMES } from './games';
 
 // Multiplayer games live inside the playroom modal (not in GAMES), but should
@@ -2026,7 +2026,23 @@ function AppShell() {
   useEffect(() => {
     enableModifyOtherKeys(process.stdout);
     enableKittyKeyboard(process.stdout);
+    // kitty disambiguate mode re-encodes Escape and Shift+Tab into CSI u
+    // sequences Ink can't parse. Intercept stdin's data emission and rewrite
+    // them to legacy bytes so every useInput handler (model picker, abort,
+    // /usage panel, …) sees key.escape / key.shift+key.tab again. Only the two
+    // affected sequences are touched; everything else (incl. mouse SGR) passes
+    // through untouched, and a non-matching chunk keeps its original Buffer.
+    const stdin = process.stdin;
+    const realEmit = stdin.emit.bind(stdin);
+    stdin.emit = ((event: string, ...rest: unknown[]) => {
+      if (event === 'data') {
+        const s = String(rest[0]);
+        if (s.includes('\x1b[27u') || s.includes('\x1b[9;2u')) rest[0] = normalizeKittyKeys(s);
+      }
+      return realEmit(event, ...(rest as []));
+    }) as typeof stdin.emit;
     return () => {
+      stdin.emit = realEmit;
       disableModifyOtherKeys(process.stdout);
       disableKittyKeyboard(process.stdout);
     };
