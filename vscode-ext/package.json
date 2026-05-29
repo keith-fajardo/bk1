@@ -1,6 +1,6 @@
 {
   "name": "bk1-context",
-  "displayName": "bk1 IDE Context",
+  "displayName": "bk1 - dbt coding agent",
   "description": "bk1 dbt coding agent — IDE context bridge + embedded terminal.",
   "version": "0.4.0",
   "publisher": "keithfajardo",
