@@ -3121,7 +3121,7 @@ function App({ onLogout }: { onLogout: () => void }) {
               <Text bold color="#C0FAD2">bk1</Text>
               <Text color="#5A8060">v0.1.0</Text>
             </Box>
-            <Text color="#5A8060"><Text color="#C0FAD2">{MODELS[modelIdx]!.label}</Text> · dbt Coding Agent by Mangrove Digital</Text>
+            <Text color="#5A8060"><Text color="#C0FAD2">{MODELS[modelIdx]!.label}</Text> · dbt Coding Agent by Keith Fajardo @ Mangrove Digital</Text>
             <Text color="#5A8060">{PROJECT_DIR}</Text>
           </Box>
         </Box>
@@ -3170,7 +3170,7 @@ function App({ onLogout }: { onLogout: () => void }) {
                 <Text bold color="#C0FAD2">bk1</Text>
                 <Text color="#5A8060">v0.1.0</Text>
               </Box>
-              <Text color="#5A8060"><Text color="#C0FAD2">{MODELS[modelIdx]!.label}</Text> · dbt Coding Agent by Mangrove Digital</Text>
+              <Text color="#5A8060"><Text color="#C0FAD2">{MODELS[modelIdx]!.label}</Text> · dbt Coding Agent by Keith Fajardo @ Mangrove Digital</Text>
               <Text color="#5A8060">{PROJECT_DIR}</Text>
             </Box>
           </Box>
