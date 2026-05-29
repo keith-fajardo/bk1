@@ -180,3 +180,57 @@ jobs:
           fi
           git commit -m "bk1 ${VERSION}"
           git push
+
+  # Publishes the VS Code extension to the Marketplace when vscode-ext's version
+  # is new. The extension version bumps alongside bk1 via `bun run bump <ver>`,
+  # or on its own via `bun run bump ext <ver>`. Requires an AZURE_DEVOPS_PAT
+  # secret: a marketplace PAT for publisher `keithfajardo`. Skipped automatically
+  # if the secret isn't set, and idempotent — a `vsce show` check no-ops the job
+  # when this version is already published, so ordinary pushes don't re-publish.
+  #
+  # `needs: build` so a co-released bk1 v<BK1_VERSION> exists before the new
+  # extension (which downloads that binary on first activation) goes live. The
+  # `always()` guard lets it run on extension-only bumps too (build is skipped),
+  # but the build-result check refuses to publish if a co-running bk1 build FAILED
+  # (the extension would point at a release that never got created).
+  extension:
+    needs: [gate, build]
+    if: >-
+      always() &&
+      needs.gate.result == 'success' &&
+      (needs.build.result == 'success' || needs.build.result == 'skipped')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Publish extension to Marketplace
+        working-directory: vscode-ext
+        env:
+          VSCE_PAT: ${{ secrets.AZURE_DEVOPS_PAT }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${VSCE_PAT:-}" ]]; then
+            echo "AZURE_DEVOPS_PAT not set — skipping extension publish."
+            exit 0
+          fi
+          LOCAL="$(jq -r .version package.json)"
+          NAME="$(jq -r '.publisher + "." + .name' package.json)"
+
+          # Idempotent: skip when this exact version is already on the Marketplace
+          # (so non-bump pushes to main no-op here). `vsce show` needs no auth.
+          PUBLISHED="$(npx --yes @vscode/vsce show "$NAME" --json 2>/dev/null || echo '{}')"
+          if echo "$PUBLISHED" | jq -e --arg v "$LOCAL" '.versions[]? | select(.version == $v)' >/dev/null 2>&1; then
+            echo "$NAME@$LOCAL already published — skipping."
+            exit 0
+          fi
+
+          npm ci
+          npm run build  # tsc -> out/ (vsce has no vscode:prepublish hook here)
+          # --no-dependencies: the extension imports only node builtins + the
+          # vscode API (host-provided), so there is no node_modules to bundle.
+          npx --yes @vscode/vsce publish --no-dependencies -p "$VSCE_PAT"
+          echo "Published $NAME@$LOCAL"
