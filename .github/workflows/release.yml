@@ -47,11 +47,14 @@ jobs:
         run: cargo build --release --quiet
 
       - name: Compile bk1 binary
-        # --external react-devtools-core: optional peer dep of Ink, only used
-        # by Ink's devtools mode which we don't ship. Without --external the
-        # compile fails when the package isn't in node_modules (i.e. always
-        # under --frozen-lockfile CI).
-        run: bun build --compile --target=${{ matrix.bun_target }} --external react-devtools-core --outfile bk1 src/app.tsx
+        # --define process.env.DEV='"false"': inlines DEV as the literal string
+        # "false" so bun dead-code-eliminates the guarded `if (process.env.DEV
+        # === 'true')` block in Ink's reconciler. That block dynamic-imports
+        # ./devtools.js, which statically imports react-devtools-core — an
+        # optional peer dep we don't ship. Without the DCE, bun either fails
+        # at compile (can't resolve the package) or emits a runtime require
+        # that crashes the binary on launch.
+        run: bun build --compile --target=${{ matrix.bun_target }} --define process.env.DEV='"false"' --outfile bk1 src/app.tsx
 
       - name: Stage release artifacts
         run: |
