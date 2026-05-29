@@ -10,6 +10,7 @@ import { PROJECT_DIR } from './tools';
 import { LINT_REPORT_PATH } from './state';
 import { bk1AssetsDir } from './bk1-home';
 import { BK1_VERSION } from './version';
+import { createSession, saveSessionMessages, loadSessionMessages, searchSessions, formatSessionLine, type SessionSearchHit, type StoredMessage } from './sessions';
 import { readIdeContextBlock, readIdeContextRaw, type IdeContext } from './ide-context';
 import { SKILLS, expandSkill } from './skills';
 import { getStoredKey, storeKey, clearStoredKey, isValidKeyShape, authFilePath, getStoredAdminKey, storeAdminKey } from './auth';
@@ -121,6 +122,90 @@ const MODEL_DESCS: Record<string, string> = {
   'claude-opus-4-7':           'Highly capable · previous flagship',
   'claude-opus-4-8':           'Most capable · best for complex analysis',
 };
+
+// Fullscreen-takeover picker for past conversations. Owns its own search input
+// state and useInput hook because the search query is interactive (debounced
+// FTS hit on each keystroke). Emits onSelect with a session id on Enter, or
+// onCancel on Esc — App is responsible for hydrating the messages array from
+// the chosen session.
+function SessionPicker({ projectPath, onSelect, onCancel }: {
+  projectPath: string;
+  onSelect: (sessionId: number) => void;
+  onCancel: () => void;
+}) {
+  const [query, setQuery] = useState('');
+  const [results, setResults] = useState<SessionSearchHit[]>(() => searchSessions(projectPath, ''));
+  const [selectedIdx, setSelectedIdx] = useState(0);
+
+  // Debounce the search so FTS doesn't re-run on every keystroke (negligible
+  // for small DBs but the right shape for when history grows).
+  useEffect(() => {
+    const t = setTimeout(() => {
+      setResults(searchSessions(projectPath, query));
+      setSelectedIdx(0);
+    }, 80);
+    return () => clearTimeout(t);
+  }, [query, projectPath]);
+
+  useInput((inputChar, key) => {
+    if (key.escape) { onCancel(); return; }
+    if (key.return) {
+      const hit = results[selectedIdx];
+      if (hit) onSelect(hit.id);
+      return;
+    }
+    if (key.upArrow)   { setSelectedIdx(i => Math.max(0, i - 1)); return; }
+    if (key.downArrow) { setSelectedIdx(i => Math.min(results.length - 1, i + 1)); return; }
+    if (key.backspace || key.delete) {
+      setQuery(q => q.slice(0, -1));
+      return;
+    }
+    if (inputChar && !key.ctrl && !key.meta) {
+      const cleaned = inputChar.replace(/\[[\d;<>?]*[A-Za-z~]/g, '');
+      if (cleaned) setQuery(q => q + cleaned);
+    }
+  });
+
+  return (
+    <Box flexDirection="column" paddingX={2} paddingY={1}>
+      <Box marginBottom={1}>
+        <Text bold color="#C0FAD2">Conversation history</Text>
+        <Text color="#5A8060">  ·  {results.length} match{results.length === 1 ? '' : 'es'}</Text>
+      </Box>
+      <Box>
+        <Text color="#9DD9BA">filter ▸ </Text>
+        <Text color="#D8CFEF">{query}</Text>
+        <Text color="#9DD9BA">█</Text>
+      </Box>
+      <Box flexDirection="column" marginTop={1}>
+        {results.length === 0 ? (
+          <Text color="#5A8060">{query ? `No sessions match "${query}"` : 'No saved sessions yet — they start saving once you exchange messages.'}</Text>
+        ) : (
+          results.slice(0, 20).map((s, i) => {
+            const active = i === selectedIdx;
+            const line = formatSessionLine(s);
+            return (
+              <Box key={s.id} flexDirection="column">
+                <Box>
+                  <Text color={active ? '#C0FAD2' : '#7AB890'} bold={active}>{active ? '▸ ' : '  '}</Text>
+                  <Text color={active ? '#C0FAD2' : '#7AB890'}>{line}</Text>
+                </Box>
+                {s.snippet && (
+                  <Box paddingLeft={4}>
+                    <Text color="#5A8060">in: {s.snippet}</Text>
+                  </Box>
+                )}
+              </Box>
+            );
+          })
+        )}
+      </Box>
+      <Box marginTop={1}>
+        <Text color="#5A8060">↑↓ navigate · Enter open · Esc cancel · type to filter</Text>
+      </Box>
+    </Box>
+  );
+}
 
 function ModelPicker({ currentIdx }: { currentIdx: number }) {
   return (
@@ -381,11 +466,19 @@ function InputBar({ input, isRunning, mode, modelLabel, maskInput, terminalMode 
 }) {
   const theme = MODE_THEME[mode];
   const termAccent = '#7DD3FC';
-  const accent = isRunning ? '#5A8060' : (terminalMode ? termAccent : theme.accent);
-  const text   = isRunning ? '#5A8060' : (terminalMode ? termAccent : theme.text);
-  const badgeColor = terminalMode ? termAccent : theme.badge;
-  const badgeLabel = terminalMode ? 'TERM' : theme.label;
-  const promptChar = terminalMode ? '$' : '>';
+  // Typing `!` at the start of the input is the inline shell-escape — that
+  // line will run as a bash command on submit, even outside terminal mode.
+  // Surface that with the same cyan styling the persistent terminal mode
+  // uses so users get visual confirmation BEFORE hitting Enter (e.g.
+  // typing `! ls -lrt` flips the badge to TERM, prompt char to $, accent
+  // to cyan). Submit clears the input and styling reverts on next render.
+  const isBangShell = !isRunning && !maskInput && input.startsWith('!');
+  const effectiveTerm = terminalMode || isBangShell;
+  const accent = isRunning ? '#5A8060' : (effectiveTerm ? termAccent : theme.accent);
+  const text   = isRunning ? '#5A8060' : (effectiveTerm ? termAccent : theme.text);
+  const badgeColor = effectiveTerm ? termAccent : theme.badge;
+  const badgeLabel = effectiveTerm ? 'TERM' : theme.label;
+  const promptChar = effectiveTerm ? '$' : '>';
   const display = maskInput ? '*'.repeat(input.length) : input;
   // Cursor is a static block — no blink. Blinking would fire setState on an
   // interval, forcing Ink to repaint the dynamic frame and wiping any
@@ -1982,6 +2075,28 @@ function App({ onLogout }: { onLogout: () => void }) {
   const messagesRef = useRef<Message[]>([]);
   useEffect(() => { messagesRef.current = messages; }, [messages]);
 
+  // Persist conversation to ~/.bk1/sessions.db. A session row is created at
+  // mount; every messages change schedules a debounced replace-all save.
+  // Failures are swallowed (matching usage.db's best-effort pattern) so a
+  // disk-full or DB-locked condition never blocks the chat.
+  useEffect(() => {
+    if (currentSessionIdRef.current !== null) return;
+    try {
+      currentSessionIdRef.current = createSession(PROJECT_DIR, MODELS[DEFAULT_MODEL_IDX]!.id);
+    } catch { /* DB unavailable — history will be a no-op for this session */ }
+  }, []);
+  useEffect(() => {
+    if (currentSessionIdRef.current === null || messages.length === 0) return;
+    const sessionId = currentSessionIdRef.current;
+    const t = setTimeout(() => {
+      const stored: StoredMessage[] = messages
+        .filter(m => m.role === 'user' || m.role === 'assistant')
+        .map(m => ({ role: m.role, content: m.content, info: m.info }));
+      try { saveSessionMessages(sessionId, stored); } catch { /* best-effort */ }
+    }, 500);
+    return () => clearTimeout(t);
+  }, [messages]);
+
   const inputRef = useRef('');
   const isRunningRef = useRef(false);
   const historyRef = useRef<Anthropic.MessageParam[]>([]);
@@ -2144,6 +2259,13 @@ function App({ onLogout }: { onLogout: () => void }) {
   // When set, the render path swaps the conversation view for the multiplayer
   // playroom lobby. `null` means closed. Driven by `/pet playroom create|join`.
   const [playroom, setPlayroom] = useState<LobbyMode | null>(null);
+  // Persistent conversation history. A new session is created per bk1 launch
+  // (or rolled into an existing one when /history selects a past session to
+  // resume). Messages are debounce-saved to ~/.bk1/sessions.db as the chat
+  // progresses; the SessionPicker reads from the same store to surface past
+  // conversations for review/resume. See src/sessions.ts.
+  const currentSessionIdRef = useRef<number | null>(null);
+  const [historyPickerOpen, setHistoryPickerOpen] = useState(false);
   // Terminal mode toggle. When ON, lines submitted at the prompt run as shell
   // commands via runInlineShell (no LLM, no tokens) — prefix with `?` to ask
   // the agent. When OFF (default), submitted lines go to the agent — prefix
@@ -2390,12 +2512,19 @@ function App({ onLogout }: { onLogout: () => void }) {
       return;
     }
     if (raw === '/history') {
-      // Snapshot the current conversation to a markdown file and open it in a
-      // VS Code editor pane next to the terminal. Lets users review long agent
-      // output (lint findings, analyses) in a fully scrollable, searchable,
-      // copy-able editor view without fighting the terminal's mouse-tracking
-      // selection limits. Snapshot is point-in-time; re-run /history for an
-      // updated view.
+      // Open the cross-session picker — type to filter by title or message
+      // content (FTS5), Enter to load a past session into the current view.
+      // Replaces the earlier "snapshot to markdown" behavior, which was
+      // current-session-only and lost on bk1 close. The old behavior is
+      // still reachable as /export below.
+      setInput(''); inputRef.current = ''; setSuggestionIndex(-1);
+      setHistoryPickerOpen(true);
+      return;
+    }
+    if (raw === '/export') {
+      // Old /history behavior: snapshot the current conversation to a markdown
+      // file and open it in VS Code. Useful when you want to share a session
+      // out-of-band (paste into a PR description, archive elsewhere).
       setInput(''); inputRef.current = ''; setSuggestionIndex(-1);
       const md: string[] = [`# bk1 session — ${new Date().toISOString()}`, ''];
       for (const msg of messagesRef.current) {
@@ -3179,6 +3308,37 @@ function App({ onLogout }: { onLogout: () => void }) {
       setActiveGame(null);
     };
     return <GameComponent pet={pet} onExit={onGameExit} />;
+  }
+
+  // /history picker — fullscreen takeover, same pattern as /usage below.
+  // Selecting a session hydrates messages + LLM history from sessions.db and
+  // closes the picker. The hydrated session becomes the active session, so
+  // subsequent prompts append to it and the LLM sees full prior context.
+  if (historyPickerOpen) {
+    return (
+      <SessionPicker
+        projectPath={PROJECT_DIR}
+        onCancel={() => setHistoryPickerOpen(false)}
+        onSelect={(sessionId) => {
+          try {
+            const loaded = loadSessionMessages(sessionId);
+            const hydrated: Message[] = loaded.map(m => ({ role: m.role, content: m.content, info: m.info }));
+            setMessages(hydrated);
+            messagesRef.current = hydrated;
+            // Rebuild the LLM-bound history so the next prompt resumes with
+            // full prior context. Skips messages flagged info (status lines
+            // that aren't real conversation) and the local-greeting reply.
+            historyRef.current = hydrated
+              .filter(m => !m.info)
+              .map(m => ({ role: m.role, content: m.content }));
+            currentSessionIdRef.current = sessionId;
+          } catch (err) {
+            setMessages(prev => [...prev, { role: 'assistant', content: `Failed to load session: ${err instanceof Error ? err.message : String(err)}`, info: true }]);
+          }
+          setHistoryPickerOpen(false);
+        }}
+      />
+    );
   }
 
   // /usage tabbed panel — fullscreen takeover. Same pattern as the mini-game
