@@ -38,7 +38,8 @@ vscode-ext/         Optional VS Code companion extension — streams the active 
                     Also auto-downloads the bk1 binary + sidecars from GitHub
                     Releases on first activation (see "Distribution" below).
 scripts/install.sh  One-shot setup: builds binary, installs to skill dir, bun install
-.github/workflows/  release.yml builds per-platform tarballs on `v*` tags
+.github/workflows/  release.yml builds per-platform tarballs + GitHub Release
+                    when package.json's version advances on a push to main
 tests/              bun:test suites (aggregation correctness, skill contract)
 ```
 
@@ -135,18 +136,24 @@ The two locations are reconciled in [src/bk1-home.ts](src/bk1-home.ts):
   [src/skills.ts](src/skills.ts), [src/kimball.ts](src/kimball.ts), and the
   `lintBuilt` status check in [src/app.tsx](src/app.tsx).
 
-**Releasing.** Tag `v<x.y.z>` on main; [.github/workflows/release.yml](.github/workflows/release.yml)
-builds darwin-arm64 and linux-x64 tarballs (bk1, bk1-lint, kimball/kimball.db
-at the tarball root) and attaches them to the GitHub Release. Three things
-**must** match per release, or something downstream breaks:
+**Releasing.** Run `bun run bump <x.y.z>` (see [scripts/bump.ts](scripts/bump.ts)),
+commit, and push to main — no hand-tagging. [.github/workflows/release.yml](.github/workflows/release.yml)
+gates on the version: when package.json's version has no matching `v<x.y.z>`
+tag yet, it builds darwin-arm64, darwin-x64, and linux-x64 tarballs (bk1,
+bk1-lint, kimball/kimball.db at the tarball root), creates the tag + GitHub
+Release at that commit, and pushes the homebrew formula. Pushes that don't
+change the version no-op at the gate. Two things **must** match per release —
+`bun run bump` keeps them in sync and refuses to run if they've drifted:
 
 - `version` in [package.json](package.json) — shown in the banner via
   [src/version.ts](src/version.ts) which imports the JSON. Bun bundles this
-  into the compiled binary at build time.
+  into the compiled binary at build time. Also the value the gate releases on.
 - `BK1_VERSION` in [vscode-ext/src/bk1-loader.ts](vscode-ext/src/bk1-loader.ts) —
   drives the URL the extension fetches: `bk1-<BK1_VERSION>-<platform>.tar.gz`
   from the `v<BK1_VERSION>` release. Mismatch = 404 on first activation.
-- The git tag (`v<x.y.z>`).
+
+The `v<x.y.z>` git tag is created automatically by CI from package.json's
+version, so it can't drift — there's nothing to tag by hand.
 
 The `version` in [vscode-ext/package.json](vscode-ext/package.json) is independent
 of the above — it's the marketplace version of the extension itself and can
