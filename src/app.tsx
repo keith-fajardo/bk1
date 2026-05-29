@@ -16,7 +16,7 @@ import { SKILLS, expandSkill } from './skills';
 import { getStoredKey, storeKey, clearStoredKey, isValidKeyShape, authFilePath, getStoredAdminKey, storeAdminKey } from './auth';
 import { estimateCostUsd, formatUsd } from './pricing';
 import { recordProjectUsage, loadProjectTotals, type ProjectTotals } from './project-usage';
-import { createUsageState, recordUsage, buildReport, renderReport, classifyTurnLabel, fetchOrgUsage, fetchOrgUsageSeries, type UsageState } from './usage';
+import { createUsageState, recordUsage, buildReport, renderReport, classifyTurnLabel, getOrgUsage, getOrgUsageSeries, peekOrgUsageText, peekOrgUsageSeries, orgUsageFetchedAt, requestRefresh, type UsageState } from './usage';
 import {
   loadPet, savePet, newPet, tickPet, petFace, petFaceEating,
   petSprite, petSpriteBlink, petSpriteSleep, petSpriteEating,
@@ -1406,15 +1406,28 @@ function UsagePanel({
   // granularity / metric choices survive flipping to another tab and back.
   const [granularity, setGranularity] = useState<import('./usage').UsageGranularity>('daily');
   const [metric, setMetric] = useState<'cost' | 'tokens'>('cost');
+  // Bumped by 'r' to force the active data tab to re-pull; refreshNotice carries
+  // the local rate-limiter's rejection so the user sees why nothing happened.
+  const [refreshNonce, setRefreshNonce] = useState(0);
+  const [refreshNotice, setRefreshNotice] = useState<string | null>(null);
+  const refreshable = tab === 'usage' || tab === 'stats';
 
   useInput((inputChar, key) => {
     if (key.escape) { onExit(); return; }
     if (key.tab && key.shift) {
+      setRefreshNotice(null);
       setTab(t => USAGE_TAB_ORDER[(USAGE_TAB_ORDER.indexOf(t) - 1 + USAGE_TAB_ORDER.length) % USAGE_TAB_ORDER.length]!);
       return;
     }
     if (key.tab) {
+      setRefreshNotice(null);
       setTab(t => USAGE_TAB_ORDER[(USAGE_TAB_ORDER.indexOf(t) + 1) % USAGE_TAB_ORDER.length]!);
+      return;
+    }
+    if ((inputChar === 'r' || inputChar === 'R') && refreshable) {
+      const gate = requestRefresh();
+      if (gate.ok) { setRefreshNotice(null); setRefreshNonce(n => n + 1); }
+      else setRefreshNotice(`Too many refreshes — wait ${gate.retryInSec}s and try again.`);
       return;
     }
     if (tab === 'stats') {
@@ -1431,16 +1444,18 @@ function UsagePanel({
       <UsagePanelTabsHeader active={tab} />
       <Box marginTop={1} flexDirection="column">
         {tab === 'status'  && <StatusTab model={model} mode={mode} terminalMode={terminalMode} adminKey={adminKey} />}
-        {tab === 'usage'   && <UsageTab adminKey={adminKey} />}
-        {tab === 'stats'    && <StatsTab adminKey={adminKey} granularity={granularity} metric={metric} />}
+        {tab === 'usage'   && <UsageTab adminKey={adminKey} refreshNonce={refreshNonce} />}
+        {tab === 'stats'    && <StatsTab adminKey={adminKey} granularity={granularity} metric={metric} refreshNonce={refreshNonce} />}
         {tab === 'projects' && <ProjectsTab />}
         {tab === 'session'  && <SessionTab usageState={usageState} />}
       </Box>
-      <Box marginTop={1}>
+      <Box marginTop={1} flexDirection="column">
         <Text color="#3D6650">
           Tab next · Shift+Tab prev · Esc close
+          {refreshable && ' · r refresh'}
           {tab === 'stats' && ' · m/d/h granularity · t/$ metric'}
         </Text>
+        {refreshNotice && <Text color="#E0A060">{refreshNotice}</Text>}
       </Box>
     </Box>
   );
@@ -1515,21 +1530,30 @@ function StatusTab({
   );
 }
 
-function UsageTab({ adminKey }: { adminKey: string }) {
+function UsageTab({ adminKey, refreshNonce }: { adminKey: string; refreshNonce: number }) {
   // Text-summary view (per-model rollup, daily avg, projection, cache
-  // efficiency). Re-fetched each time the tab mounts; for tighter caching
-  // see the StatsTab pattern.
-  const [text, setText] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
+  // efficiency). Seeds from the process-lifetime cache so reopening /usage
+  // doesn't re-hit the Admin endpoint; the user presses 'r' to re-pull.
+  const [text, setText] = useState<string | null>(() => peekOrgUsageText(adminKey));
+  const [loading, setLoading] = useState(text === null);
+  // A mount is not a refresh (seed the ref to the live nonce); only a nonce
+  // change while mounted forces a re-pull. Otherwise returning to this tab
+  // after pressing 'r' elsewhere would spuriously re-fetch.
+  const lastNonce = useRef(refreshNonce);
+
   useEffect(() => {
+    const force = refreshNonce !== lastNonce.current;
+    lastNonce.current = refreshNonce;
+    if (!force && peekOrgUsageText(adminKey) !== null) return;
     let cancelled = false;
     setLoading(true);
-    fetchOrgUsage(adminKey).then(t => {
+    getOrgUsage(adminKey, force).then(t => {
       if (cancelled) return;
       setText(t); setLoading(false);
     });
     return () => { cancelled = true; };
-  }, [adminKey]);
+  }, [adminKey, refreshNonce]);
+
   if (loading) return <Text color="#5A8060">Loading organization usage…</Text>;
   return (
     <Box flexDirection="column">
@@ -1568,26 +1592,39 @@ function UsageLine({ line }: { line: string }) {
 }
 
 function StatsTab({
-  adminKey, granularity, metric,
+  adminKey, granularity, metric, refreshNonce,
 }: {
   adminKey: string;
   granularity: import('./usage').UsageGranularity;
   metric: 'cost' | 'tokens';
+  refreshNonce: number;
 }) {
-  // Pre-fetch all three granularities in parallel as soon as the /usage menu
-  // mounts, so switching h/d/m is instant. The cache is intentionally NOT
-  // persisted across menu closes — every fresh /usage invocation re-pulls.
+  // Stacked-bar time series across three granularities. Seeds each from the
+  // process-lifetime cache and only fetches the ones still missing, so a warm
+  // reopen of /usage costs zero Admin calls (the monthly view alone is 6).
+  // 'r' forces a re-pull of all three.
   type G = import('./usage').UsageGranularity;
-  const [cache, setCache]     = useState<Partial<Record<G, import('./usage').UsageSeries>>>({});
+  const GRANS: G[] = ['hourly', 'daily', 'monthly'];
+  const [cache, setCache]     = useState<Partial<Record<G, import('./usage').UsageSeries>>>(() => {
+    const c: Partial<Record<G, import('./usage').UsageSeries>> = {};
+    for (const g of GRANS) { const v = peekOrgUsageSeries(adminKey, g); if (v) c[g] = v; }
+    return c;
+  });
   const [errors, setErrors]   = useState<Partial<Record<G, string>>>({});
-  const [pending, setPending] = useState<Set<G>>(new Set(['hourly', 'daily', 'monthly']));
+  const [pending, setPending] = useState<Set<G>>(() => new Set(GRANS.filter(g => peekOrgUsageSeries(adminKey, g) === null)));
+  const lastNonce = useRef(refreshNonce);
 
   useEffect(() => {
+    const force = refreshNonce !== lastNonce.current;
+    lastNonce.current = refreshNonce;
+    const toFetch = force ? GRANS : GRANS.filter(g => peekOrgUsageSeries(adminKey, g) === null);
+    if (toFetch.length === 0) return;
     let cancelled = false;
-    const grans: G[] = ['hourly', 'daily', 'monthly'];
-    for (const g of grans) {
+    setErrors({});
+    setPending(new Set(toFetch));
+    for (const g of toFetch) {
       (async () => {
-        const result = await fetchOrgUsageSeries(adminKey, g);
+        const result = await getOrgUsageSeries(adminKey, g, force);
         if (cancelled) return;
         if (typeof result === 'string') {
           setErrors(e => ({ ...e, [g]: result }));
@@ -1598,7 +1635,7 @@ function StatsTab({
       })();
     }
     return () => { cancelled = true; };
-  }, [adminKey]);
+  }, [adminKey, refreshNonce]);
 
   const series  = cache[granularity] ?? null;
   const error   = errors[granularity] ?? null;
