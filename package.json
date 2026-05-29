@@ -2,6 +2,7 @@
   "name": "dbt-agent",
   "version": "0.4.9",
   "type": "module",
+  "license": "Apache-2.0",
   "scripts": {
     "setup": "bash scripts/install.sh",
     "bump": "bun scripts/bump.ts",
