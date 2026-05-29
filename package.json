@@ -5,7 +5,7 @@
   "scripts": {
     "setup": "bash scripts/install.sh",
     "dev": "bun src/app.tsx",
-    "build": "bun build --compile --external react-devtools-core src/app.tsx --outfile dbt-agent",
+    "build": "bun build --compile --define process.env.DEV='\"false\"' src/app.tsx --outfile dbt-agent",
     "build:lint": "cd sidecars/lint && $HOME/.cargo/bin/cargo build --release && cp target/release/bk1-lint ~/.bk1/bk1-lint",
     "build:kimball": "bun scripts/build_kimball_db.ts",
     "deploy:assets": "bash scripts/deploy_assets.sh",
