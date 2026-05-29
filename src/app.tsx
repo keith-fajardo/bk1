@@ -307,7 +307,7 @@ function HintBar({ isRunning, terminalMode }: { isRunning: boolean; terminalMode
         ? <Text color="#3D6650">t  toggle output   Esc  stop agent   Ctrl+C  exit</Text>
         : terminalMode
           ? <Text color="#7DD3FC">TERMINAL MODE — input runs as shell   ? prefix  ask agent   Ctrl+T  back to prompt   Ctrl+C exit</Text>
-          : <Text color="#B9FECF">PROMPT MODE — input sent to agent   ! prefix  run shell   Opt+Enter  newline   Tab switch mode   Shift+Tab switch model   Ctrl+T  terminal mode   Ctrl+C exit</Text>
+          : <Text color="#B9FECF">PROMPT MODE — input sent to agent   ! prefix  run shell   Opt+Enter  newline   Tab switch mode   /term  terminal mode   /clear  redraw   Ctrl+C exit</Text>
       }
     </Box>
   );
@@ -2009,11 +2009,24 @@ function App({ onLogout }: { onLogout: () => void }) {
   // ready-made hook, so we listen to stdout's resize event ourselves.
   const [terminalRows, setTerminalRows] = useState(process.stdout.rows ?? 24);
   useEffect(() => {
+    // Debounce so a drag-resize doesn't flicker the screen on every pixel tick.
+    // The clear sequence (\x1b[3J\x1b[H\x1b[2J — clear scrollback + cursor home
+    // + clear screen) wipes ghost InputBar copies that Ink can leave behind
+    // when the live-area cursor position drifts during resize. Ink's next paint
+    // fills the empty terminal back in cleanly.
+    let resizeTimer: ReturnType<typeof setTimeout> | undefined;
     const onResize = () => {
       setTerminalRows(process.stdout.rows ?? 24);
+      if (resizeTimer) clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(() => {
+        process.stdout.write('\x1b[3J\x1b[H\x1b[2J');
+      }, 150);
     };
     process.stdout.on('resize', onResize);
-    return () => { process.stdout.off('resize', onResize); };
+    return () => {
+      if (resizeTimer) clearTimeout(resizeTimer);
+      process.stdout.off('resize', onResize);
+    };
   }, []);
   useEffect(() => {
     if (!containerRef.current) return;
@@ -2297,6 +2310,22 @@ function App({ onLogout }: { onLogout: () => void }) {
     if (raw === '/plan' || raw === '/build' || raw === '/auto') {
       const next = raw.slice(1) as Mode;
       setMode(next); modeRef.current = next;
+      setInput(''); inputRef.current = ''; setSuggestionIndex(-1);
+      return;
+    }
+    // /term and /clear are slash-command equivalents of Ctrl+T and Ctrl+L.
+    // VS Code's editor terminal intercepts a number of Ctrl+<letter> combos
+    // (varies by version and user keybindings), so Ctrl+T / Ctrl+L
+    // unreliably reach bk1 there. Slash commands always work because they're
+    // just typed text submitted via Enter.
+    if (raw === '/term' || raw === '/shell') {
+      terminalModeRef.current = !terminalModeRef.current;
+      setTerminalMode(terminalModeRef.current);
+      setInput(''); inputRef.current = ''; setSuggestionIndex(-1);
+      return;
+    }
+    if (raw === '/clear') {
+      process.stdout.write('\x1b[3J\x1b[H\x1b[2J');
       setInput(''); inputRef.current = ''; setSuggestionIndex(-1);
       return;
     }
