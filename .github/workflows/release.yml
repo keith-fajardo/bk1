@@ -1,24 +1,54 @@
 name: Release
 
-# Builds per-platform bk1 tarballs and attaches them to a GitHub Release when a
-# v* tag is pushed. The VS Code extension's auto-downloader (vscode-ext/src/bk1-
-# loader.ts) fetches these tarballs by tag + platform on first activation.
+# Publishes a GitHub Release (per-platform bk1 tarballs) when the version in
+# package.json advances. Triggered on push to main: the `gate` job reads
+# package.json's version and checks whether a `v<version>` tag already exists on
+# the remote. If it does, nothing else runs; if not, the build matrix compiles
+# the binary per platform, action-gh-release creates the tag + Release at this
+# commit, and the homebrew job pushes a refreshed formula to the tap.
+#
+# So a release is cut by bumping the version (`bun run bump <version>`) and
+# pushing to main — NOT by hand-tagging. Ordinary pushes that don't change the
+# version no-op at the gate, so the 3-platform matrix never spins up.
 #
 # Tarball layout: bk1, bk1-lint, kimball/kimball.db at the root. bk1 resolves
 # its sidecars sibling-of-binary at runtime (see src/bk1-home.ts).
-#
-# Tag scheme: v<major>.<minor>.<patch>, matching BK1_VERSION in bk1-loader.ts.
 
 on:
   push:
-    tags:
-      - 'v*'
+    branches: [main]
+  workflow_dispatch:   # manual re-run, e.g. to retry a failed release build
 
 permissions:
   contents: write
 
 jobs:
+  # Decide whether this push should release: true only when package.json's
+  # version has no matching v<tag> on the remote yet. Cheap ubuntu job, so the
+  # build matrix is skipped entirely on non-release pushes.
+  gate:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+      should_release: ${{ steps.check.outputs.should_release }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: check
+        run: |
+          set -euo pipefail
+          VERSION="$(jq -r .version package.json)"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if [ -n "$(git ls-remote --tags origin "refs/tags/v$VERSION")" ]; then
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            echo "v$VERSION already released — skipping."
+          else
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+            echo "v$VERSION is new — building + releasing."
+          fi
+
   build:
+    needs: gate
+    if: needs.gate.outputs.should_release == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -62,7 +92,7 @@ jobs:
       - name: Stage release artifacts
         run: |
           set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${{ needs.gate.outputs.version }}"
           STAGE="bk1-${VERSION}-${{ matrix.platform }}"
           mkdir -p "$STAGE/kimball"
           cp bk1 "$STAGE/bk1"
@@ -74,8 +104,14 @@ jobs:
           echo "STAGE=$STAGE" >> "$GITHUB_ENV"
 
       - name: Upload to release
+        # tag_name + target_commitish create the v<version> tag at this commit
+        # the first time a matrix leg uploads; later legs append their tarballs
+        # to the same Release. The tag is created HERE (not in the gate) so a
+        # failed build never leaves an orphan tag that blocks a later re-release.
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: v${{ needs.gate.outputs.version }}
+          target_commitish: ${{ github.sha }}
           files: |
             ${{ env.STAGE }}.tar.gz
             ${{ env.STAGE }}.tar.gz.sha256
@@ -84,11 +120,12 @@ jobs:
   # Renders dist/homebrew/bk1.rb.tmpl with this release's version + per-platform
   # sha256 and pushes it to the tap repo so `brew install keith-fajardo/tap/bk1`
   # serves the new version. Requires a HOMEBREW_TAP_TOKEN secret: a PAT (or
-  # fine-grained token) with contents:write on keith-fajardo/homebrew-tap.
-  # Skipped automatically if the secret isn't set, so releases still succeed
-  # before the tap is wired up.
+  # fine-grained token) with contents:write on keith-fajardo/homebrew-tap and
+  # read access to this repo's releases. Skipped automatically if the secret
+  # isn't set, so releases still succeed before the tap is wired up.
   homebrew:
-    needs: build
+    needs: [gate, build]
+    if: needs.gate.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -102,11 +139,11 @@ jobs:
             echo "HOMEBREW_TAP_TOKEN not set — skipping tap update."
             exit 0
           fi
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${{ needs.gate.outputs.version }}"
 
           # Pull the checksums published by the build job above. The .sha256
           # files are "<hash>  <filename>" — keep just the hash.
-          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --pattern '*.sha256' --dir sums
+          gh release download "v$VERSION" --repo "$GITHUB_REPOSITORY" --pattern '*.sha256' --dir sums
           SHA_DARWIN_ARM64="$(awk '{print $1}' "sums/bk1-${VERSION}-darwin-arm64.tar.gz.sha256")"
           SHA_DARWIN_X64="$(awk '{print $1}' "sums/bk1-${VERSION}-darwin-x64.tar.gz.sha256")"
           SHA_LINUX_X64="$(awk '{print $1}' "sums/bk1-${VERSION}-linux-x64.tar.gz.sha256")"
