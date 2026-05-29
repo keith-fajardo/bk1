@@ -41,10 +41,11 @@ function detectPlatform(): PlatformTag {
   const p = process.platform;
   const a = process.arch;
   if (p === 'darwin' && a === 'arm64') return { tag: 'darwin-arm64', label: 'macOS (Apple Silicon)' };
+  if (p === 'darwin' && a === 'x64')   return { tag: 'darwin-x64',   label: 'macOS (Intel)' };
   if (p === 'linux'  && a === 'x64')   return { tag: 'linux-x64',    label: 'Linux x64' };
   throw new Error(
     `bk1 doesn't ship a prebuilt binary for ${p}/${a} yet. ` +
-    `Supported: macOS (Apple Silicon), Linux x64. ` +
+    `Supported: macOS (Apple Silicon), macOS (Intel), Linux x64. ` +
     `For other platforms, build from source: https://github.com/${REPO}`
   );
 }
