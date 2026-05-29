@@ -132,19 +132,30 @@ export function disableKittyKeyboard(out: NodeJS.WriteStream): void {
 }
 
 // Kitty's "disambiguate" mode (the flag enableKittyKeyboard pushes) re-encodes
-// a couple of keys that previously had legacy byte sequences into CSI u form,
-// which Ink's keypress parser doesn't decode — so Escape and Shift+Tab silently
-// stop firing in terminals that honor kitty (VS Code's xterm.js, kitty,
-// Ghostty). Plain Tab keeps its legacy 0x09 byte, which is why only Shift+Tab
-// breaks. We need the flag for Shift+Enter, so rather than disable it we
-// translate the two affected sequences back to the legacy bytes Ink understands
-// before they reach the parser:
-//   Escape     \x1b[27u  -> \x1b
-//   Shift+Tab  \x1b[9;2u -> \x1b[Z  (classic backtab)
-const KITTY_ESCAPE    = /\x1b\[27u/g;
-const KITTY_SHIFT_TAB = /\x1b\[9;2u/g;
+// keys that previously had legacy byte sequences into CSI u form, which Ink's
+// keypress parser doesn't decode — so they silently stop firing in terminals
+// that honor kitty (VS Code's xterm.js, kitty, Ghostty). We need the flag for
+// Shift+Enter, so rather than disable it we translate the affected sequences
+// back to the legacy bytes Ink understands before they reach the parser:
+//   Escape         \x1b[27u    -> \x1b
+//   Shift+Tab      \x1b[9;2u   -> \x1b[Z   (classic backtab)
+//   Ctrl+<letter>  \x1b[<c>;5u -> the legacy control byte (c - 96), e.g.
+//                  Ctrl+C \x1b[99;5u -> \x03, which parseKeypress decodes as
+//                  { name:'c', ctrl:true }. Modifier 5 = ctrl-only (1 + 4).
+//                  Without this, Ctrl+C/L/T (exit, redraw, terminal-mode) all
+//                  no-op in kitty terminals. The range guard leaves non-letter
+//                  ctrl combos (e.g. Ctrl+Escape, code 27) untouched.
+const KITTY_ESCAPE      = /\x1b\[27u/g;
+const KITTY_SHIFT_TAB   = /\x1b\[9;2u/g;
+const KITTY_CTRL_LETTER = /\x1b\[(\d+);5u/g;
 export function normalizeKittyKeys(chunk: string): string {
-  return chunk.replace(KITTY_ESCAPE, '\x1b').replace(KITTY_SHIFT_TAB, '\x1b[Z');
+  return chunk
+    .replace(KITTY_ESCAPE, '\x1b')
+    .replace(KITTY_SHIFT_TAB, '\x1b[Z')
+    .replace(KITTY_CTRL_LETTER, (m, code) => {
+      const n = Number(code);
+      return n >= 97 && n <= 122 ? String.fromCharCode(n - 96) : m;
+    });
 }
 
 // Detects the Shift+Enter escape sequence in an input chunk. Returns true if
