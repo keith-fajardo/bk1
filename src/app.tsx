@@ -30,10 +30,14 @@ import { GAMES } from './games';
 // Multiplayer games live inside the playroom modal (not in GAMES), but should
 // still appear in the /pet play picker so users can discover them. Picking
 // one opens the playroom in create mode; the actual game is launched from
-// within the lobby via a key shortcut (j for jakenpoy, r for race).
+// within the lobby via a key shortcut (j jakenpoy, r race, p long jump,
+// s shot put, a artillery).
 const MULTIPLAYER_GAMES = [
-  { id: 'jakenpoy', description: 'Filipino rock-paper-scissors — opens playroom' },
-  { id: 'race',     description: '40-col mash sprint — opens playroom' },
+  { id: 'jakenpoy',  description: 'Filipino rock-paper-scissors — opens playroom' },
+  { id: 'race',      description: 'Steeplechase — 3000m mash sprint with hurdles — opens playroom' },
+  { id: 'longjump',  description: 'Long jump — mash to sprint, space to jump — opens playroom' },
+  { id: 'shotput',   description: 'Shot put — aim angle, charge power, time the release — opens playroom' },
+  { id: 'artillery', description: 'Turn-based artillery duel — opens playroom' },
 ] as const;
 const MULTIPLAYER_GAME_IDS = new Set<string>(MULTIPLAYER_GAMES.map(g => g.id));
 import { registerCoinEventHandler, emitCoinEvent, COIN_REWARDS, PASSIVE_SESSION_CAP, type CoinEvent } from './coin-events';
@@ -43,6 +47,7 @@ const MODELS = [
   { id: 'claude-haiku-4-5-20251001', label: 'Haiku 4.5' },
   { id: 'claude-sonnet-4-6',         label: 'Sonnet 4.6' },
   { id: 'claude-opus-4-7',           label: 'Opus 4.7' },
+  { id: 'claude-opus-4-8',           label: 'Opus 4.8' },
 ];
 const DEFAULT_MODEL_IDX = Math.max(
   0,
@@ -60,7 +65,7 @@ const WORDMARK = [
 
 interface ToolEvent { name: string; result?: string; }
 interface TokenTotals { input: number; output: number; cacheRead: number; }
-interface Message { role: 'user' | 'assistant'; content: string; tools?: ToolEvent[]; tokens?: TokenTotals; }
+interface Message { role: 'user' | 'assistant'; content: string; tools?: ToolEvent[]; tokens?: TokenTotals; info?: boolean; }
 
 const CMD_COL_WIDTH = 16;
 
@@ -111,7 +116,8 @@ function Suggestions({ suggestions, selectedIndex, input }: {
 const MODEL_DESCS: Record<string, string> = {
   'claude-haiku-4-5-20251001': 'Faster · cheaper · good for routine tasks',
   'claude-sonnet-4-6':         'Balanced · recommended for most work',
-  'claude-opus-4-7':           'Most capable · best for complex analysis',
+  'claude-opus-4-7':           'Highly capable · previous flagship',
+  'claude-opus-4-8':           'Most capable · best for complex analysis',
 };
 
 function ModelPicker({ currentIdx }: { currentIdx: number }) {
@@ -299,7 +305,7 @@ function HintBar({ isRunning, terminalMode }: { isRunning: boolean; terminalMode
         ? <Text color="#3D6650">t  toggle output   Esc  stop agent   Ctrl+C  exit</Text>
         : terminalMode
           ? <Text color="#7DD3FC">TERMINAL MODE — input runs as shell   ? prefix  ask agent   Ctrl+T  back to prompt   Ctrl+C exit</Text>
-          : <Text color="#B9FECF">PROMPT MODE — input sent to agent   ! prefix  run shell   Tab switch mode   Ctrl+T  terminal mode   Ctrl+C exit</Text>
+          : <Text color="#B9FECF">PROMPT MODE — input sent to agent   ! prefix  run shell   Tab switch mode   Shift+Tab switch model   Ctrl+T  terminal mode   Ctrl+C exit</Text>
       }
     </Box>
   );
@@ -2390,11 +2396,11 @@ function App({ onLogout }: { onLogout: () => void }) {
           // Multiplayer games live inside the playroom modal. Opening the
           // lobby in create mode drops the user into the share-address flow;
           // once their peer joins, the chosen game can be launched with its
-          // key shortcut (j for jakenpoy, r for race).
+          // key shortcut (j for jakenpoy, r for race, a for artillery).
           setPlayroom({ kind: 'create' });
           return;
         } else if (arg === 'space-impact') {
-          note = `space-impact is not yet implemented. Try /pet play jakenpoy or /pet play race for multiplayer games.`;
+          note = `space-impact was replaced by artillery. Try /pet play artillery instead.`;
         } else if (arg && GAMES[arg]) {
           setActiveGame(arg);
           return;
@@ -2563,6 +2569,14 @@ function App({ onLogout }: { onLogout: () => void }) {
                 ...(modelName ? { currentModel: modelName } : {}),
               } : p);
             }
+          },
+          onModelRoute: (model: string, classification: string) => {
+            const label = MODELS.find(m => m.id === model)?.label ?? model;
+            setMessages(prev => [...prev, {
+              role: 'assistant',
+              content: `↳ Auto-routed to ${label} (${classification})`,
+              info: true,
+            }]);
           },
           onUsage: (u: TokenUsage, model: string, subAgentLabel?: string) => {
             const acc = tokenAccRef.current;
@@ -2933,7 +2947,7 @@ function App({ onLogout }: { onLogout: () => void }) {
         setSuggestionIndex(i => Math.min(suggestions.length - 1, i + 1));
         return;
       }
-      if (key.tab) {
+      if (key.tab && !key.shift) {
         const idx = suggestionIndex >= 0 ? suggestionIndex : (suggestions.length === 1 ? 0 : -1);
         if (idx >= 0 && suggestions[idx]) {
           const [cmd, skill] = suggestions[idx]!;
@@ -2975,6 +2989,13 @@ function App({ onLogout }: { onLogout: () => void }) {
         inputRef.current = hist[next]!;
         setInput(hist[next]!);
       }
+      return;
+    }
+
+    // Shift+Tab → cycle model (mirror of /model picker, without opening it)
+    if (key.tab && key.shift) {
+      const next = (modelIdxRef.current + 1) % MODELS.length;
+      setModelIdx(next); modelIdxRef.current = next;
       return;
     }
 
@@ -3178,7 +3199,9 @@ function App({ onLogout }: { onLogout: () => void }) {
                   </Box>
                 </Box>
               );
-            })() : (
+            })() : msg.info ? (
+              <Text color="#5A8060">{msg.content}</Text>
+            ) : (
               <>
                 <RichMessage text={msg.content} />
                 {msg.tokens && <TokenBadge tokens={msg.tokens} />}

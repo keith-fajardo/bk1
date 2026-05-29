@@ -126,13 +126,14 @@ Stop and wait. Do not call any tools until the user explicitly says yes.`;
 const AUTO_MODE_SUFFIX = `
 
 ## Auto Mode — active
-The user wants to grind through work without confirmation prompts:
-- Skip mid-flow "Shall I proceed? (yes / no)" pauses on lint-fix and refactor workflows.
-- Apply proposed edits directly when you have a clear, mechanical fix in hand
-  (e.g. lint violations with a documented suggested_fix).
-- Still pause for genuinely ambiguous work — schema redesigns, destructive dbt commands
-  (run/build/seed/snapshot/test on prod targets), or anything that could lose data.
-- Surface a concise summary of what you changed at the end of each turn.`;
+The model for this turn was auto-selected to match the task's complexity. Before calling
+any tools or editing any files, write a complete plan:
+- What you intend to do, step by step
+- Which files you will read or modify
+- Any risks or ambiguities worth flagging
+
+End your plan with: "Shall I proceed? (yes / no)"
+Stop and wait. Do not call any tools until the user explicitly says yes.`;
 
 let client: Anthropic | null = null;
 function getClient() {
@@ -149,6 +150,16 @@ const MODEL = process.env.ANTHROPIC_MODEL ?? 'claude-sonnet-4-6';
 // Sub-agents do simple rule-checking — Haiku is fast, cheap, and sufficient.
 // Override with ANTHROPIC_SUB_AGENT_MODEL if needed.
 const SUB_AGENT_MODEL = process.env.ANTHROPIC_SUB_AGENT_MODEL ?? 'claude-haiku-4-5-20251001';
+
+// Auto mode picks the turn's model from a one-shot Haiku complexity classification.
+const ROUTER_MODEL = 'claude-haiku-4-5-20251001';
+const ROUTER_FALLBACK_MODEL = 'claude-sonnet-4-6';
+const COMPLEXITY_MODEL: Record<string, string> = {
+  simple:  'claude-haiku-4-5-20251001',
+  medium:  'claude-sonnet-4-6',
+  hard:    'claude-opus-4-7',
+  complex: 'claude-opus-4-8',
+};
 
 // Limits concurrent sub-agent API calls to avoid 30K input tokens/minute rate limit.
 // Regular tool calls (read_file, bash, etc.) are unaffected — only `agent` tool is throttled.
@@ -214,6 +225,8 @@ export interface AgentCallbacks {
   // set only when the usage came from a sub-agent (the `agent` tool); it carries the
   // sub-agent's `description` so /usage can attribute Haiku spend to specific rules.
   onUsage?: (usage: TokenUsage, model: string, subAgentLabel?: string) => void;
+  // Fired in auto mode once the router has picked the turn's model.
+  onModelRoute?: (model: string, classification: string) => void;
 }
 
 function extractUsage(u: Anthropic.Message['usage']): TokenUsage {
@@ -271,15 +284,81 @@ async function runSubAgent(prompt: string, signal?: AbortSignal): Promise<SubAge
   }
 }
 
+const ROUTER_SYSTEM = `You are a routing classifier for a dbt coding agent. Read the user's request and rate how much work it needs. Reply with EXACTLY one lowercase word and nothing else:
+- simple: a trivial one-shot edit or lookup (fix a typo, rename a column description, read one file)
+- medium: a normal single-model change (write/adjust one model's SQL, add a test, explain a model)
+- hard: multi-file work or non-obvious logic (refactor a model and its dependents, debug a failing build, tricky SQL)
+- complex: architectural or large multi-step work (redesign a layer, build many models, project-wide migration)`;
+
+// Extracts the plain text of the most recent user turn, ignoring tool_result blocks.
+function lastUserText(messages: Anthropic.MessageParam[]): string {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]!;
+    if (m.role !== 'user') continue;
+    if (typeof m.content === 'string') return m.content;
+    const text = m.content
+      .filter((b): b is Anthropic.TextBlockParam => b.type === 'text')
+      .map(b => b.text)
+      .join('\n');
+    if (text.trim()) return text;
+  }
+  return '';
+}
+
+// One-shot Haiku classification → model. Never throws: any failure falls back to Sonnet
+// so a turn is never blocked by the router.
+async function routeModel(
+  messages: Anthropic.MessageParam[],
+  callbacks: AgentCallbacks,
+  signal?: AbortSignal,
+): Promise<{ model: string; classification: string }> {
+  const task = lastUserText(messages);
+  if (!task.trim()) return { model: ROUTER_FALLBACK_MODEL, classification: 'medium' };
+
+  try {
+    const response = await retryOn429(() => getClient().messages.create({
+      model: ROUTER_MODEL,
+      max_tokens: 8,
+      system: ROUTER_SYSTEM,
+      messages: [{ role: 'user', content: task }],
+    }, { signal }));
+
+    callbacks.onUsage?.(extractUsage(response.usage), ROUTER_MODEL, 'router');
+
+    const word = response.content
+      .filter((b): b is Anthropic.TextBlock => b.type === 'text')
+      .map(b => b.text)
+      .join('')
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z]/g, '');
+    const model = COMPLEXITY_MODEL[word];
+    if (model) return { model, classification: word };
+  } catch (err) {
+    if (err instanceof AgentAbortedError) throw err;
+  }
+  return { model: ROUTER_FALLBACK_MODEL, classification: 'medium' };
+}
+
 export async function runAgent(
   history: Anthropic.MessageParam[],
   callbacks: AgentCallbacks,
   options?: RunAgentOptions,
 ): Promise<Anthropic.MessageParam[]> {
   const messages = [...history];
-  const effectiveModel = options?.model ?? MODEL;
   const mode: AgentMode = options?.mode ?? 'build';
   const signal = options?.signal;
+
+  let effectiveModel: string;
+  if (mode === 'plan') {
+    effectiveModel = 'claude-opus-4-8';
+  } else if (mode === 'auto') {
+    const routed = await routeModel(messages, callbacks, signal);
+    effectiveModel = routed.model;
+    callbacks.onModelRoute?.(routed.model, routed.classification);
+  } else {
+    effectiveModel = options?.model ?? MODEL;
+  }
   const effectiveSystem =
     mode === 'plan' ? RESOLVED_SYSTEM_PROMPT + PLAN_MODE_SUFFIX :
     mode === 'auto' ? RESOLVED_SYSTEM_PROMPT + AUTO_MODE_SUFFIX :

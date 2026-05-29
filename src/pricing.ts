@@ -36,6 +36,7 @@ export const MODEL_RATES: Record<string, ModelRate> = {
   'claude-sonnet-4-5':           SONNET_TIER,
   'claude-haiku-4-5':            HAIKU_TIER,
   'claude-haiku-4-5-20251001':   HAIKU_TIER,
+  'claude-opus-4-8':             OPUS_TIER,
   'claude-opus-4-7':             OPUS_TIER,
   'claude-opus-4-6':             OPUS_TIER,
   'claude-opus-4-5':             OPUS_TIER,
