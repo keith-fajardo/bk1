@@ -25,7 +25,7 @@ import {
   FOODS, addCoins, petColorHex, PET_COLOR_NAMES, DEFAULT_PET_COLOR,
   type PetState,
 } from './pet';
-import { disableMouseTracking, parseMouseEvents } from './mouse';
+import { disableMouseTracking, parseMouseEvents, enableModifyOtherKeys, disableModifyOtherKeys, isShiftEnter } from './mouse';
 import { GAMES } from './games';
 
 // Multiplayer games live inside the playroom modal (not in GAMES), but should
@@ -306,7 +306,7 @@ function HintBar({ isRunning, terminalMode }: { isRunning: boolean; terminalMode
         ? <Text color="#3D6650">t  toggle output   Esc  stop agent   Ctrl+C  exit</Text>
         : terminalMode
           ? <Text color="#7DD3FC">TERMINAL MODE — input runs as shell   ? prefix  ask agent   Ctrl+T  back to prompt   Ctrl+C exit</Text>
-          : <Text color="#B9FECF">PROMPT MODE — input sent to agent   ! prefix  run shell   Tab switch mode   Shift+Tab switch model   Ctrl+T  terminal mode   Ctrl+C exit</Text>
+          : <Text color="#B9FECF">PROMPT MODE — input sent to agent   ! prefix  run shell   Shift+Enter  newline   Tab switch mode   Shift+Tab switch model   Ctrl+T  terminal mode   Ctrl+C exit</Text>
       }
     </Box>
   );
@@ -389,6 +389,33 @@ function InputBar({ input, isRunning, mode, modelLabel, maskInput, terminalMode 
   // Cursor is a static block — no blink. Blinking would fire setState on an
   // interval, forcing Ink to repaint the dynamic frame and wiping any
   // in-progress terminal selection. Static cursor = no repaint pressure.
+
+  // Multi-line input (from Shift+Enter): badge + prompt char stay on the first
+  // line; continuation lines indent under the input; cursor sits at the end of
+  // the last line followed by the model label. Single-line input renders with
+  // the original inline layout so the common case is unchanged.
+  const lines = display.split('\n');
+  if (lines.length > 1) {
+    const last = lines.length - 1;
+    return (
+      <Box paddingX={2} flexDirection="column">
+        <Box gap={1}>
+          <Text color={badgeColor} bold>{badgeLabel}</Text>
+          <Text color={accent}>{promptChar}</Text>
+          <Text color={text}>{lines[0]}</Text>
+        </Box>
+        {lines.slice(1, last).map((line, i) => (
+          <Text key={i} color={text}>  {line}</Text>
+        ))}
+        <Box gap={1}>
+          <Text color={text}>  {lines[last]}</Text>
+          <Text color={accent}>█</Text>
+          <Text color="#3D6650">  {modelLabel}</Text>
+        </Box>
+      </Box>
+    );
+  }
+
   return (
     <Box paddingX={2} gap={1}>
       <Text color={badgeColor} bold>{badgeLabel}</Text>
@@ -1868,7 +1895,10 @@ function AppShell() {
   // stranded in mouse mode after bk1 closes — printing garbage escape sequences in
   // the next shell session would be very bad UX.
   useEffect(() => {
-    const restore = () => disableMouseTracking(process.stdout);
+    const restore = () => {
+      disableMouseTracking(process.stdout);
+      disableModifyOtherKeys(process.stdout);
+    };
     process.on('exit', restore);
     process.on('SIGINT', () => { restore(); process.exit(0); });
     process.on('SIGTERM', restore);
@@ -1877,6 +1907,16 @@ function AppShell() {
       process.off('exit', restore);
       process.off('SIGTERM', restore);
     };
+  }, []);
+
+  // Enable xterm modifyOtherKeys mode 2 so the terminal reports Shift+Enter as
+  // a distinct escape sequence (CSI 27;2;13~) instead of collapsing it to bare
+  // \r. The input handler detects that sequence and inserts a literal newline
+  // into the buffer instead of submitting. Terminals that don't support the
+  // mode ignore the sequence and Shift+Enter degrades to plain Enter.
+  useEffect(() => {
+    enableModifyOtherKeys(process.stdout);
+    return () => disableModifyOtherKeys(process.stdout);
   }, []);
 
 
@@ -3004,6 +3044,18 @@ function App({ onLogout }: { onLogout: () => void }) {
     if (key.tab) {
       const next = nextMode(modeRef.current);
       setMode(next); modeRef.current = next;
+      return;
+    }
+
+    // Shift+Enter arrives as the modifyOtherKeys escape sequence (CSI 27;2;13~).
+    // It bypasses Ink's `key.return` flag — Ink only reports raw \r as return —
+    // so detect it from the inputChar before the CSI stripper would erase it.
+    // Inserts a newline into the buffer; plain Enter still submits below.
+    if (inputChar && isShiftEnter(inputChar)) {
+      const next = inputRef.current + '\n';
+      inputRef.current = next;
+      setInput(next);
+      setSuggestionIndex(-1);
       return;
     }
 

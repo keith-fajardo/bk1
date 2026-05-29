@@ -85,3 +85,33 @@ export function enableMouseTracking(out: NodeJS.WriteStream): void {
 export function disableMouseTracking(out: NodeJS.WriteStream): void {
   out.write('\x1b[?1006l\x1b[?1015l\x1b[?1005l\x1b[?1003l\x1b[?1002l\x1b[?1000l');
 }
+
+// xterm "modifyOtherKeys" mode 2 — makes the terminal report Shift+Enter,
+// Ctrl+Enter, etc. as distinct CSI escape sequences instead of collapsing them
+// to bare \r (which is indistinguishable from a plain Enter). Used to detect
+// Shift+Enter for multi-line input.
+//
+// Shift+Enter under this mode arrives as `\x1b[27;2;13~` (CSI 27 ; modifier ; 13 ~):
+//   - 27 is the prefix used by xterm-style modifyOtherKeys for "other key"
+//   - modifier: 2 = Shift, 3 = Alt, 4 = Shift+Alt, 5 = Ctrl, etc.
+//   - 13 is the Enter keycode (0x0D)
+//
+// Terminals that don't support it ignore the enable sequence; Shift+Enter then
+// behaves like plain Enter, which degrades gracefully (no newline, just submit).
+// Verified working: VS Code integrated terminal, iTerm2, kitty, Ghostty.
+export function enableModifyOtherKeys(out: NodeJS.WriteStream): void {
+  out.write('\x1b[>4;2m');
+}
+
+export function disableModifyOtherKeys(out: NodeJS.WriteStream): void {
+  out.write('\x1b[>4;0m');
+}
+
+// Detects the Shift+Enter escape sequence in an input chunk. Returns true if
+// any Shift+Enter byte sequence is present. Caller is responsible for treating
+// it as a newline insertion and stripping it from the buffer before re-using
+// the chunk as printable input.
+const SHIFT_ENTER_RE = /\x1b?\[27;2;13~/;
+export function isShiftEnter(inputChar: string): boolean {
+  return SHIFT_ENTER_RE.test(inputChar);
+}
