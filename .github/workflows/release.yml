@@ -47,7 +47,11 @@ jobs:
         run: cargo build --release --quiet
 
       - name: Compile bk1 binary
-        run: bun build --compile --target=${{ matrix.bun_target }} --outfile bk1 src/app.tsx
+        # --external react-devtools-core: optional peer dep of Ink, only used
+        # by Ink's devtools mode which we don't ship. Without --external the
+        # compile fails when the package isn't in node_modules (i.e. always
+        # under --frozen-lockfile CI).
+        run: bun build --compile --target=${{ matrix.bun_target }} --external react-devtools-core --outfile bk1 src/app.tsx
 
       - name: Stage release artifacts
         run: |
