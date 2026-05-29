@@ -1,8 +1,8 @@
 {
   "name": "bk1-context",
   "displayName": "bk1 - dbt coding agent",
-  "description": "Coding agent made to understand dbt projects, reviews data modeling using Kimball Dimensional Modeling, and folder linting based on dbt best practices.",
-  "version": "0.4.3",
+  "description": "Coding agent for dbt projects — reviews modeling against Kimball and lints folders against dbt best practices",
+  "version": "0.4.4",
   "publisher": "keithfajardo",
   "private": true,
   "icon": "media/icon.png",
