@@ -485,6 +485,97 @@ function buildSeries(
   };
 }
 
+// ─── Org-usage fetch cache + local refresh limiter ───────────────────────────
+//
+// The /usage panel unmounts on Esc, so its per-component fetch state is lost
+// between opens. Without a cache, every reopen re-pulled the Admin usage
+// endpoint — one text call plus the series calls (the monthly view alone fires
+// 6). That endpoint has its own low rate limit; reopening /usage in a loop
+// returns 429s. This process-lifetime store lets a reopen reuse the last
+// fetched data; the user explicitly refreshes to re-pull.
+//
+// Only successful results are cached. An error (429, network, auth) is never
+// stored, so it re-fetches on the next open instead of sticking around.
+
+interface OrgUsageCacheEntry {
+  key: string;
+  text?: string;
+  series: Partial<Record<UsageGranularity, UsageSeries>>;
+  fetchedAt: number;
+}
+
+let orgCache: OrgUsageCacheEntry | null = null;
+
+// Keyed by adminKey so swapping keys (a different org) never shows stale data
+// from the previous one.
+function cacheFor(adminKey: string): OrgUsageCacheEntry {
+  if (!orgCache || orgCache.key !== adminKey) {
+    orgCache = { key: adminKey, series: {}, fetchedAt: 0 };
+  }
+  return orgCache;
+}
+
+// fetchOrgUsage / fetchBuckets return their failures as strings with one of
+// these prefixes; everything else (a real report, or "No usage data…") is a
+// cacheable success.
+function isFetchError(text: string): boolean {
+  return /^(API error|Network error|Authentication failed)/.test(text);
+}
+
+// Sync peeks — seed component state on mount without triggering a fetch.
+export function peekOrgUsageText(adminKey: string): string | null {
+  return orgCache && orgCache.key === adminKey ? orgCache.text ?? null : null;
+}
+
+export function peekOrgUsageSeries(adminKey: string, g: UsageGranularity): UsageSeries | null {
+  return orgCache && orgCache.key === adminKey ? orgCache.series[g] ?? null : null;
+}
+
+export function orgUsageFetchedAt(adminKey: string): number {
+  return orgCache && orgCache.key === adminKey ? orgCache.fetchedAt : 0;
+}
+
+// Cache-aware wrappers. force=true bypasses the cache (manual refresh).
+export async function getOrgUsage(adminKey: string, force = false): Promise<string> {
+  const c = cacheFor(adminKey);
+  if (!force && c.text !== undefined) return c.text;
+  const text = await fetchOrgUsage(adminKey);
+  if (!isFetchError(text)) { c.text = text; c.fetchedAt = Date.now(); }
+  return text;
+}
+
+export async function getOrgUsageSeries(
+  adminKey: string,
+  g: UsageGranularity,
+  force = false,
+): Promise<UsageSeries | string> {
+  const c = cacheFor(adminKey);
+  if (!force && c.series[g]) return c.series[g]!;
+  const result = await fetchOrgUsageSeries(adminKey, g);
+  if (typeof result !== 'string') { c.series[g] = result; c.fetchedAt = Date.now(); }
+  return result;
+}
+
+// Local refresh rate-limiter. Guards the manual-refresh action so mashing "r"
+// can't trip the upstream 429 we're avoiding. Sliding 60s window; the (MAX+1)th
+// refresh inside it is rejected locally with the seconds until a slot frees up.
+const REFRESH_WINDOW_MS = 60_000;
+const REFRESH_MAX = 5;
+let refreshStamps: number[] = [];
+
+export type RefreshGate = { ok: true } | { ok: false; retryInSec: number };
+
+export function requestRefresh(): RefreshGate {
+  const now = Date.now();
+  refreshStamps = refreshStamps.filter(t => now - t < REFRESH_WINDOW_MS);
+  if (refreshStamps.length >= REFRESH_MAX) {
+    const retryInSec = Math.ceil((REFRESH_WINDOW_MS - (now - refreshStamps[0]!)) / 1000);
+    return { ok: false, retryInSec };
+  }
+  refreshStamps.push(now);
+  return { ok: true };
+}
+
 export interface UsageEvent {
   turnLabel: string;            // "/lint-deep" | "/kimball" | "chat" | ...
   subAgentLabel?: string;       // present only when the call came from a sub-agent
