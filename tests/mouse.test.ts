@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { parseMouseEvents } from '../src/mouse';
+import { parseMouseEvents, normalizeKittyKeys } from '../src/mouse';
 
 describe('parseMouseEvents (xterm SGR protocol)', () => {
   test('parses a left-button press at coords', () => {
@@ -61,5 +61,33 @@ describe('parseMouseEvents (xterm SGR protocol)', () => {
     // behavior so a flaky terminal can't take bk1 down.
     expect(() => parseMouseEvents('\x1b[<0;abc;15M')).not.toThrow();
     expect(parseMouseEvents('\x1b[<0;abc;15M')).toEqual([]);
+  });
+});
+
+describe('normalizeKittyKeys (kitty disambiguate → legacy bytes)', () => {
+  test('rewrites kitty Escape (CSI 27 u) to a lone ESC', () => {
+    expect(normalizeKittyKeys('\x1b[27u')).toBe('\x1b');
+  });
+
+  test('rewrites kitty Shift+Tab (CSI 9;2 u) to legacy backtab (CSI Z)', () => {
+    expect(normalizeKittyKeys('\x1b[9;2u')).toBe('\x1b[Z');
+  });
+
+  test('leaves plain Tab (0x09) and other input untouched', () => {
+    expect(normalizeKittyKeys('\t')).toBe('\t');
+    expect(normalizeKittyKeys('hello')).toBe('hello');
+  });
+
+  test('does not touch the kitty Shift+Enter sequence (CSI 13;2 u)', () => {
+    // Shift+Enter detection still depends on this reaching the prompt handler.
+    expect(normalizeKittyKeys('\x1b[13;2u')).toBe('\x1b[13;2u');
+  });
+
+  test('leaves SGR mouse sequences intact', () => {
+    expect(normalizeKittyKeys('\x1b[<0;42;15M')).toBe('\x1b[<0;42;15M');
+  });
+
+  test('rewrites multiple occurrences in one chunk', () => {
+    expect(normalizeKittyKeys('\x1b[27u\x1b[9;2u\x1b[27u')).toBe('\x1b\x1b[Z\x1b');
   });
 });

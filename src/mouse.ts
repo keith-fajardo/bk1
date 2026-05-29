@@ -131,6 +131,22 @@ export function disableKittyKeyboard(out: NodeJS.WriteStream): void {
   out.write('\x1b[<u');
 }
 
+// Kitty's "disambiguate" mode (the flag enableKittyKeyboard pushes) re-encodes
+// a couple of keys that previously had legacy byte sequences into CSI u form,
+// which Ink's keypress parser doesn't decode — so Escape and Shift+Tab silently
+// stop firing in terminals that honor kitty (VS Code's xterm.js, kitty,
+// Ghostty). Plain Tab keeps its legacy 0x09 byte, which is why only Shift+Tab
+// breaks. We need the flag for Shift+Enter, so rather than disable it we
+// translate the two affected sequences back to the legacy bytes Ink understands
+// before they reach the parser:
+//   Escape     \x1b[27u  -> \x1b
+//   Shift+Tab  \x1b[9;2u -> \x1b[Z  (classic backtab)
+const KITTY_ESCAPE    = /\x1b\[27u/g;
+const KITTY_SHIFT_TAB = /\x1b\[9;2u/g;
+export function normalizeKittyKeys(chunk: string): string {
+  return chunk.replace(KITTY_ESCAPE, '\x1b').replace(KITTY_SHIFT_TAB, '\x1b[Z');
+}
+
 // Detects the Shift+Enter escape sequence in an input chunk. Returns true if
 // EITHER the modifyOtherKeys form (CSI 27;2;13~) or the kitty CSI u form
 // (CSI 13;2u) is present. Caller treats a true result as a newline insertion.
