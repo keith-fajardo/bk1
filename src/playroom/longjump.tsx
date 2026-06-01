@@ -205,6 +205,7 @@ export function LongJump({ pet, peerPet, sidecar, onExit, onMatchDismiss }: Prop
   }, []);
 
   useInput((input, key) => {
+    if (key.ctrl && input === 'c') process.exit(0);
     if (key.escape) { onExit(); return; }
 
     if (phase.kind === 'ready') {

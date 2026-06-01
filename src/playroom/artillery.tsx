@@ -268,7 +268,8 @@ export function Artillery({ pet, peerPet, sidecar, role, onExit, onMatchDismiss 
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  useInput((_input, key) => {
+  useInput((input, key) => {
+    if (key.ctrl && input === 'c') process.exit(0);
     if (key.escape) { onExit(); return; }
 
     if (phase.kind === 'ready') {
@@ -301,7 +302,7 @@ export function Artillery({ pet, peerPet, sidecar, role, onExit, onMatchDismiss 
         updatePhase(p => p.kind === 'battle' ? { ...p, power: Math.max(POWER_MIN, p.power - powerStep) } : p);
         return;
       }
-      if (_input === ' ' || key.return) {
+      if (input === ' ' || key.return) {
         // Fire! Broadcast first so the peer sees the same values; then
         // start our own animation. Both sides land on the same trajectory.
         const angle = phase.angle;
