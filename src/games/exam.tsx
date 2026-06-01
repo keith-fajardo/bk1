@@ -106,6 +106,11 @@ export function ExamGame({ pet, onExit }: GameProps) {
   }, [finished, current, qStartMs]);
 
   useInput((input, key) => {
+    // Ctrl+C exits the whole app, matching app.tsx's global handler. The game's
+    // useInput shadows that handler while mounted, and the extension's xterm.js
+    // never raises the SIGINT that used to be the only exit path, so this line
+    // is what makes Ctrl+C work here under the extension.
+    if (key.ctrl && input === 'c') process.exit(0);
     if (finished) {
       // Any key on the results screen exits.
       const score   = answers.filter(a => a.correct).length;

@@ -54,7 +54,8 @@ export function JakenpoySpectator({ hostPet, joinerPet, sidecar, onExit }: Props
   const roundRef = useRef(round);
   roundRef.current = round;
 
-  useInput((_input, key) => {
+  useInput((input, key) => {
+    if (key.ctrl && input === 'c') process.exit(0);
     if (key.escape) onExit();
   });
 

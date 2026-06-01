@@ -127,9 +127,9 @@ function decodeSpriteCell(ch: string): Cell {
 // show the same eye glyph for the same mood. Leaves H (tired eyelid) alone —
 // tired and hungry are stacked moods; if the pet is BOTH tired and hungry,
 // the tired sprite is already in play (eyes are H) and stays as-is.
-function applyHungryEyes(rows: string[], hungry: boolean): string[] {
-  if (!hungry) return rows;
-  return rows.map(row => row.replace(/[VM]/g, 'S'));
+function applyHungryEyes(sprite: SpriteDef, hungry: boolean): SpriteDef {
+  if (!hungry) return sprite;
+  return { ...sprite, rows: sprite.rows.map(row => row.replace(/[VM]/g, 'S')) };
 }
 
 // Tired (energy = 0) sprite variants: same silhouette as the awake versions,
@@ -286,8 +286,15 @@ export function FetchGame({ pet, onExit }: GameProps) {
     return () => clearTimeout(id);
   }, [target, hasThrown, petCol, petRow, cols, playRows]);
 
-  useInput((_input, key) => {
-    if (key.escape) onExit({ happiness: happinessGain });
+  useInput((input, key) => {
+    // ESC leaves the game (crediting happiness). Ctrl+C exits the whole app,
+    // matching the global handler in app.tsx — while a game is mounted the main
+    // useInput is unmounted, so without this Ctrl+C would no-op. It only ever
+    // reached SIGINT before, which a kitty terminal like VS Code's xterm.js
+    // never raises (Ctrl+C arrives as \x1b[99;5u, normalized to 0x03, not an
+    // OS signal), so Ctrl+C silently did nothing in the extension.
+    if (key.escape) { onExit({ happiness: happinessGain }); return; }
+    if (key.ctrl && input === 'c') process.exit(0);
   });
 
   // Project the live stats from the gain accumulated so far. Each 2 happiness

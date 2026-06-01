@@ -234,6 +234,7 @@ export function ShotPut({ pet, peerPet, sidecar, onExit, onMatchDismiss }: Props
   }, []);
 
   useInput((input, key) => {
+    if (key.ctrl && input === 'c') process.exit(0);
     if (key.escape) { onExit(); return; }
 
     if (phase.kind === 'ready') {
