@@ -30,6 +30,8 @@ import type { RelayClientMsg, RelayServerMsg, PlayerRole } from './relay-protoco
 const DEFAULT_RELAY_URL =
   process.env.PLAYROOM_RELAY_URL ?? 'wss://bk1-playroom-relay.bk1.workers.dev';
 
+const delay = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
 type Pending = {
   resolve: (value: any) => void;
   reject: (err: Error) => void;
@@ -50,12 +52,32 @@ interface CreateResult { pin: string; }
 // (both player slots are now filled); 'spectator' = view-only attach.
 interface JoinResult { role: 'joiner' | 'spectator'; pin: string; }
 
+// Send a ping this often while connected. Must be comfortably below the edge's
+// idle-WebSocket timeout (Cloudflare drops quiet sockets after ~100s, but turn
+// gaps in a game can be long, so we stay well under). The relay answers with a
+// native pong without waking its Durable Object.
+const KEEPALIVE_MS = 25_000;
+
+// Auto-reconnect on an unexpected close: a few quick retries before giving up
+// and surfacing the disconnect to the UI.
+const RECONNECT_TRIES = 3;
+const RECONNECT_DELAY_MS = 800;
+
 export class PlayroomSidecar {
   private ws: WebSocket | null = null;
+  private url: string = DEFAULT_RELAY_URL;
   private listeners = new Map<EventName, Set<EventListener>>();
   private pendingCreate: Pending | null = null;
   private pendingJoin: Pending | null = null;
   private opened = false;
+  private keepalive: ReturnType<typeof setInterval> | null = null;
+  // True once the caller asked us to close; suppresses reconnect so esc/leave
+  // doesn't trigger a rejoin race.
+  private intentionalClose = false;
+  // Set after a successful create/join so reconnect knows what room to rejoin.
+  // Host can't be rebuilt (its room is torn down relay-side the moment its
+  // socket drops), so only joiner/spectator pins are reconnectable.
+  private roomPin: string | null = null;
   // Role assigned by the relay. Set after create or join resolves; null until
   // then. Exposed so the UI can render player vs spectator chrome.
   private _role: PlayerRole | null = null;
@@ -63,15 +85,36 @@ export class PlayroomSidecar {
 
   async start(url: string = DEFAULT_RELAY_URL): Promise<void> {
     if (this.ws) return;
-    this.ws = new WebSocket(url);
+    this.url = url;
+    await this.connect();
+  }
+
+  private async connect(): Promise<void> {
+    this.opened = false;
+    this.ws = new WebSocket(this.url);
     await new Promise<void>((resolve, reject) => {
-      this.ws!.onopen = () => { this.opened = true; resolve(); };
-      this.ws!.onerror = (e) => {
-        if (!this.opened) reject(new Error(`relay connection failed: ${url}`));
+      this.ws!.onopen = () => {
+        this.opened = true;
+        this.startKeepalive();
+        resolve();
+      };
+      this.ws!.onerror = () => {
+        if (!this.opened) reject(new Error(`relay connection failed: ${this.url}`));
       };
       this.ws!.onmessage = (e) => this.handleMessage(e.data as string);
       this.ws!.onclose = () => this.handleClose();
     });
+  }
+
+  private startKeepalive(): void {
+    this.stopKeepalive();
+    this.keepalive = setInterval(() => {
+      this.sendRaw({ op: 'ping' });
+    }, KEEPALIVE_MS);
+  }
+
+  private stopKeepalive(): void {
+    if (this.keepalive) { clearInterval(this.keepalive); this.keepalive = null; }
   }
 
   async create(): Promise<CreateResult> {
@@ -86,8 +129,15 @@ export class PlayroomSidecar {
   async join(pin: string): Promise<JoinResult> {
     if (!this.ws) throw new Error('relay not connected');
     if (this.pendingJoin) throw new Error('join already in flight');
+    // Remember the pin up front so an unexpected drop can rejoin the same room
+    // (the relay's `joined` ack carries no pin). Cleared again if the join
+    // itself fails.
+    this.roomPin = pin;
     return new Promise((resolve, reject) => {
-      this.pendingJoin = { resolve, reject };
+      this.pendingJoin = {
+        resolve,
+        reject: (err) => { this.roomPin = null; reject(err); },
+      };
       this.sendRaw({ op: 'join', pin });
     });
   }
@@ -106,6 +156,8 @@ export class PlayroomSidecar {
   }
 
   async close(): Promise<void> {
+    this.intentionalClose = true;
+    this.stopKeepalive();
     if (!this.ws) return;
     try { this.ws.close(); } catch {}
     this.ws = null;
@@ -134,10 +186,15 @@ export class PlayroomSidecar {
         return;
       case 'joined_as_spectator':
         this._role = 'spectator';
+        this.roomPin = msg.pin;
         this.pendingJoin?.resolve({ role: 'spectator', pin: msg.pin });
         this.pendingJoin = null;
         // Also fire as an event so the lobby can immediately swap to spectator chrome.
         this.emit('joined_as_spectator', { pin: msg.pin });
+        return;
+      case 'pong':
+        // Keepalive ack — nothing to do; the round-trip already kept the
+        // connection warm at the edge.
         return;
       case 'paired':
         this.emit('peer_connected', {});
@@ -166,11 +223,45 @@ export class PlayroomSidecar {
   }
 
   private handleClose(): void {
+    this.stopKeepalive();
+    this.ws = null;
+
     const err = new Error('relay connection closed');
     this.pendingCreate?.reject(err); this.pendingCreate = null;
     this.pendingJoin?.reject(err);   this.pendingJoin = null;
-    this.emit('error', { msg: 'relay disconnected' });
-    this.ws = null;
+
+    if (this.intentionalClose) return;
+
+    // Unexpected drop. A joiner or spectator can transparently rejoin the same
+    // pin (the relay keeps the room alive now). A host can't: the relay tears
+    // its room down the instant the host socket drops, so there's nothing to
+    // rejoin — surface the disconnect immediately.
+    if ((this._role === 'joiner' || this._role === 'spectator') && this.roomPin) {
+      this.reconnect().catch(() => {});
+      return;
+    }
+    this.emit('peer_disconnected', {});
+  }
+
+  private async reconnect(): Promise<void> {
+    const pin = this.roomPin!;
+    for (let attempt = 1; attempt <= RECONNECT_TRIES; attempt++) {
+      await delay(RECONNECT_DELAY_MS * attempt);
+      if (this.intentionalClose) return;
+      try {
+        await this.connect();
+        await this.join(pin);
+        // Rejoin succeeded. The relay's `paired`/`joined_as_spectator` reply
+        // already drove the right event through handleMessage, so the lobby is
+        // back in sync — nothing more to emit here.
+        return;
+      } catch {
+        // connect or rejoin failed (room gone, relay unreachable) — try again.
+        if (this.ws) { try { this.ws.close(); } catch {} this.ws = null; }
+      }
+    }
+    // Out of retries — the room is genuinely gone.
+    this.emit('peer_disconnected', {});
   }
 
   private emit(name: EventName, data: any): void {

@@ -6,7 +6,11 @@
 export type RelayClientMsg =
   | { op: 'create' }
   | { op: 'join'; pin: string }
-  | { op: 'data'; payload: string };
+  | { op: 'data'; payload: string }
+  // Client keepalive sent on an interval during idle gaps. The relay answers
+  // with `pong` (natively, via the DO auto-response, when hibernated). This is
+  // what keeps the edge from idling the connection out between turns.
+  | { op: 'ping' };
 
 export type PlayerRole = 'host' | 'joiner' | 'spectator';
 
@@ -22,6 +26,7 @@ export type RelayServerMsg =
   // omitted on data sent BY clients.
   | { op: 'data'; payload: string; from?: 'host' | 'joiner' }
   | { op: 'peer_left' }
+  | { op: 'pong' }
   | { op: 'error'; msg: string };
 
 // Pin charset: uppercase letters + digits minus visually confusing

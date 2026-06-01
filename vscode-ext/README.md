@@ -42,4 +42,4 @@ These only apply while the bk1 terminal tab is focused — they leave every othe
 
 bk1 is open source. Full documentation, the CLI, the Rust linter, and the bundled Kimball knowledge base all live in one repo: **https://github.com/keith-fajardo/bk1**
 
-bk1 is built by [Mangrove](https://gridland.io). The name is short for *bakawan* — Filipino for *mangrove*.
+bk1 is built by [Mangrove](https://mangrovedigital.com.au/). The name is short for *bakawan* — Filipino for *mangrove*.
