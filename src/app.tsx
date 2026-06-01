@@ -2,7 +2,7 @@ import { useState, useRef, useCallback, useMemo, useEffect } from 'react';
 import { existsSync, mkdirSync, writeFileSync } from 'fs';
 import { homedir } from 'os';
 import { spawnSync } from 'node:child_process';
-import { render, Box, Text, Static, useInput, measureElement, type DOMElement, type Instance } from 'ink';
+import { render, Box, Text, Static, useInput, measureElement, type DOMElement } from 'ink';
 import Spinner from 'ink-spinner';
 import type Anthropic from '@anthropic-ai/sdk';
 import { runAgent, AgentAbortedError, resetAnthropicClient, type TokenUsage } from './agent';
@@ -29,13 +29,6 @@ import {
 } from './pet';
 import { disableMouseTracking, parseMouseEvents, enableModifyOtherKeys, disableModifyOtherKeys, enableKittyKeyboard, disableKittyKeyboard, isShiftEnter, normalizeKittyKeys } from './mouse';
 import { GAMES } from './games';
-
-// The Ink render() instance, set once at startup (bottom of file). The resize
-// handler uses inkInstance.clear() to reset Ink's log-update line tracking, which
-// the terminal's line-rewrap on resize otherwise desyncs (leaving a duplicated
-// input bar). Module-scoped because render() happens outside the component tree.
-let inkInstance: Instance | null = null;
-function setInkInstance(instance: Instance) { inkInstance = instance; }
 
 // Multiplayer games live inside the playroom modal (not in GAMES), but should
 // still appear in the /pet play picker so users can discover them. Picking
@@ -80,7 +73,12 @@ interface Message { role: 'user' | 'assistant'; content: string; tools?: ToolEve
 const CMD_COL_WIDTH = 16;
 
 function HRule() {
-  const cols = (process.stdout.columns ?? 80) - 4;
+  // columns - 4 for the paddingX={2}, minus 1 more so the rule never reaches the full
+  // terminal width. A full-width rule wraps to a second physical row the instant the
+  // window shrinks (the old rule is still painted at the old width), and that wrapped
+  // row is what gets stranded as an orphan on resize. Leaving a 1-col margin guarantees
+  // the rule stays a single physical row at any width.
+  const cols = Math.max(0, (process.stdout.columns ?? 80) - 5);
   return (
     <Box paddingX={2}>
       <Text color="#5A8060">{'─'.repeat(cols)}</Text>
@@ -2209,37 +2207,41 @@ function App({ onLogout }: { onLogout: () => void }) {
   // so the calculation needs to follow window resizes. Ink doesn't expose a
   // ready-made hook, so we listen to stdout's resize event ourselves.
   const [terminalRows, setTerminalRows] = useState(process.stdout.rows ?? 24);
-  // Bumped by the resize handler to force Ink to re-emit the live frame after we
-  // clear it. Read once below so the dependency is real and React can't elide it.
-  const [resizeNonce, setResizeNonce] = useState(0);
+  // True while the window is actively being resized. The live frame collapses to a
+  // minimal height (input + one status line, no pet sprite / rules / hints) while
+  // this is set — see the resize handling note below.
+  const [resizing, setResizing] = useState(false);
   useEffect(() => {
-    // Resize handling. Two failure modes to thread between:
+    // Resize ghosting fix, Claude-Code style. The root bug: bk1's live (repainted)
+    // frame is ~10 rows tall (pet sprite, footer, rules, hints, input). On resize the
+    // terminal reflows those rows into a different physical-row count, which desyncs
+    // Ink's log-update line tracking and leaves stale copies stacked in scrollback as
+    // ghosts. No amount of post-hoc clearing fixes it cleanly (logical vs physical
+    // line counts can't be resynced), and we must never wipe the <Static> history.
     //
-    //   1. Clearing scrollback (\x1b[3J) destroys the conversation history, because
-    //      it lives in Ink's <Static> output which Ink won't reprint on a normal
-    //      render. So we never touch scrollback.
-    //   2. NOT clearing leaves a duplicated input bar: on resize the terminal rewraps
-    //      the on-screen live frame, which desyncs log-update's eraseLines() math
-    //      (it erases a line count measured at the old width), so the old frame isn't
-    //      fully erased before the new one is drawn.
+    // The robust fix is to keep the live frame SMALL so it can't wrap-scroll and ghost.
+    // We can't permanently drop the pet sprite, so instead we collapse the live frame
+    // to a minimal height only WHILE resizing: set `resizing` on the first resize tick,
+    // clear it on a trailing debounce once the drag settles.
     //
-    // The fix is to clear ONLY the live region (cursor to end of screen, \x1b[J —
-    // which leaves the Static scrollback above the cursor intact) and reset Ink's
-    // log-update tracking via inkInstance.clear(), then force a repaint by bumping
-    // resizeNonce. Debounced so a drag-resize doesn't thrash on every pixel tick.
-    let resizeTimer: ReturnType<typeof setTimeout> | undefined;
+    // We deliberately do NOT manually clear Ink's output here. Ink's clear() writes
+    // eraseLines(previousLineCount), and previousLineCount is a LOGICAL line count while
+    // the terminal reflows PHYSICAL rows — calling it mid-resize corrupts Ink's counter
+    // against the reflowed buffer and strands orphan rows (the stray HRule lines we saw).
+    // Letting Ink's own log() do the erase on each render keeps the counter self-consistent.
+    // The other half of the fix is that HRule never spans the full width (see HRule), so no
+    // live-frame row wraps to a second physical row — the divergence that makes the upward
+    // erase fall short.
+    let settleTimer: ReturnType<typeof setTimeout> | undefined;
     const onResize = () => {
       setTerminalRows(process.stdout.rows ?? 24);
-      if (resizeTimer) clearTimeout(resizeTimer);
-      resizeTimer = setTimeout(() => {
-        inkInstance?.clear();        // reset log-update line tracking (erases old frame)
-        process.stdout.write('\x1b[J'); // mop up any rewrap residue below the cursor
-        setResizeNonce(n => n + 1);  // force Ink to re-emit the live frame cleanly
-      }, 120);
+      setResizing(true);
+      if (settleTimer) clearTimeout(settleTimer);
+      settleTimer = setTimeout(() => setResizing(false), 300);
     };
     process.stdout.on('resize', onResize);
     return () => {
-      if (resizeTimer) clearTimeout(resizeTimer);
+      if (settleTimer) clearTimeout(settleTimer);
       process.stdout.off('resize', onResize);
     };
   }, []);
@@ -3506,7 +3508,7 @@ function App({ onLogout }: { onLogout: () => void }) {
             <Text color="#5A8060">{PROJECT_DIR}</Text>
           </Box>
         </Box>
-        <Box key={`live-${resizeNonce}`} marginTop={1} flexDirection="column">
+        <Box marginTop={1} flexDirection="column">
           {isModelPicker
             ? <ModelPicker currentIdx={modelIdx} />
             : isPetPlayroomPicker
@@ -3601,84 +3603,95 @@ function App({ onLogout }: { onLogout: () => void }) {
         )}
       </Static>
 
-      {/* key includes resizeNonce so a resize remounts ONLY this live frame (not the
-          Static blocks above), guaranteeing Ink emits fresh output after we clear the
-          rewrap-ghosted copy. */}
-      <Box key={`live-${resizeNonce}`} flexDirection="column" paddingX={2}>
-        {isRunning && (
-          <Box flexDirection="column" marginBottom={1}>
-            <Box gap={1}>
-              <Text color="#5A8060">{liveExpanded ? '-' : '+'}</Text>
-              <Text color="#B9FECF"><Spinner type="sand" /></Text>
-              <GlowText text="mangroooooving..." />
-              {activeTool && (
-                <Text color="#5A8060">· {activeTool}</Text>
-              )}
-            </Box>
-            {lintProgress && lintProgress.phase !== 'semantic' && <LintProgressBar progress={lintProgress} />}
-            {semanticProgress && semanticProgress.agents.some(a => !a.done) && (
-              <SemanticProgressBar progress={semanticProgress} />
-            )}
-            {liveTokens && <TokenBadge tokens={liveTokens} dim />}
-            {!liveExpanded && liveText && (
-              <Box paddingLeft={4}>
-                <Text color="#3D6650">
-                  {(liveText.trim().split('\n').slice(-1)[0] ?? '').slice(0, 120)}
-                </Text>
+      {/* While the window is being resized, collapse the live frame to two rows
+          (input + compact status). A tall live frame is what ghosts on resize: the
+          terminal reflows its rows and Ink's line tracking desyncs. Two rows can't
+          wrap-scroll, so there's nothing to ghost. The full frame (pet sprite, rules,
+          hints, live-stream) repaints once `resizing` clears on settle. */}
+      {resizing ? (
+        <Box flexDirection="column" paddingX={2}>
+          <InputBar input={input} isRunning={isRunning} mode={mode} modelLabel={MODELS[modelIdx]!.label} maskInput={awaitingAdminKey} terminalMode={terminalMode} />
+          <Text color="#5A8060">resizing…</Text>
+        </Box>
+      ) : (
+        <>
+          <Box flexDirection="column" paddingX={2}>
+            {isRunning && (
+              <Box flexDirection="column" marginBottom={1}>
+                <Box gap={1}>
+                  <Text color="#5A8060">{liveExpanded ? '-' : '+'}</Text>
+                  <Text color="#B9FECF"><Spinner type="sand" /></Text>
+                  <GlowText text="mangroooooving..." />
+                  {activeTool && (
+                    <Text color="#5A8060">· {activeTool}</Text>
+                  )}
+                </Box>
+                {lintProgress && lintProgress.phase !== 'semantic' && <LintProgressBar progress={lintProgress} />}
+                {semanticProgress && semanticProgress.agents.some(a => !a.done) && (
+                  <SemanticProgressBar progress={semanticProgress} />
+                )}
+                {liveTokens && <TokenBadge tokens={liveTokens} dim />}
+                {!liveExpanded && liveText && (
+                  <Box paddingLeft={4}>
+                    <Text color="#3D6650">
+                      {(liveText.trim().split('\n').slice(-1)[0] ?? '').slice(0, 120)}
+                    </Text>
+                  </Box>
+                )}
+                {liveExpanded && liveText && (
+                  <Box flexDirection="column" paddingLeft={3}>
+                    <Text wrap="wrap" color="#7AB890">{liveText.trimEnd()}</Text>
+                  </Box>
+                )}
               </Box>
             )}
-            {liveExpanded && liveText && (
-              <Box flexDirection="column" paddingLeft={3}>
-                <Text wrap="wrap" color="#7AB890">{liveText.trimEnd()}</Text>
+            {liveShellCmd && (
+              <Box flexDirection="column" marginBottom={1}>
+                <Box gap={1}>
+                  <Text color="#7DD3FC">$</Text>
+                  <Text color="#BAE6FD" bold>{liveShellCmd}</Text>
+                  <Text color="#5A8060"><Spinner type="sand" /></Text>
+                  <Text color="#3D6650">Esc to abort</Text>
+                </Box>
+                {liveShellText && (
+                  <Box flexDirection="column" paddingLeft={2}>
+                    <Text wrap="wrap" color="#7AB890">
+                      {liveShellText.trimEnd().split('\n').slice(-12).join('\n')}
+                    </Text>
+                  </Box>
+                )}
               </Box>
             )}
           </Box>
-        )}
-        {liveShellCmd && (
-          <Box flexDirection="column" marginBottom={1}>
-            <Box gap={1}>
-              <Text color="#7DD3FC">$</Text>
-              <Text color="#BAE6FD" bold>{liveShellCmd}</Text>
-              <Text color="#5A8060"><Spinner type="sand" /></Text>
-              <Text color="#3D6650">Esc to abort</Text>
-            </Box>
-            {liveShellText && (
-              <Box flexDirection="column" paddingLeft={2}>
-                <Text wrap="wrap" color="#7AB890">
-                  {liveShellText.trimEnd().split('\n').slice(-12).join('\n')}
-                </Text>
-              </Box>
-            )}
-          </Box>
-        )}
-      </Box>
 
-      {!confirmPrompt && (isModelPicker
-        ? <ModelPicker currentIdx={modelIdx} />
-        : isPetPlayroomPicker
-          ? <PlayroomPicker currentIdx={petPlayroomIdx} />
-          : isPetPlayPicker
-            ? <GamePicker currentIdx={petPlayIdx} />
-            : isPetFeedPicker
-              ? <FoodPicker currentIdx={petFeedIdx} balance={pet.coins} />
-              : <Suggestions suggestions={suggestions} selectedIndex={suggestionIndex} input={input} />
+          {!confirmPrompt && (isModelPicker
+            ? <ModelPicker currentIdx={modelIdx} />
+            : isPetPlayroomPicker
+              ? <PlayroomPicker currentIdx={petPlayroomIdx} />
+              : isPetPlayPicker
+                ? <GamePicker currentIdx={petPlayIdx} />
+                : isPetFeedPicker
+                  ? <FoodPicker currentIdx={petFeedIdx} balance={pet.coins} />
+                  : <Suggestions suggestions={suggestions} selectedIndex={suggestionIndex} input={input} />
+          )}
+          <HRule />
+          {!confirmPrompt && <IdeContextBar ctx={ideCtx} />}
+          {confirmPrompt
+            ? <ConfirmBar question={confirmPrompt} selectedIdx={confirmSelected} />
+            : <InputBar input={input} isRunning={isRunning} mode={mode} modelLabel={MODELS[modelIdx]!.label} maskInput={awaitingAdminKey} terminalMode={terminalMode} />
+          }
+          {/* Eye-tracking anchor: `terminalRows - 5`. Once a conversation has enough
+              Static scrollback to push the dynamic frame down, the cursor lands at the
+              terminal bottom and this is exact. For short conversations on tall terminals
+              it can be a bit off (eye is higher than the anchor), but that's the
+              least-bad option given we can't measure absolute position with Static
+              content present. terminalRows itself follows window resizes via the
+              stdout.on('resize') listener at the top of App. */}
+          <StatusFooter sessionUsd={sessionUsd} pet={pet} renderHeight={terminalRows} coinToast={coinToast} />
+          <HRule />
+          <HintBar isRunning={isRunning} terminalMode={terminalMode} />
+        </>
       )}
-      <HRule />
-      {!confirmPrompt && <IdeContextBar ctx={ideCtx} />}
-      {confirmPrompt
-        ? <ConfirmBar question={confirmPrompt} selectedIdx={confirmSelected} />
-        : <InputBar input={input} isRunning={isRunning} mode={mode} modelLabel={MODELS[modelIdx]!.label} maskInput={awaitingAdminKey} terminalMode={terminalMode} />
-      }
-      {/* Eye-tracking anchor: `terminalRows - 5`. Once a conversation has enough
-          Static scrollback to push the dynamic frame down, the cursor lands at the
-          terminal bottom and this is exact. For short conversations on tall terminals
-          it can be a bit off (eye is higher than the anchor), but that's the
-          least-bad option given we can't measure absolute position with Static
-          content present. terminalRows itself follows window resizes via the
-          stdout.on('resize') listener at the top of App. */}
-      <StatusFooter sessionUsd={sessionUsd} pet={pet} renderHeight={terminalRows} coinToast={coinToast} />
-      <HRule />
-      <HintBar isRunning={isRunning} terminalMode={terminalMode} />
     </Box>
   );
 }
@@ -3699,8 +3712,4 @@ process.on('uncaughtException', (err: NodeJS.ErrnoException) => {
   throw err;
 });
 
-// Capture the Ink instance so the resize handler can ask Ink to re-emit the live
-// frame. On resize the terminal rewraps existing lines, which desyncs log-update's
-// erase math and leaves a duplicated input bar; clear() resets that tracking so the
-// next paint is clean. See the resize useEffect in App.
-setInkInstance(render(<AppShell />));
+render(<AppShell />);
