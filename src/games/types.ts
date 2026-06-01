@@ -20,5 +20,7 @@ export interface GameProps {
 export interface Game {
   id: string;
   description: string;
-  component: (props: GameProps) => ReactElement;
+  // Returns null for the frame before the game's first state is ready (Ink
+  // treats a null render as "draw nothing"), so the return type allows it.
+  component: (props: GameProps) => ReactElement | null;
 }

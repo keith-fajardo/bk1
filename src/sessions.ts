@@ -150,7 +150,7 @@ export function searchSessions(projectPath: string, query: string, limit = 20): 
       id: number; started_at: string; last_used_at: string;
       title: string | null; model: string; message_count: number;
       snippet: string | null;
-    }, [string, string, string, string, number]>(
+    }, [string, string, string, number]>(
       `SELECT s.id, s.started_at, s.last_used_at, s.title, s.model,
               (SELECT COUNT(*) FROM session_messages WHERE session_id = s.id) AS message_count,
               (SELECT snippet(session_messages_fts, 1, '', '', '…', 8)
