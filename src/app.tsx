@@ -24,10 +24,10 @@ import {
   petSpriteLookUL, petSpriteLookUR, petSpriteLookDL, petSpriteLookDR,
   renderPetView, isSleeping, isEating,
   feed, play, petSleep, wakePet, rename, autoFeedFromActivity,
-  FOODS, addCoins, petColorHex, PET_COLOR_NAMES, DEFAULT_PET_COLOR,
+  FOODS, addCoins, addXp, levelInfo, petColorHex, PET_COLOR_NAMES, DEFAULT_PET_COLOR,
   type PetState,
 } from './pet';
-import { disableMouseTracking, parseMouseEvents, enableModifyOtherKeys, disableModifyOtherKeys, enableKittyKeyboard, disableKittyKeyboard, isShiftEnter, normalizeKittyKeys } from './mouse';
+import { disableMouseTracking, parseMouseEvents, enableModifyOtherKeys, disableModifyOtherKeys, enableKittyKeyboard, disableKittyKeyboard, isNewlineKey, normalizeKittyKeys } from './mouse';
 import { GAMES } from './games';
 
 // Multiplayer games live inside the playroom modal (not in GAMES), but should
@@ -43,7 +43,7 @@ const MULTIPLAYER_GAMES = [
   { id: 'artillery', description: 'Turn-based artillery duel — opens playroom' },
 ] as const;
 const MULTIPLAYER_GAME_IDS = new Set<string>(MULTIPLAYER_GAMES.map(g => g.id));
-import { registerCoinEventHandler, emitCoinEvent, COIN_REWARDS, PASSIVE_SESSION_CAP, type CoinEvent } from './coin-events';
+import { registerCoinEventHandler, emitCoinEvent, COIN_REWARDS, type CoinEvent } from './coin-events';
 import { PlayroomLobby, type LobbyMode } from './playroom/room';
 
 const MODELS = [
@@ -466,8 +466,12 @@ function nextMode(m: Mode): Mode {
   return MODE_ORDER[(MODE_ORDER.indexOf(m) + 1) % MODE_ORDER.length]!;
 }
 
-function InputBar({ input, isRunning, mode, modelLabel, maskInput, terminalMode }: {
+function InputBar({ input, isRunning, mode, modelLabel, maskInput, terminalMode, collapsed }: {
   input: string; isRunning: boolean; mode: Mode; modelLabel: string; maskInput?: boolean; terminalMode?: boolean;
+  // While the window is actively resizing the caller passes collapsed so we
+  // render a single borderless row — a multi-row bordered box would wrap-desync
+  // mid-resize and strand orphan rows (see the resize-safety note below).
+  collapsed?: boolean;
 }) {
   const theme = MODE_THEME[mode];
   const termAccent = '#7DD3FC';
@@ -489,52 +493,65 @@ function InputBar({ input, isRunning, mode, modelLabel, maskInput, terminalMode 
   // interval, forcing Ink to repaint the dynamic frame and wiping any
   // in-progress terminal selection. Static cursor = no repaint pressure.
 
-  // Multi-line input (from Shift+Enter): badge + prompt char stay on the first
-  // line; continuation lines indent under the input; cursor sits at the end of
-  // the last line followed by the model label. Single-line input renders with
-  // the original inline layout so the common case is unchanged.
+  // Claude-Code-style bordered prompt box. The input text (single- or
+  // multi-line) lives inside a rounded border; the badge + model sit on a
+  // status line below it (the key hints stay in the HintBar). The border color
+  // follows the mode/state accent so it reinforces PROMPT vs TERM vs running.
+  //
+  // RESIZE SAFETY: the box width is capped to `columns - 5` (the same margin
+  // HRule uses) so the border NEVER reaches full terminal width. A full-width
+  // border wraps to an extra physical row on shrink while Ink counts it as one
+  // logical line, stranding an orphan row — the exact resize-ghosting failure
+  // mode this codebase fights. The caller already collapses to a borderless
+  // frame while actively resizing (see the `resizing` branch in App), so this
+  // multi-row box is only mounted once the window has settled.
   const lines = display.split('\n');
-  if (lines.length > 1) {
-    const last = lines.length - 1;
-    // Continuation lines align under line 0's text, which begins after the badge,
-    // a space, the prompt char, and a space — badgeLabel.length + 3 columns in.
-    const contIndent = ' '.repeat(badgeLabel.length + 3);
-    // Each continuation line needs its own Box wrapper, not a bare Text child.
-    // Ink's flex column layout treats bare Text children as inline content
-    // that can merge with sibling rows; wrapping in Box forces a real flex
-    // item per row. The model label is omitted from multi-line render so it
-    // can't end up on a half-rendered "continuation" row — single-line
-    // already shows it, and during active multi-line edit the user doesn't
-    // need to see it.
+  const last = lines.length - 1;
+
+  // Collapsed (resizing) form: a single borderless row. We show the first line
+  // plus an ellipsis if multi-line, so the live frame stays exactly one row and
+  // can't wrap or ghost while the terminal reflows.
+  if (collapsed) {
+    const oneLine = lines.length > 1 ? `${lines[0]} …` : lines[0];
     return (
-      <Box paddingX={2} flexDirection="column">
-        <Box>
-          <Text color={badgeColor} bold>{badgeLabel}</Text>
-          <Text> </Text>
-          <Text color={accent}>{promptChar}</Text>
-          <Text> </Text>
-          <Text color={text}>{lines[0]}</Text>
-        </Box>
-        {lines.slice(1, last).map((line, i) => (
-          <Box key={i}>
-            <Text color={text}>{contIndent}{line}</Text>
-          </Box>
-        ))}
-        <Box>
-          <Text color={text}>{contIndent}{lines[last]}</Text>
-          <Text color={accent}>█</Text>
-        </Box>
+      <Box gap={1}>
+        <Text color={badgeColor} bold>{badgeLabel}</Text>
+        <Text color={accent}>{promptChar}</Text>
+        <Text color={text}>{oneLine}</Text>
+        <Text color={accent}>█</Text>
       </Box>
     );
   }
 
+  const cols = process.stdout.columns ?? 80;
+  // InputBar owns its own paddingX={2} (like the old inline form) so it aligns
+  // under the HRules at every call site — the welcome view doesn't wrap it in a
+  // padded container. The box width subtracts that 4-col padding plus a 1-col
+  // safety margin so the border can't touch the edge and wrap on resize.
+  const boxWidth = Math.max(20, cols - 4 - 1);
+
   return (
-    <Box paddingX={2} gap={1}>
-      <Text color={badgeColor} bold>{badgeLabel}</Text>
-      <Text color={accent}>{promptChar}</Text>
-      <Text color={text}>{display}</Text>
-      <Text color={accent}>█</Text>
-      <Text color="#3D6650">  {modelLabel}</Text>
+    <Box flexDirection="column" paddingX={2}>
+      <Box width={boxWidth} borderStyle="round" borderColor={accent} paddingX={1} flexDirection="column">
+        {lines.map((line, i) => {
+          // One bare Text per row — the same structure as the user-message
+          // bubble, which renders reliably inside a fixed-width border. The
+          // prompt char ("> ") prefixes line 0; continuation rows get a matching
+          // two-space indent so they align under the first line. The cursor
+          // block is appended to the last row's string. `|| ' '` keeps an empty
+          // row from collapsing (which would drop the cursor's line). Building a
+          // single string per row — NOT multiple Text children in a per-row Box
+          // — is what keeps content inside the border; the multi-child row Box
+          // overflowed the frame and stranded the text and right edge.
+          const prefix = i === 0 ? `${promptChar} ` : '  ';
+          const body = prefix + line + (i === last ? '█' : '');
+          return <Text key={i} color={text} wrap="wrap">{body || ' '}</Text>;
+        })}
+      </Box>
+      <Box paddingX={1}>
+        <Text color={badgeColor} bold>{badgeLabel}</Text>
+        <Text color="#3D6650">   {modelLabel}</Text>
+      </Box>
     </Box>
   );
 }
@@ -782,6 +799,8 @@ function StatusFooter({ sessionUsd, pet, renderHeight, coinToast }: {
               {coinToast.delta >= 0 ? '+' : ''}{coinToast.delta} ({coinToast.reason})
             </Text>
           )}
+          <Text color="#3D6650">·</Text>
+          {(() => { const l = levelInfo(pet.xp); return <Text color="#A78BFA">⭐ Lv{l.level} {l.into}/{l.span}</Text>; })()}
           <Text color="#3D6650">·</Text>
           {sessionUsd > 0 && (
             <>
@@ -2194,6 +2213,12 @@ function App({ onLogout }: { onLogout: () => void }) {
   // an Option+<letter> sequence that some terminals (VS Code's xterm.js) split into
   // two keypresses.
   const lastEscapeAtRef = useRef<number>(0);
+  // Stamped when the raw-stdin handler inserts a newline for Opt+Enter (`\x1b\r`).
+  // The same chunk also reaches Ink's useInput, which decodes the trailing `\r`
+  // as key.return and would otherwise submit. The key.return branch checks this
+  // timestamp and skips submit if a newline was just inserted (~50ms window),
+  // so Opt+Enter inserts a newline instead of sending the prompt.
+  const newlineJustInsertedRef = useRef<number>(0);
   // When set, the next confirm prompt's yes/no resolves locally via these callbacks
   // instead of being forwarded to the agent. Used by `/lint-deep` (and any future
   // command that wants to gate an expensive LLM call on a local Y/N).
@@ -2310,25 +2335,19 @@ function App({ onLogout }: { onLogout: () => void }) {
   // Auto-clears after a few seconds so it doesn't linger past the moment.
   const [coinToast, setCoinToast] = useState<{ delta: number; reason: string } | null>(null);
 
-  // Track cumulative passive earnings (model add/update) this session — capped
-  // at PASSIVE_SESSION_CAP so a refactor that touches 100 files doesn't dump
-  // 500 coins. Lint fixes, pushes, dbt runs are NOT capped (they reflect real
-  // work). Resets on app restart, intentionally — the cap is per-session.
-  const passiveEarnedRef = useRef(0);
-
   // Register the coin-event handler once at mount. State.ts (lint pipeline)
   // and future emitters (git poll, dbt tool wrappers) call emitCoinEvent;
   // this handler applies the delta to the pet and shows a transient toast.
+  // Every event pays its full delta — there is no per-session cap. (A passive
+  // cap on model add/update events was removed; coins now mirror XP, awarding
+  // in full for every action.)
   useEffect(() => {
     registerCoinEventHandler((event: CoinEvent) => {
-      let delta = event.delta;
-      if (event.countsTowardPassiveCap && delta > 0) {
-        const headroom = Math.max(0, PASSIVE_SESSION_CAP - passiveEarnedRef.current);
-        delta = Math.min(delta, headroom);
-        passiveEarnedRef.current += delta;
-        if (delta === 0) return;  // cap hit — silently drop
-      }
-      const next = addCoins(petRef.current, delta);
+      const delta = event.delta;
+      // XP earns from positive deltas only (it ignores penalties and never
+      // decreases); coins take the delta directly (addCoins floors at zero).
+      let next = addCoins(petRef.current, delta);
+      if (delta > 0) next = addXp(next, delta);
       petRef.current = next;
       setPet(next);
       savePet(next);
@@ -2417,6 +2436,32 @@ function App({ onLogout }: { onLogout: () => void }) {
     mouseTrackingOnRef.current = false;
   }, []);
 
+  // Opt+Enter / Shift+Enter → insert a newline into the prompt instead of
+  // submitting. Handled by re-wrapping stdin.emit (layered on top of AppShell's
+  // wrapper) because this runs before ANY 'data' listener — including Ink's,
+  // which is registered first and would otherwise decode the trailing `\r` as
+  // key.return and submit before a plain stdin listener could intervene. On a
+  // match we update the input here (this effect lives in App, which owns the
+  // input state) and SWALLOW the chunk so Ink never sees it.
+  useEffect(() => {
+    const stdin = process.stdin;
+    const innerEmit = stdin.emit.bind(stdin);
+    stdin.emit = ((event: string, ...rest: unknown[]) => {
+      if (event === 'data') {
+        const s = String(rest[0]);
+        if (!isRunningRef.current && !awaitingAdminKeyRef.current && isNewlineKey(s)) {
+          const next = inputRef.current + '\n';
+          inputRef.current = next;
+          setInput(next);
+          setSuggestionIndex(-1);
+          return true;  // swallow — do not forward to Ink (no key.return → no submit)
+        }
+      }
+      return innerEmit(event, ...(rest as []));
+    }) as typeof stdin.emit;
+    return () => { stdin.emit = innerEmit; };
+  }, []);
+
   // Live mouse cursor position — drives the pet's eye-tracking. `null` means we haven't
   // Mouse click → pet interaction. Mouse motion → eye tracking.
   //
@@ -2436,7 +2481,8 @@ function App({ onLogout }: { onLogout: () => void }) {
       // to fetch" AND "tap the StatusFooter pet" (which would credit happiness twice
       // and re-render the bottom bar mid-game).
       if (activeGameRef.current) return;
-      const events = parseMouseEvents(data.toString('utf8'));
+      const str = data.toString('utf8');
+      const events = parseMouseEvents(str);
       for (const ev of events) {
         if (!ev.press || ev.motion) continue;
         if (ev.button !== 'left') continue;
@@ -2474,7 +2520,15 @@ function App({ onLogout }: { onLogout: () => void }) {
   }, [input, isModelPicker, isPetPlayPicker, isPetFeedPicker, isPetPlayroomPicker]);
 
   const submit = useCallback(async () => {
-    let raw = inputRef.current.trim();
+    // Normalize line breaks before anything reads the buffer: a stray \r (from
+    // Opt+Enter's \x1b\r) renders as a cursor-return in the history bubble,
+    // pushing lines outside the border. Collapse \r\n and lone \r to \n, then
+    // drop any other control bytes, so the stored message + everything sent to
+    // the agent contains only clean newlines.
+    let raw = inputRef.current
+      .replace(/\r\n?/g, '\n')
+      .replace(/[\x00-\x09\x0b-\x1f]/g, '')  // controls except \n (0x0a)
+      .trim();
     if (!raw || isRunningRef.current) return;
     setConfirmPrompt(null);
     // Push to prompt history (shell-style, with HIST_IGNOREDUPS — skip if identical
@@ -3331,34 +3385,10 @@ function App({ onLogout }: { onLogout: () => void }) {
       return;
     }
 
-    // Multi-line triggers, in order of reliability:
-    //
-    //   1. Alt+Enter (Option+Enter on Mac) — `key.meta && key.return`. The
-    //      Option key always prepends ESC at the byte level, which Ink reports
-    //      as `key.meta`. Works in every terminal because it doesn't depend on
-    //      modifyOtherKeys / kitty / any terminal protocol. This is the
-    //      primary advertised shortcut.
-    //   2. Shift+Enter via modifyOtherKeys (CSI 27;2;13~) or kitty CSI u
-    //      (CSI 13;2u) — only fires if Ink's keypress parser lets the escape
-    //      through to inputChar. A parallel raw-stdin listener (further down
-    //      in this component) handles the case where Ink filters them.
-    //
-    // Plain Enter still submits in the branch below.
-    if (key.meta && key.return) {
-      const next = inputRef.current + '\n';
-      inputRef.current = next;
-      setInput(next);
-      setSuggestionIndex(-1);
-      return;
-    }
-    if (inputChar && isShiftEnter(inputChar)) {
-      const next = inputRef.current + '\n';
-      inputRef.current = next;
-      setInput(next);
-      setSuggestionIndex(-1);
-      return;
-    }
-
+    // Newline insertion (Opt+Enter / Shift+Enter) is handled upstream in the
+    // stdin.emit interceptor (see App's setup effect): it appends `\n` to the
+    // input and swallows the chunk before Ink sees it, so no key.return arrives
+    // here for those keys and they never submit. Plain Enter still submits below.
     if (key.return) {
       if (suggestionIndex >= 0 && suggestions[suggestionIndex]) {
         const [cmd, skill] = suggestions[suggestionIndex]!;
@@ -3384,7 +3414,18 @@ function App({ onLogout }: { onLogout: () => void }) {
       // the rest of the CSI through as printable text — e.g. a left-click leaks `[<0;8;40M`
       // into the input buffer. Strip any residual CSI-style escape sequence (numbers,
       // semicolons, `<`/`>`, then a letter or `~`) so nothing weird ever lands in input.
-      const cleaned = inputChar.replace(/\[[\d;<>?]*[A-Za-z~]/g, '');
+      let cleaned = inputChar.replace(/\[[\d;<>?]*[A-Za-z~]/g, '');
+      // A chunk that is ONLY line-break bytes is an orphan Enter / Opt+Enter tail
+      // (Opt+Enter is \x1b\r and the interceptor above already inserted the \n;
+      // the trailing \r can still arrive here split off). Drop it — converting it
+      // to a newline is what produced the DOUBLE newline on Opt+Enter.
+      if (/^[\r\n]+$/.test(cleaned)) return;
+      // Otherwise this is typed text or a PASTE. Keep internal line breaks as real
+      // newlines (\r\n and lone \r → \n) so multi-line pastes stay multi-line, and
+      // strip every other control byte (a literal \r would break the box border).
+      cleaned = cleaned
+        .replace(/\r\n?/g, '\n')
+        .replace(/[\x00-\x09\x0b-\x1f]/g, '');  // controls except \n (0x0a)
       if (!cleaned) return;
       const next = inputRef.current + cleaned;
       inputRef.current = next;
@@ -3576,11 +3617,14 @@ function App({ onLogout }: { onLogout: () => void }) {
               // with embedded \n sometimes collapses the newlines when the
               // parent Box has a fixed width — splitting + flexDirection=column
               // sidesteps that path entirely.
+              //
+              // Fixed width (60% of the terminal): every prompt bubble is the same
+              // size regardless of content, rather than hugging the longest line.
+              // Still right-aligned (justifyContent flex-end) so it reads as the
+              // user's side. Lines longer than the box wrap inside it.
               const cols = process.stdout.columns ?? 80;
               const bubbleLines = msg.content.split('\n');
-              const longest = Math.max(...bubbleLines.map(l => l.length));
-              const maxInner = Math.max(20, Math.floor(cols * 0.6));
-              const innerW = Math.min(maxInner, longest);
+              const innerW = Math.max(20, Math.floor(cols * 0.6));
               return (
                 <Box justifyContent="flex-end">
                   <Box borderStyle="round" borderColor="#6B5E8C" paddingX={1} width={innerW + 4} flexDirection="column">
@@ -3609,7 +3653,7 @@ function App({ onLogout }: { onLogout: () => void }) {
           hints, live-stream) repaints once `resizing` clears on settle. */}
       {resizing ? (
         <Box flexDirection="column" paddingX={2}>
-          <InputBar input={input} isRunning={isRunning} mode={mode} modelLabel={MODELS[modelIdx]!.label} maskInput={awaitingAdminKey} terminalMode={terminalMode} />
+          <InputBar input={input} isRunning={isRunning} mode={mode} modelLabel={MODELS[modelIdx]!.label} maskInput={awaitingAdminKey} terminalMode={terminalMode} collapsed />
           <Text color="#5A8060">resizing…</Text>
         </Box>
       ) : (
