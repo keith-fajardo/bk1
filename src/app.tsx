@@ -6,8 +6,8 @@ import { render, Box, Text, Static, useInput, measureElement, type DOMElement } 
 import Spinner from 'ink-spinner';
 import type Anthropic from '@anthropic-ai/sdk';
 import { runAgent, AgentAbortedError, resetAnthropicClient, type TokenUsage } from './agent';
-import { PROJECT_DIR } from './tools';
-import { LINT_REPORT_PATH } from './state';
+import { getProjectDir } from './project-dir';
+import { lintReportPath } from './state';
 import { bk1AssetsDir } from './bk1-home';
 import { BK1_VERSION } from './version';
 import { createSession, saveSessionMessages, loadSessionMessages, searchSessions, formatSessionLine, type SessionSearchHit, type StoredMessage } from './sessions';
@@ -373,8 +373,8 @@ function ConfirmBar({ question, selectedIdx }: { question: string; selectedIdx: 
 // context. Hidden when nothing is open or the snapshot is stale.
 function IdeContextBar({ ctx }: { ctx: IdeContext | null }) {
   if (!ctx || !ctx.file_path) return null;
-  const rel = ctx.file_path.startsWith(PROJECT_DIR + '/')
-    ? ctx.file_path.slice(PROJECT_DIR.length + 1)
+  const rel = ctx.file_path.startsWith(getProjectDir() + '/')
+    ? ctx.file_path.slice(getProjectDir().length + 1)
     : ctx.file_path.replace(homedir(), '~');
   const sel = ctx.has_selection && ctx.selection_start_line && ctx.selection_end_line
     ? ctx.selection_start_line === ctx.selection_end_line
@@ -1516,7 +1516,7 @@ function StatusTab({
   const [branch, setBranch] = useState<string>('…');
   useEffect(() => {
     try {
-      const res = spawnSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: PROJECT_DIR, encoding: 'utf-8' });
+      const res = spawnSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: getProjectDir(), encoding: 'utf-8' });
       setBranch(res.status === 0 ? (res.stdout?.trim() || '—') : '—');
     } catch { setBranch('—'); }
   }, []);
@@ -1526,12 +1526,12 @@ function StatusTab({
   // share can't recover any part of it.
   const keyHint = adminKey ? 'stored' : 'not stored';
   const lintBuilt = existsSync(`${bk1AssetsDir()}/bk1-lint`);
-  const dbtProject = `${PROJECT_DIR}/dbt_project.yml`;
+  const dbtProject = `${getProjectDir()}/dbt_project.yml`;
   const dbtPresent = existsSync(dbtProject);
 
   const rows: { label: string; value: React.ReactNode }[] = [
     { label: 'Version',       value: <Text color="#C0FAD2">bk1 v{BK1_VERSION}</Text> },
-    { label: 'Project',       value: <Text color="#C0FAD2">{PROJECT_DIR}</Text> },
+    { label: 'Project',       value: <Text color="#C0FAD2">{getProjectDir()}</Text> },
     { label: 'Branch',        value: <Text color="#C0FAD2">{branch}</Text> },
     { label: 'Model',         value: <Text color="#C0FAD2">{model.label}  <Text color="#5A8060">({model.id})</Text></Text> },
     { label: 'Mode',          value: <Text color="#C0FAD2">{mode}</Text> },
@@ -2185,7 +2185,7 @@ function App({ onLogout }: { onLogout: () => void }) {
   useEffect(() => {
     if (currentSessionIdRef.current !== null) return;
     try {
-      currentSessionIdRef.current = createSession(PROJECT_DIR, MODELS[DEFAULT_MODEL_IDX]!.id);
+      currentSessionIdRef.current = createSession(getProjectDir(), MODELS[DEFAULT_MODEL_IDX]!.id);
     } catch { /* DB unavailable — history will be a no-op for this session */ }
   }, []);
   useEffect(() => {
@@ -2625,7 +2625,7 @@ function App({ onLogout }: { onLogout: () => void }) {
     // entirely client-side; the LLM is only called if the user explicitly opts in.
     // `--force` bypasses the gate so a deliberate re-run never asks twice.
     if (raw === '/lint-deep' || (raw.startsWith('/lint-deep ') && !raw.includes('--force'))) {
-      if (existsSync(LINT_REPORT_PATH)) {
+      if (existsSync(lintReportPath())) {
         pendingConfirmActionRef.current = {
           onYes: () => {
             inputRef.current = '/lint-deep --force';
@@ -2636,11 +2636,11 @@ function App({ onLogout }: { onLogout: () => void }) {
             setMessages(prev => [
               ...prev,
               { role: 'user', content: raw },
-              { role: 'assistant', content: `Existing lint report: ${LINT_REPORT_PATH}\n\nOpen it in your browser, or run \`/lint-deep --force\` to overwrite with a fresh semantic pass.` },
+              { role: 'assistant', content: `Existing lint report: ${lintReportPath()}\n\nOpen it in your browser, or run \`/lint-deep --force\` to overwrite with a fresh semantic pass.` },
             ]);
           },
         };
-        setConfirmPrompt(`A lint report already exists at ${LINT_REPORT_PATH}. Re-run /lint-deep and overwrite it? (yes/no)`);
+        setConfirmPrompt(`A lint report already exists at ${lintReportPath()}. Re-run /lint-deep and overwrite it? (yes/no)`);
         return;
       }
     }
@@ -2690,7 +2690,7 @@ function App({ onLogout }: { onLogout: () => void }) {
           md.push(msg.content, '');
         }
       }
-      const dir  = `${PROJECT_DIR}/.bk1`;
+      const dir  = `${getProjectDir()}/.bk1`;
       const path = `${dir}/session-${Date.now()}.md`;
       let note: string;
       try {
@@ -2995,7 +2995,7 @@ function App({ onLogout }: { onLogout: () => void }) {
             // Persist a row per LLM call to the global ~/.bk1/usage.db so the
             // Projects tab can break lifetime spend down by dbt project path.
             recordProjectUsage({
-              projectPath: PROJECT_DIR,
+              projectPath: getProjectDir(),
               model,
               input:       u.inputTokens,
               output:      u.outputTokens,
@@ -3091,7 +3091,7 @@ function App({ onLogout }: { onLogout: () => void }) {
     const ansi = /\x1b\[[\d;?]*[A-Za-z~]/g;
     try {
       const proc = Bun.spawn(['bash', '-c', `${cmd} 2>&1`], {
-        cwd: PROJECT_DIR,
+        cwd: getProjectDir(),
         stdout: 'pipe',
         // Put bash in its own process group so Esc can signal the whole group
         // (bash + dbt + any adapter subprocesses) instead of just bash, which
@@ -3464,7 +3464,7 @@ function App({ onLogout }: { onLogout: () => void }) {
   if (historyPickerOpen) {
     return (
       <SessionPicker
-        projectPath={PROJECT_DIR}
+        projectPath={getProjectDir()}
         onCancel={() => setHistoryPickerOpen(false)}
         onSelect={(sessionId) => {
           try {
@@ -3545,7 +3545,7 @@ function App({ onLogout }: { onLogout: () => void }) {
               <Text color="#5A8060">v{BK1_VERSION}</Text>
             </Box>
             <Text color="#5A8060"><Text color="#C0FAD2">{MODELS[modelIdx]!.label}</Text> · dbt Coding Agent by Keith Fajardo @ Mangrove Digital</Text>
-            <Text color="#5A8060">{PROJECT_DIR}</Text>
+            <Text color="#5A8060">{getProjectDir()}</Text>
           </Box>
         </Box>
         <Box marginTop={1} flexDirection="column">
@@ -3594,7 +3594,7 @@ function App({ onLogout }: { onLogout: () => void }) {
                 <Text color="#5A8060">v{BK1_VERSION}</Text>
               </Box>
               <Text color="#5A8060"><Text color="#C0FAD2">{MODELS[modelIdx]!.label}</Text> · dbt Coding Agent by Keith Fajardo @ Mangrove Digital</Text>
-              <Text color="#5A8060">{PROJECT_DIR}</Text>
+              <Text color="#5A8060">{getProjectDir()}</Text>
             </Box>
           </Box>
         )}

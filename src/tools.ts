@@ -4,6 +4,7 @@ import { resolve, dirname } from 'path';
 import { syncManifestState, getLintQueue, getModelStatus, markModelLinted, fetchContent, resetModelState, lintRun, type Projection } from './state';
 import { propagateColumnTaint, pickDialect, type ModelTraceStatus } from './lineage';
 import { kimballQuery, type KimballQueryInput } from './kimball';
+import { getProjectDir } from './project-dir';
 import { homedir } from 'os';
 
 interface ManifestNode {
@@ -23,8 +24,6 @@ interface ManifestSource {
   schema: string;
   unique_id: string;
 }
-
-export const PROJECT_DIR = resolve(process.env.DBT_PROJECT_DIR ?? process.cwd());
 
 export const TOOLS: Anthropic.Tool[] = [
   {
@@ -228,8 +227,10 @@ export const TOOLS: Anthropic.Tool[] = [
 ];
 
 function safeResolvePath(relativePath: string): string {
-  const full = resolve(PROJECT_DIR, relativePath);
-  if (!full.startsWith(PROJECT_DIR + '/') && full !== PROJECT_DIR) {
+  // Read the live project dir so the guard tracks a mid-session /project switch.
+  const projectDir = getProjectDir();
+  const full = resolve(projectDir, relativePath);
+  if (!full.startsWith(projectDir + '/') && full !== projectDir) {
     throw new Error(`Path outside project directory: ${relativePath}`);
   }
   return full;
@@ -238,7 +239,7 @@ function safeResolvePath(relativePath: string): string {
 async function runDbtCommand(command: string): Promise<string> {
   const parts = command.trim().split(/\s+/);
   const proc = Bun.spawn(parts, {
-    cwd: PROJECT_DIR,
+    cwd: getProjectDir(),
     stdout: 'pipe',
     stderr: 'pipe',
   });
@@ -287,7 +288,7 @@ function writeFile(path: string, content: string): string {
 async function listFiles(pattern: string): Promise<string> {
   const glob = new Bun.Glob(pattern);
   const files: string[] = [];
-  for await (const file of glob.scan({ cwd: PROJECT_DIR, onlyFiles: true })) {
+  for await (const file of glob.scan({ cwd: getProjectDir(), onlyFiles: true })) {
     files.push(file);
     if (files.length >= 100) break;
   }
@@ -297,7 +298,7 @@ async function listFiles(pattern: string): Promise<string> {
 
 async function runBash(command: string): Promise<string> {
   const proc = Bun.spawn(['bash', '-c', command], {
-    cwd: PROJECT_DIR,
+    cwd: getProjectDir(),
     stdout: 'pipe',
     stderr: 'pipe',
   });
@@ -396,7 +397,7 @@ export function queryRunResultsData(
 }
 
 function queryRunResults(query: string, model?: string): string {
-  const path = resolve(PROJECT_DIR, 'target/run_results.json');
+  const path = resolve(getProjectDir(), 'target/run_results.json');
   if (!existsSync(path)) {
     return 'target/run_results.json not found. Run dbt build, dbt test, or dbt run first.';
   }
@@ -664,7 +665,7 @@ function extractWarehouseType(profilesYml: string): string | null {
 
 function detectDialect(): string | null {
   const candidates = [
-    resolve(PROJECT_DIR, 'profiles.yml'),
+    resolve(getProjectDir(), 'profiles.yml'),
     resolve(homedir(), '.dbt', 'profiles.yml'),
   ];
   for (const p of candidates) {
@@ -687,7 +688,7 @@ function queryImpact(
   if (column && result.downstream && result.downstream.length > 0) {
     const dialect = pickDialect(detectDialect());
     const modelsInOrder = result.downstream.map(n => {
-      const compiledFull = resolve(PROJECT_DIR, n.compiled_path);
+      const compiledFull = resolve(getProjectDir(), n.compiled_path);
       const sql = existsSync(compiledFull) ? readFileSync(compiledFull, 'utf-8') : null;
       return { name: n.name, compiledSql: sql };
     });
@@ -704,7 +705,7 @@ function queryImpact(
 }
 
 function queryManifest(query: string, model?: string, direction?: ImpactDirection, column?: string): string {
-  const manifestPath = resolve(PROJECT_DIR, 'target/manifest.json');
+  const manifestPath = resolve(getProjectDir(), 'target/manifest.json');
   if (!existsSync(manifestPath)) {
     return 'target/manifest.json not found. Run dbt compile or dbt parse first.';
   }

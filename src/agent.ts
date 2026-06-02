@@ -3,7 +3,8 @@ import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 import { SYSTEM_PROMPT } from './system-prompt';
-import { TOOLS, executeTool, PROJECT_DIR } from './tools';
+import { TOOLS, executeTool } from './tools';
+import { getProjectDir } from './project-dir';
 
 // Sub-agents don't get the agent tool — prevents accidental recursion
 const SUB_AGENT_TOOLS = TOOLS.filter(t => t.name !== 'agent');
@@ -80,7 +81,7 @@ function extractWarehouseType(profilesYml: string): string | null {
 function buildSystemPrompt(): string {
   const parts: string[] = [SYSTEM_PROMPT];
 
-  const dbtProjectPath = join(PROJECT_DIR, 'dbt_project.yml');
+  const dbtProjectPath = join(getProjectDir(), 'dbt_project.yml');
   if (existsSync(dbtProjectPath)) {
     const dbtProject = readFileSync(dbtProjectPath, 'utf-8');
     parts.push(`## dbt_project.yml (project config — use this for project name, profile, and schema/materialization defaults)\n\n${dbtProject}`);
@@ -88,7 +89,7 @@ function buildSystemPrompt(): string {
 
   // Check project-local profiles.yml first, then the default ~/.dbt/profiles.yml
   const profilesCandidates = [
-    join(PROJECT_DIR, 'profiles.yml'),
+    join(getProjectDir(), 'profiles.yml'),
     join(homedir(), '.dbt', 'profiles.yml'),
   ];
   for (const p of profilesCandidates) {
@@ -101,7 +102,7 @@ function buildSystemPrompt(): string {
     }
   }
 
-  const claudeMdPath = join(PROJECT_DIR, 'CLAUDE.md');
+  const claudeMdPath = join(getProjectDir(), 'CLAUDE.md');
   if (existsSync(claudeMdPath)) {
     const claudeMd = readFileSync(claudeMdPath, 'utf-8');
     parts.push(`## Project Instructions (CLAUDE.md)\n\n${claudeMd}`);
@@ -110,7 +111,15 @@ function buildSystemPrompt(): string {
   return parts.join('\n\n');
 }
 
-const RESOLVED_SYSTEM_PROMPT = buildSystemPrompt();
+// Resolved once at import, and rebuilt by rebuildSystemPrompt() when the user
+// switches projects mid-session — otherwise the agent would keep injecting the
+// previous project's dbt_project.yml + CLAUDE.md for the rest of the session.
+// Read live inside runAgent so a rebuild takes effect on the very next turn.
+let RESOLVED_SYSTEM_PROMPT = buildSystemPrompt();
+
+export function rebuildSystemPrompt(): void {
+  RESOLVED_SYSTEM_PROMPT = buildSystemPrompt();
+}
 
 const PLAN_MODE_SUFFIX = `
 
