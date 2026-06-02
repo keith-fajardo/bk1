@@ -23,11 +23,6 @@ export const COIN_PENALTIES = {
   newViolation:   -5,
 } as const;
 
-// Cap on the cumulative passive coin total awarded for model add/update
-// events in a single bk1 session — refactor sprees shouldn't dump 500 coins.
-// Lint fixes, pushes, and dbt runs are NOT capped (they reflect real work).
-export const PASSIVE_SESSION_CAP = 50;
-
 export type CoinEventType =
   | 'new_model'
   | 'model_update'
@@ -41,7 +36,6 @@ export interface CoinEvent {
   type:   CoinEventType;
   delta:  number;
   reason: string;          // short user-facing description ("Fixed: stg_orders")
-  countsTowardPassiveCap?: boolean;  // true for new_model / model_update
 }
 
 export type CoinEventHandler = (event: CoinEvent) => void;

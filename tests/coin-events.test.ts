@@ -2,7 +2,7 @@ import { describe, expect, test, beforeEach, afterEach } from 'bun:test';
 import { computeLintTransition } from '../src/state';
 import {
   registerCoinEventHandler, emitCoinEvent,
-  COIN_REWARDS, COIN_PENALTIES, PASSIVE_SESSION_CAP,
+  COIN_REWARDS, COIN_PENALTIES,
   type CoinEvent,
 } from '../src/coin-events';
 
@@ -63,10 +63,4 @@ describe('coin event handler registration', () => {
     expect(() => emitCoinEvent({ type: 'lint_fix', delta: 3, reason: 'x' })).not.toThrow();
   });
 
-  test('passive cap constant is positive (sanity check)', () => {
-    // Sanity: cap should be meaningfully positive so passive earnings can accrue.
-    // Live cap enforcement is exercised inside app.tsx; this just guards against
-    // an accidental flip of the constant to zero or negative.
-    expect(PASSIVE_SESSION_CAP).toBeGreaterThan(0);
-  });
 });

@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { normalizeKittyKeys, isShiftEnter } from '../src/mouse';
+import { normalizeKittyKeys, isNewlineKey } from '../src/mouse';
 
 // Guards the kitty CSI-u -> legacy-byte translation that keeps Escape, Shift+Tab,
 // and Ctrl+<letter> working in terminals that honor the kitty keyboard protocol
@@ -29,9 +29,22 @@ describe('normalizeKittyKeys', () => {
     expect(normalizeKittyKeys('\x1b[27;5u')).toBe('\x1b[27;5u');
   });
 
-  test('Shift+Enter (mod 2) is left for isShiftEnter to detect', () => {
-    expect(normalizeKittyKeys('\x1b[13;2u')).toBe('\x1b[13;2u');
-    expect(isShiftEnter('\x1b[13;2u')).toBe(true);
+  test('Enter+modifier sequences are left for isNewlineKey to detect', () => {
+    // normalizeKittyKeys must NOT rewrite these — the newline detector consumes
+    // them downstream. Both kitty CSI u and modifyOtherKeys forms, for Shift
+    // (mod 2), Alt/Opt (mod 3), and Shift+Alt (mod 4).
+    for (const seq of ['\x1b[13;2u', '\x1b[13;3u', '\x1b[13;4u',
+                       '\x1b[27;2;13~', '\x1b[27;3;13~', '\x1b[27;4;13~']) {
+      expect(normalizeKittyKeys(seq)).toBe(seq);
+      expect(isNewlineKey(seq)).toBe(true);
+    }
+  });
+
+  test('isNewlineKey ignores plain Enter and unrelated sequences', () => {
+    expect(isNewlineKey('\r')).toBe(false);
+    expect(isNewlineKey('\n')).toBe(false);
+    expect(isNewlineKey('\x1b[13;1u')).toBe(false);  // Enter, no modifier
+    expect(isNewlineKey('hello')).toBe(false);
   });
 
   test('plain typed text is unchanged', () => {

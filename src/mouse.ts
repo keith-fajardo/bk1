@@ -158,11 +158,25 @@ export function normalizeKittyKeys(chunk: string): string {
     });
 }
 
-// Detects the Shift+Enter escape sequence in an input chunk. Returns true if
-// EITHER the modifyOtherKeys form (CSI 27;2;13~) or the kitty CSI u form
-// (CSI 13;2u) is present. Caller treats a true result as a newline insertion.
-const SHIFT_ENTER_MODIFY_OTHER = /\x1b?\[27;2;13~/;
-const SHIFT_ENTER_KITTY        = /\x1b?\[13;2u/;
-export function isShiftEnter(inputChar: string): boolean {
-  return SHIFT_ENTER_MODIFY_OTHER.test(inputChar) || SHIFT_ENTER_KITTY.test(inputChar);
+// Detects a "newline-insert" Enter chunk off raw stdin. Three encodings, all of
+// which a terminal may use for Shift/Opt+Enter:
+//   1. Legacy ESC+Enter — `\x1b\r` or `\x1b\n`. This is what Opt+Enter emits on
+//      Apple Terminal / iTerm and what VS Code's terminal sent in testing
+//      (keylog showed `1b0d`). Ink SHOULD report this as key.meta+key.return,
+//      but its parser splits the ESC off as a separate keypress, so the return
+//      lands alone and submits — hence we catch the raw bytes here instead.
+//   2. modifyOtherKeys — `CSI 27;<mod>;13~`.
+//   3. kitty CSI u — `CSI 13;<mod>u` (VS Code's xterm.js under kitty mode).
+// For 2 & 3 the modifier digit is 1+bitmask: shift=2, alt=3, shift+alt=4.
+// IMPORTANT: this must NOT match a bare `\r`/`\n` (plain Enter = submit) — the
+// ESC prefix in case 1 is what distinguishes Opt+Enter from Enter. A terminal
+// that sends bare `\r` for Shift+Enter (no modifier info) is indistinguishable
+// from Enter and necessarily submits; nothing we can do about that.
+const NEWLINE_KEY_LEGACY       = /^\x1b[\r\n]$/;
+const NEWLINE_KEY_MODIFY_OTHER = /\x1b?\[27;[234];13~/;
+const NEWLINE_KEY_KITTY        = /\x1b?\[13;[234]u/;
+export function isNewlineKey(inputChar: string): boolean {
+  return NEWLINE_KEY_LEGACY.test(inputChar)
+    || NEWLINE_KEY_MODIFY_OTHER.test(inputChar)
+    || NEWLINE_KEY_KITTY.test(inputChar);
 }

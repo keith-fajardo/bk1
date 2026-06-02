@@ -35,6 +35,8 @@ export interface PetState {
   happiness: number;            // 0 (miserable) ... 100 (overjoyed)
   energy: number;               // 0 (exhausted) ... 100 (energetic)
   coins: number;                // bk1 in-game currency — starts at 100, earned via dbt activity + games
+  xp: number;                   // user experience points — only ever increases (every productive
+                                // action that earns coins also earns XP); never spent, never capped
   sleeping_until?: string;      // ISO — while in the future, pet shows closed eyes + snore
   eating_until?: string;        // ISO — while in the future, pet shows 2-frame chewing animation
   color?: PetColorName;         // body color (defaults to 'green' if absent); existing files without this still load
@@ -130,6 +132,7 @@ export function newPet(now: Date = new Date(), color: PetColorName = randomPetCo
     happiness: 80,
     energy: 100,
     coins: STARTING_COINS,
+    xp: 0,
     color,
   };
 }
@@ -148,6 +151,43 @@ export function spendCoins(state: PetState, cost: number): PetState | null {
   if (cost < 0) return null;
   if (state.coins < cost) return null;
   return { ...state, coins: state.coins - cost };
+}
+
+// XP API — XP only ever goes up. Unlike coins, there is no spend and no
+// penalty: a negative or zero delta is a no-op (XP measures cumulative
+// productive work, so a coin penalty must not claw XP back). Not capped — XP
+// keeps accruing even after the per-session coin passive-cap zeroes a coin
+// reward. Returns a NEW state; caller persists via savePet.
+export function addXp(state: PetState, delta: number): PetState {
+  if (delta <= 0) return state;
+  return { ...state, xp: state.xp + delta };
+}
+
+// Level model: a gentle ramp where each level requires more XP than the last.
+// The XP span of level N (1-indexed) is LEVEL_BASE * N, so:
+//   Lv1: 0..50, Lv2: 50..150, Lv3: 150..300, Lv4: 300..500, ...
+// cumulative XP to reach level N+1 = LEVEL_BASE * (1+2+...+N) = BASE * N(N+1)/2.
+const LEVEL_BASE = 50;
+
+export interface LevelInfo {
+  level: number;   // current level, 1-indexed
+  into: number;    // XP earned into the current level
+  span: number;    // XP needed to advance from this level to the next
+  xp: number;      // total XP (passthrough, convenient for callers)
+}
+
+// Pure: derive level + progress from a total XP value. Walks levels by
+// subtracting each level's span until the remainder no longer covers the next
+// level. Cheap — levels grow fast enough that this loop stays short.
+export function levelInfo(xp: number): LevelInfo {
+  let level = 1;
+  let remaining = Math.max(0, Math.floor(xp));
+  // span of level N = LEVEL_BASE * N
+  while (remaining >= LEVEL_BASE * level) {
+    remaining -= LEVEL_BASE * level;
+    level += 1;
+  }
+  return { level, into: remaining, span: LEVEL_BASE * level, xp };
 }
 
 // Pure: advance the pet's stats based on real-world minutes elapsed since last_seen.
@@ -573,6 +613,7 @@ export function renderPetView(state: PetState, now: Date = new Date()): string {
     `😊 happiness  ${statBar(state.happiness)}  ${Math.round(state.happiness)}%`,
     `🔋 energy     ${statBar(state.energy)}  ${Math.round(state.energy)}%`,
     `💰  coins      ${state.coins}`,
+    (() => { const l = levelInfo(state.xp); return `⭐ xp         Lv ${l.level}  ${l.into}/${l.span}  (${state.xp} total)`; })(),
     '',
   ];
 
@@ -722,6 +763,9 @@ export function readPetFrom(path: string): PetState | null {
         // Migration: pet.json files from before the coins feature default to
         // STARTING_COINS so existing users get the same starter pot as new pets.
         coins:          typeof data.coins === 'number' ? data.coins : STARTING_COINS,
+        // Migration: pet.json files from before XP shipped start at 0 — XP is
+        // cumulative going forward, no retroactive credit for past sessions.
+        xp:             typeof data.xp === 'number' ? data.xp : 0,
         sleeping_until: typeof data.sleeping_until === 'string' ? data.sleeping_until : undefined,
         eating_until:   typeof data.eating_until   === 'string' ? data.eating_until   : undefined,
         // color persists: a pet's body color is part of its identity. A fresh
