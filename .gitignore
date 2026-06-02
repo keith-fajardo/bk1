@@ -12,3 +12,6 @@ target/
 
 # JS deps
 node_modules/
+
+# Runtime logs — transient, not build artifacts
+logs/
