@@ -207,7 +207,7 @@ export async function syncManifestState(): Promise<string> {
   }
 }
 
-export interface LintViolation { code: string; rule: string; severity: string; file: string; evidence: string; fix: string; }
+export interface LintViolation { code: string; rule: string; severity: string; file: string; evidence: string; suggested_fix: string; }
 export interface LintOutput {
   project_name: string;
   summary: { total: number; by_severity: Record<string, number>; by_rule: Record<string, number> };
@@ -418,7 +418,7 @@ function writeLintReportHtml(input: {
       <td><code>${esc(v.code)}</code></td>
       <td class="file">${esc(v.file)}</td>
       <td>${esc(v.evidence)}</td>
-      <td>${esc(v.fix)}</td>
+      <td>${esc(v.suggested_fix)}</td>
     </tr>`).join('');
   const truncatedNote = input.violations.length > 500
     ? `<p class="note">Showing the first 500 of ${input.violations.length} violations. Run the binary directly for the full list.</p>`
