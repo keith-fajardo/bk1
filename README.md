@@ -1,6 +1,6 @@
 # bk1
 
-A **deterministic dbt linter with a coding agent attached** — for **dbt Core**, in your terminal. By [Mangrove](https://gridland.io).
+A **deterministic dbt linter with a coding agent attached** — for **dbt Core**, in your terminal. By [Mangrove](https://mangrovedigital.com.au/).
 
 dbt Cloud users get **dbt Copilot** inside the dbt Cloud IDE. Everyone on **dbt Core** — the open-source CLI most teams actually run — has had to choose between generic coding agents that don't understand dbt conventions, or VS Code plugins that lock them into one editor. bk1 is the dbt-native option for the terminal: it runs locally against your project on disk, uses your own Anthropic key, and requires no Cloud account.
 
