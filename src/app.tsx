@@ -505,8 +505,8 @@ function nextMode(m: Mode): Mode {
   return MODE_ORDER[(MODE_ORDER.indexOf(m) + 1) % MODE_ORDER.length]!;
 }
 
-function InputBar({ input, isRunning, mode, modelLabel, maskInput, terminalMode, collapsed }: {
-  input: string; isRunning: boolean; mode: Mode; modelLabel: string; maskInput?: boolean; terminalMode?: boolean;
+function InputBar({ input, cursorPos, isRunning, mode, modelLabel, maskInput, terminalMode, collapsed }: {
+  input: string; cursorPos: number; isRunning: boolean; mode: Mode; modelLabel: string; maskInput?: boolean; terminalMode?: boolean;
   // While the window is actively resizing the caller passes collapsed so we
   // render a single borderless row — a multi-row bordered box would wrap-desync
   // mid-resize and strand orphan rows (see the resize-safety note below).
@@ -531,6 +531,13 @@ function InputBar({ input, isRunning, mode, modelLabel, maskInput, terminalMode,
   // Cursor is a static block — no blink. Blinking would fire setState on an
   // interval, forcing Ink to repaint the dynamic frame and wiping any
   // in-progress terminal selection. Static cursor = no repaint pressure.
+  //
+  // The block is INSERTED into the string at cursorPos (left of the char you're
+  // on), so it works mid-text — and crucially keeps each rendered row a single
+  // string, preserving the border-render fix (multi-Text rows overflow the
+  // border). split('\n') after insertion puts the block on the correct line.
+  const c = Math.max(0, Math.min(cursorPos, display.length));
+  const displayWithCursor = display.slice(0, c) + '█' + display.slice(c);
 
   // Claude-Code-style bordered prompt box. The input text (single- or
   // multi-line) lives inside a rounded border; the badge + model sit on a
@@ -544,12 +551,13 @@ function InputBar({ input, isRunning, mode, modelLabel, maskInput, terminalMode,
   // mode this codebase fights. The caller already collapses to a borderless
   // frame while actively resizing (see the `resizing` branch in App), so this
   // multi-row box is only mounted once the window has settled.
-  const lines = display.split('\n');
+  const lines = displayWithCursor.split('\n');
   const last = lines.length - 1;
 
   // Collapsed (resizing) form: a single borderless row. We show the first line
   // plus an ellipsis if multi-line, so the live frame stays exactly one row and
-  // can't wrap or ghost while the terminal reflows.
+  // can't wrap or ghost while the terminal reflows. The cursor block is already
+  // embedded in `lines` via displayWithCursor.
   if (collapsed) {
     const oneLine = lines.length > 1 ? `${lines[0]} …` : lines[0];
     return (
@@ -557,7 +565,6 @@ function InputBar({ input, isRunning, mode, modelLabel, maskInput, terminalMode,
         <Text color={badgeColor} bold>{badgeLabel}</Text>
         <Text color={accent}>{promptChar}</Text>
         <Text color={text}>{oneLine}</Text>
-        <Text color={accent}>█</Text>
       </Box>
     );
   }
@@ -583,7 +590,8 @@ function InputBar({ input, isRunning, mode, modelLabel, maskInput, terminalMode,
           // — is what keeps content inside the border; the multi-child row Box
           // overflowed the frame and stranded the text and right edge.
           const prefix = i === 0 ? `${promptChar} ` : '  ';
-          const body = prefix + line + (i === last ? '█' : '');
+          // The cursor block is already embedded in `line` (displayWithCursor).
+          const body = prefix + line;
           return <Text key={i} color={text} wrap="wrap">{body || ' '}</Text>;
         })}
       </Box>
@@ -2198,6 +2206,12 @@ function AppShell() {
 function App({ onLogout }: { onLogout: () => void }) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
+  // Cursor position: index into `input`, 0..input.length. Left/Right move it,
+  // typing inserts at it, backspace deletes before it. Mirrored to a ref for the
+  // []-deps key handler (same pattern as inputRef). Keep the two in lockstep —
+  // always update via setInputAndCursor below rather than touching either alone.
+  const [cursorPos, setCursorPos] = useState(0);
+  const cursorPosRef = useRef(0);
   const [liveText, setLiveText] = useState('');
   const [activeTool, setActiveTool] = useState('');
   const [isRunning, setIsRunning] = useState(false);
@@ -2246,6 +2260,17 @@ function App({ onLogout }: { onLogout: () => void }) {
   }, [messages]);
 
   const inputRef = useRef('');
+  // Set the input string AND cursor position together (keeps state + refs in
+  // lockstep). cursor defaults to end-of-string — correct for clears (''→0),
+  // history recall, and slash-completion. Editing handlers pass an explicit
+  // cursor. Clamped to [0, value.length].
+  const setInputAndCursor = useCallback((value: string, cursor: number = value.length) => {
+    const c = Math.max(0, Math.min(cursor, value.length));
+    inputRef.current = value;
+    cursorPosRef.current = c;
+    setInput(value);
+    setCursorPos(c);
+  }, []);
   const isRunningRef = useRef(false);
   const historyRef = useRef<Anthropic.MessageParam[]>([]);
   // Prompt-history navigation (shell-style): every submitted prompt is pushed, and
@@ -2503,8 +2528,8 @@ function App({ onLogout }: { onLogout: () => void }) {
     //    Escape \x1b[27u → \x1b, Shift+Tab \x1b[9;2u → \x1b[Z, Ctrl+<letter>
     //    \x1b[<c>;5u → control byte. Without this, Escape/Ctrl+C/Shift+Tab arrive
     //    as un-decodable text in kitty terminals (VS Code's xterm.js) and no-op.
-    //  - turn a newline-insert key (Opt/Shift+Enter) into an actual \n appended
-    //    to the prompt, and hide it from Ink so it doesn't submit.
+    //  - turn a newline-insert key (Opt/Shift+Enter) into an actual \n inserted
+    //    at the cursor, and hide it from Ink so it doesn't submit.
     const realRead = stdin.read.bind(stdin);
     stdin.read = ((size?: number) => {
       const chunk = realRead(size);
@@ -2514,9 +2539,10 @@ function App({ onLogout }: { onLogout: () => void }) {
       // so it never sees a key.return for it. Only at the prompt (not running /
       // not entering the admin key), matching the previous guard.
       if (!isRunningRef.current && !awaitingAdminKeyRef.current && isNewlineKey(s)) {
-        const next = inputRef.current + '\n';
-        inputRef.current = next;
-        setInput(next);
+        // Insert the newline at the cursor (not just append), advancing past it.
+        const cur = inputRef.current;
+        const pos = cursorPosRef.current;
+        setInputAndCursor(cur.slice(0, pos) + '\n' + cur.slice(pos), pos + 1);
         setSuggestionIndex(-1);
         return Buffer.alloc(0);
       }
@@ -2642,7 +2668,7 @@ function App({ onLogout }: { onLogout: () => void }) {
     // Admin key entry — intercept BEFORE all other handlers so the pasted key
     // isn't interpreted as a slash command or chat message.
     if (awaitingAdminKeyRef.current) {
-      setInput(''); inputRef.current = ''; setSuggestionIndex(-1);
+      setInputAndCursor(''); setSuggestionIndex(-1);
       setAwaitingAdminKey(false); awaitingAdminKeyRef.current = false;
       if (!isValidKeyShape(raw)) {
         setMessages(prev => [
@@ -2667,7 +2693,7 @@ function App({ onLogout }: { onLogout: () => void }) {
     const inTerm = terminalModeRef.current;
     if (raw.startsWith('!') || (inTerm && !raw.startsWith('?') && !raw.startsWith('/'))) {
       const cmd = (raw.startsWith('!') ? raw.slice(1) : raw).trim();
-      setInput(''); inputRef.current = ''; setSuggestionIndex(-1);
+      setInputAndCursor(''); setSuggestionIndex(-1);
       if (!cmd) return;
       if (shellProcRef.current) {
         setMessages(prev => [...prev, { role: 'assistant', content: 'A shell command is still running. Press Esc to abort it, then re-submit.' }]);
@@ -2681,7 +2707,7 @@ function App({ onLogout }: { onLogout: () => void }) {
     // normal agent flow.
     if (inTerm && raw.startsWith('?')) {
       const rest = raw.slice(1).trim();
-      if (!rest) { setInput(''); inputRef.current = ''; setSuggestionIndex(-1); return; }
+      if (!rest) { setInputAndCursor(''); setSuggestionIndex(-1); return; }
       raw = rest;
     }
 
@@ -2689,7 +2715,7 @@ function App({ onLogout }: { onLogout: () => void }) {
     if (raw === '/plan' || raw === '/build' || raw === '/auto') {
       const next = raw.slice(1) as Mode;
       setMode(next); modeRef.current = next;
-      setInput(''); inputRef.current = ''; setSuggestionIndex(-1);
+      setInputAndCursor(''); setSuggestionIndex(-1);
       return;
     }
     // /term and /clear are slash-command equivalents of Ctrl+T and Ctrl+L.
@@ -2700,17 +2726,17 @@ function App({ onLogout }: { onLogout: () => void }) {
     if (raw === '/term' || raw === '/shell') {
       terminalModeRef.current = !terminalModeRef.current;
       setTerminalMode(terminalModeRef.current);
-      setInput(''); inputRef.current = ''; setSuggestionIndex(-1);
+      setInputAndCursor(''); setSuggestionIndex(-1);
       return;
     }
     if (raw === '/clear') {
       process.stdout.write('\x1b[3J\x1b[H\x1b[2J');
-      setInput(''); inputRef.current = ''; setSuggestionIndex(-1);
+      setInputAndCursor(''); setSuggestionIndex(-1);
       return;
     }
     if (raw.startsWith('/model')) {
       // Tab already cycled the selection — Enter just closes the picker
-      setInput(''); inputRef.current = ''; setSuggestionIndex(-1);
+      setInputAndCursor(''); setSuggestionIndex(-1);
       return;
     }
     if (raw === '/project' || raw.startsWith('/project ')) {
@@ -2718,7 +2744,7 @@ function App({ onLogout }: { onLogout: () => void }) {
       // otherwise use the arrow-selected recent. changeProject re-points all
       // project-keyed state and pushes a "Switched project" line; on failure it
       // returns an error string we surface in the chat.
-      setInput(''); inputRef.current = ''; setSuggestionIndex(-1);
+      setInputAndCursor(''); setSuggestionIndex(-1);
       // Read recents + selection fresh (this callback has [] deps; the captured
       // state would be stale — mirror the petPlay/feed picker ref pattern).
       const typed = raw.replace(/^\/project\s*/, '').trim();
@@ -2737,7 +2763,7 @@ function App({ onLogout }: { onLogout: () => void }) {
       // Intercept before expandSkill — /logout is a UI-state transition, not a prompt
       // for the agent. AppShell handles clearing the key and re-rendering the login
       // screen; we just clear input and trigger.
-      setInput(''); inputRef.current = ''; setSuggestionIndex(-1);
+      setInputAndCursor(''); setSuggestionIndex(-1);
       onLogout();
       return;
     }
@@ -2749,11 +2775,11 @@ function App({ onLogout }: { onLogout: () => void }) {
       if (existsSync(lintReportPath())) {
         pendingConfirmActionRef.current = {
           onYes: () => {
-            inputRef.current = '/lint-deep --force';
+            setInputAndCursor('/lint-deep --force');
             void submit();
           },
           onNo: () => {
-            setInput(''); inputRef.current = ''; setSuggestionIndex(-1);
+            setInputAndCursor(''); setSuggestionIndex(-1);
             setMessages(prev => [
               ...prev,
               { role: 'user', content: raw },
@@ -2766,7 +2792,7 @@ function App({ onLogout }: { onLogout: () => void }) {
       }
     }
     if (raw === '/usage') {
-      setInput(''); inputRef.current = ''; setSuggestionIndex(-1);
+      setInputAndCursor(''); setSuggestionIndex(-1);
       const adminKey = getStoredAdminKey();
       if (!adminKey) {
         setAwaitingAdminKey(true); awaitingAdminKeyRef.current = true;
@@ -2784,7 +2810,7 @@ function App({ onLogout }: { onLogout: () => void }) {
       // Enter full-screen scrollable conversation view. The App's render path
       // short-circuits to <ReviewMode/> while `reviewMode` is true; Esc inside
       // ReviewMode calls onExit which flips it back to false.
-      setInput(''); inputRef.current = ''; setSuggestionIndex(-1);
+      setInputAndCursor(''); setSuggestionIndex(-1);
       setReviewMode(true);
       return;
     }
@@ -2794,7 +2820,7 @@ function App({ onLogout }: { onLogout: () => void }) {
       // Replaces the earlier "snapshot to markdown" behavior, which was
       // current-session-only and lost on bk1 close. The old behavior is
       // still reachable as /export below.
-      setInput(''); inputRef.current = ''; setSuggestionIndex(-1);
+      setInputAndCursor(''); setSuggestionIndex(-1);
       setHistoryPickerOpen(true);
       return;
     }
@@ -2802,7 +2828,7 @@ function App({ onLogout }: { onLogout: () => void }) {
       // Old /history behavior: snapshot the current conversation to a markdown
       // file and open it in VS Code. Useful when you want to share a session
       // out-of-band (paste into a PR description, archive elsewhere).
-      setInput(''); inputRef.current = ''; setSuggestionIndex(-1);
+      setInputAndCursor(''); setSuggestionIndex(-1);
       const md: string[] = [`# bk1 session — ${new Date().toISOString()}`, ''];
       for (const msg of messagesRef.current) {
         if (msg.role === 'user') {
@@ -2837,7 +2863,7 @@ function App({ onLogout }: { onLogout: () => void }) {
     // can you do" inputs. Not added to historyRef so the LLM never sees these
     // turns on subsequent prompts (no token cost now, no cache pollution later).
     if (isGreeting(raw)) {
-      setInput(''); inputRef.current = ''; setSuggestionIndex(-1);
+      setInputAndCursor(''); setSuggestionIndex(-1);
       setMessages(prev => [
         ...prev,
         { role: 'user',      content: raw },
@@ -2849,7 +2875,7 @@ function App({ onLogout }: { onLogout: () => void }) {
       // Local handler — all pet interactions are pure state updates against the on-disk
       // pet.json. No LLM call, no token spend. Each interaction ticks first so elapsed
       // time decay is applied before the action takes effect.
-      setInput(''); inputRef.current = ''; setSuggestionIndex(-1);
+      setInputAndCursor(''); setSuggestionIndex(-1);
       const args = raw.slice('/pet'.length).trim();
       const [sub, ...rest] = args.split(/\s+/);
       const arg = rest.join(' ');
@@ -2994,8 +3020,7 @@ function App({ onLogout }: { onLogout: () => void }) {
     const displayText = skill ? skill.display : raw;
     const promptText = skill ? skill.prompt : raw;
 
-    setInput('');
-    inputRef.current = '';
+    setInputAndCursor('');
     setSuggestionIndex(-1);
     isRunningRef.current = true;
     setIsRunning(true);
@@ -3323,8 +3348,7 @@ function App({ onLogout }: { onLogout: () => void }) {
       // picker (/model, /pet play, /pet feed) and acts as a general
       // "cancel current entry" affordance.
       if (!isRunningRef.current && inputRef.current.length > 0) {
-        inputRef.current = '';
-        setInput('');
+        setInputAndCursor('');
         setSuggestionIndex(-1);
       }
       return;
@@ -3347,7 +3371,7 @@ function App({ onLogout }: { onLogout: () => void }) {
           if (value === 'yes') action.onYes();
           else                 action.onNo();
         } else {
-          inputRef.current = value;
+          setInputAndCursor(value);
           void submit();
         }
       };
@@ -3432,20 +3456,17 @@ function App({ onLogout }: { onLogout: () => void }) {
       if (key.upArrow) {
         const idx = Math.max(0, promptHistoryIdxRef.current - 1);
         promptHistoryIdxRef.current = idx;
-        inputRef.current = hist[idx]!;
-        setInput(hist[idx]!);
+        setInputAndCursor(hist[idx]!);  // cursor → end of recalled prompt
         return;
       }
       // downArrow
       const next = promptHistoryIdxRef.current + 1;
       if (next >= hist.length) {
         promptHistoryIdxRef.current = -1;
-        inputRef.current = '';
-        setInput('');
+        setInputAndCursor('');
       } else {
         promptHistoryIdxRef.current = next;
-        inputRef.current = hist[next]!;
-        setInput(hist[next]!);
+        setInputAndCursor(hist[next]!);
       }
       return;
     }
@@ -3465,9 +3486,7 @@ function App({ onLogout }: { onLogout: () => void }) {
         if (idx >= 0 && suggestions[idx]) {
           const [cmd, skill] = suggestions[idx]!;
           const needsArg = skill.usage.includes('<');
-          const next = `/${cmd}${needsArg ? ' ' : ''}`;
-          inputRef.current = next;
-          setInput(next);
+          setInputAndCursor(`/${cmd}${needsArg ? ' ' : ''}`);  // cursor → end
           setSuggestionIndex(-1);
         }
         return;
@@ -3484,8 +3503,7 @@ function App({ onLogout }: { onLogout: () => void }) {
       const cur = promptHistoryIdxRef.current;
       const idx = cur === -1 ? hist.length - 1 : Math.max(0, cur - 1);
       promptHistoryIdxRef.current = idx;
-      inputRef.current = hist[idx]!;
-      setInput(hist[idx]!);
+      setInputAndCursor(hist[idx]!);  // cursor → end of recalled prompt
       return;
     }
     if (key.downArrow) {
@@ -3495,12 +3513,10 @@ function App({ onLogout }: { onLogout: () => void }) {
       const next = cur + 1;
       if (next >= hist.length) {
         promptHistoryIdxRef.current = -1;
-        inputRef.current = '';
-        setInput('');
+        setInputAndCursor('');
       } else {
         promptHistoryIdxRef.current = next;
-        inputRef.current = hist[next]!;
-        setInput(hist[next]!);
+        setInputAndCursor(hist[next]!);
       }
       return;
     }
@@ -3523,21 +3539,29 @@ function App({ onLogout }: { onLogout: () => void }) {
     // stdin.emit interceptor (see App's setup effect): it appends `\n` to the
     // input and swallows the chunk before Ink sees it, so no key.return arrives
     // here for those keys and they never submit. Plain Enter still submits below.
+    // Cursor movement (left/right/home/end + emacs Ctrl-A/E). Bounded to the
+    // input; no-op past the edges. These come before the edit branches so an
+    // arrow never falls through to character insertion.
+    if (key.leftArrow)  { setCursorPos(p => { const n = Math.max(0, p - 1); cursorPosRef.current = n; return n; }); return; }
+    if (key.rightArrow) { setCursorPos(p => { const n = Math.min(inputRef.current.length, p + 1); cursorPosRef.current = n; return n; }); return; }
+    if (key.ctrl && inputChar === 'a') { cursorPosRef.current = 0; setCursorPos(0); return; }
+    if (key.ctrl && inputChar === 'e') { const n = inputRef.current.length; cursorPosRef.current = n; setCursorPos(n); return; }
+
     if (key.return) {
       if (suggestionIndex >= 0 && suggestions[suggestionIndex]) {
         const [cmd, skill] = suggestions[suggestionIndex]!;
         const needsArg = skill.usage.includes('<');
-        const next = `/${cmd}${needsArg ? ' ' : ''}`;
-        inputRef.current = next;
-        setInput(next);
+        setInputAndCursor(`/${cmd}${needsArg ? ' ' : ''}`);  // cursor → end
         setSuggestionIndex(-1);
       } else {
         void submit();
       }
     } else if (key.backspace || key.delete) {
-      const next = inputRef.current.slice(0, -1);
-      inputRef.current = next;
-      setInput(next);
+      // Delete the char immediately before the cursor; cursor retreats by one.
+      const cur = inputRef.current;
+      const pos = cursorPosRef.current;
+      if (pos === 0) return;
+      setInputAndCursor(cur.slice(0, pos - 1) + cur.slice(pos), pos - 1);
       setSuggestionIndex(-1);
       promptHistoryIdxRef.current = -1;
     } else if (inputChar && !key.ctrl && !key.meta) {
@@ -3561,9 +3585,10 @@ function App({ onLogout }: { onLogout: () => void }) {
         .replace(/\r\n?/g, '\n')
         .replace(/[\x00-\x09\x0b-\x1f]/g, '');  // controls except \n (0x0a)
       if (!cleaned) return;
-      const next = inputRef.current + cleaned;
-      inputRef.current = next;
-      setInput(next);
+      // Insert at the cursor (not just append) and advance past what we inserted.
+      const cur = inputRef.current;
+      const pos = cursorPosRef.current;
+      setInputAndCursor(cur.slice(0, pos) + cleaned + cur.slice(pos), pos + cleaned.length);
       setSuggestionIndex(-1);
       promptHistoryIdxRef.current = -1;
     }
@@ -3697,7 +3722,7 @@ function App({ onLogout }: { onLogout: () => void }) {
           }
           <HRule />
           <IdeContextBar ctx={ideCtx} />
-          <InputBar input={input} isRunning={isRunning} mode={mode} modelLabel={MODELS[modelIdx]!.label} maskInput={awaitingAdminKey} terminalMode={terminalMode} />
+          <InputBar input={input} cursorPos={cursorPos} isRunning={isRunning} mode={mode} modelLabel={MODELS[modelIdx]!.label} maskInput={awaitingAdminKey} terminalMode={terminalMode} />
           <HRule />
           <StatusFooter sessionUsd={sessionUsd} pet={pet} renderHeight={renderHeight} coinToast={coinToast} />
           <HRule />
@@ -3789,7 +3814,7 @@ function App({ onLogout }: { onLogout: () => void }) {
           hints, live-stream) repaints once `resizing` clears on settle. */}
       {resizing ? (
         <Box flexDirection="column" paddingX={2}>
-          <InputBar input={input} isRunning={isRunning} mode={mode} modelLabel={MODELS[modelIdx]!.label} maskInput={awaitingAdminKey} terminalMode={terminalMode} collapsed />
+          <InputBar input={input} cursorPos={cursorPos} isRunning={isRunning} mode={mode} modelLabel={MODELS[modelIdx]!.label} maskInput={awaitingAdminKey} terminalMode={terminalMode} collapsed />
           <Text color="#5A8060">resizing…</Text>
         </Box>
       ) : (
@@ -3859,7 +3884,7 @@ function App({ onLogout }: { onLogout: () => void }) {
           {!confirmPrompt && <IdeContextBar ctx={ideCtx} />}
           {confirmPrompt
             ? <ConfirmBar question={confirmPrompt} selectedIdx={confirmSelected} />
-            : <InputBar input={input} isRunning={isRunning} mode={mode} modelLabel={MODELS[modelIdx]!.label} maskInput={awaitingAdminKey} terminalMode={terminalMode} />
+            : <InputBar input={input} cursorPos={cursorPos} isRunning={isRunning} mode={mode} modelLabel={MODELS[modelIdx]!.label} maskInput={awaitingAdminKey} terminalMode={terminalMode} />
           }
           {/* Eye-tracking anchor: `terminalRows - 5`. Once a conversation has enough
               Static scrollback to push the dynamic frame down, the cursor lands at the
