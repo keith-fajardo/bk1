@@ -861,6 +861,49 @@ pub fn abbreviation(root: &Path) -> Vec<Violation> {
 // This adds a quality check: a dim_ model whose description is *just* a
 // bare "SCD Type II" with no surrounding explanation isn't sufficient.
 
+// Extract a YAML block-scalar body (`key: |`, `|-`, `>`, etc.) following YAML's
+// indentation rule: collect lines more-indented than the key, stop at the first
+// line at or below the key's indent. The Rust regex crate lacks look-ahead, so a
+// regex terminator like `(?=\s*\w+:|\z)` can't express "until the next sibling
+// key" — this does it line-by-line instead. Returns None if `key` isn't a block
+// scalar (e.g. an inline `key: value`), letting callers fall back to inline parsing.
+fn block_scalar_body(text: &str, key: &str) -> Option<String> {
+    let mut lines = text.lines();
+    let (key_indent, _) = loop {
+        let line = lines.next()?;
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix(key).and_then(|r| r.strip_prefix(':')) {
+            // Only a block scalar if the value is a `|` / `>` indicator (optionally
+            // with chomping/indentation modifiers), not an inline scalar.
+            let v = rest.trim();
+            if v.starts_with('|') || v.starts_with('>') {
+                break (line.len() - trimmed.len(), v);
+            }
+            return None;
+        }
+    };
+
+    let mut body = Vec::new();
+    for line in lines {
+        if line.trim().is_empty() {
+            body.push("");
+            continue;
+        }
+        let indent = line.len() - line.trim_start().len();
+        if indent <= key_indent {
+            break;
+        }
+        body.push(line.trim_start());
+    }
+    let joined = body.join(" ");
+    let joined = joined.trim();
+    if joined.is_empty() {
+        None
+    } else {
+        Some(joined.to_string())
+    }
+}
+
 pub fn scd_quality(root: &Path, info: &ClaudeMdInfo) -> Vec<Violation> {
     let mut v = Vec::new();
     if !info.has_dim {
@@ -872,7 +915,6 @@ pub fn scd_quality(root: &Path, info: &ClaudeMdInfo) -> Vec<Violation> {
     }
 
     let scd_re = Regex::new(r"(?i)SCD\s+[Tt]ype\s+[IVX0-9]+").unwrap();
-    let desc_re = Regex::new(r"(?ms)description:\s*\|\s*\n((?:\s+.*\n?)+?)(?=\s*\w+:|\z)").unwrap();
     let inline_desc_re = Regex::new(r"description:\s*(.+)").unwrap();
 
     for e in yml_files(&marts_dir) {
@@ -887,9 +929,7 @@ pub fn scd_quality(root: &Path, info: &ClaudeMdInfo) -> Vec<Violation> {
                 continue;
             }
             // Pull the description text — block scalar takes precedence.
-            let desc_text = desc_re
-                .captures(&m.description_block)
-                .map(|c| c[1].trim().to_string())
+            let desc_text = block_scalar_body(&m.description_block, "description")
                 .or_else(|| {
                     inline_desc_re
                         .captures(&m.description_block)
@@ -1005,5 +1045,31 @@ models:
         assert_eq!(models[0].columns[0].name, "order_id");
         assert_eq!(models[0].columns[0].data_type.as_deref(), Some("bigint"));
         assert_eq!(models[0].columns[2].data_type.as_deref(), Some("numeric"));
+    }
+
+    #[test]
+    fn block_scalar_body_reads_multiline_until_next_key() {
+        let yaml = "    description: |\n      SCD Type II dimension.\n      Tracks history of customer records.\n    columns:\n      - name: id\n";
+        let body = block_scalar_body(yaml, "description").unwrap();
+        assert_eq!(body, "SCD Type II dimension. Tracks history of customer records.");
+    }
+
+    #[test]
+    fn block_scalar_body_stops_at_end_of_input() {
+        let yaml = "    description: |\n      Only line.\n";
+        assert_eq!(block_scalar_body(yaml, "description").as_deref(), Some("Only line."));
+    }
+
+    #[test]
+    fn block_scalar_body_returns_none_for_inline_scalar() {
+        // An inline `description: foo` is not a block scalar — caller falls back.
+        let yaml = "    description: SCD Type II\n    columns:\n";
+        assert_eq!(block_scalar_body(yaml, "description"), None);
+    }
+
+    #[test]
+    fn block_scalar_body_handles_chomping_indicator() {
+        let yaml = "    description: |-\n      Kept history.\n    columns:\n";
+        assert_eq!(block_scalar_body(yaml, "description").as_deref(), Some("Kept history."));
     }
 }
