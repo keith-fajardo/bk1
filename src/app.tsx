@@ -2164,17 +2164,13 @@ function AppShell() {
     // /usage panel, …) sees key.escape / key.shift+key.tab again. Only the two
     // affected sequences are touched; everything else (incl. mouse SGR) passes
     // through untouched, and a non-matching chunk keeps its original Buffer.
-    const stdin = process.stdin;
-    const realEmit = stdin.emit.bind(stdin);
-    stdin.emit = ((event: string, ...rest: unknown[]) => {
-      if (event === 'data') {
-        const s = String(rest[0]);
-        if (s.includes('\x1b[27u') || s.includes('\x1b[9;2u') || /\x1b\[\d+;5u/.test(s)) rest[0] = normalizeKittyKeys(s);
-      }
-      return realEmit(event, ...(rest as []));
-    }) as typeof stdin.emit;
+    // kitty CSI-u normalization (Escape, Shift+Tab, Ctrl+letter) AND the
+    // split-ESC rejoin both live in App's single stdin.emit interceptor (see the
+    // effect further down), so this effect only owns the mode enable/disable
+    // lifecycle. Keeping all stdin rewriting in one place avoids a layering
+    // dependency between two competing emit wrappers (which is what previously
+    // let split-Escape slip through unnormalized).
     return () => {
-      stdin.emit = realEmit;
       disableModifyOtherKeys(process.stdout);
       disableKittyKeyboard(process.stdout);
     };
@@ -2495,22 +2491,42 @@ function App({ onLogout }: { onLogout: () => void }) {
   // match we update the input here (this effect lives in App, which owns the
   // input state) and SWALLOW the chunk so Ink never sees it.
   useEffect(() => {
-    const stdin = process.stdin;
-    const innerEmit = stdin.emit.bind(stdin);
-    stdin.emit = ((event: string, ...rest: unknown[]) => {
-      if (event === 'data') {
-        const s = String(rest[0]);
-        if (!isRunningRef.current && !awaitingAdminKeyRef.current && isNewlineKey(s)) {
-          const next = inputRef.current + '\n';
-          inputRef.current = next;
-          setInput(next);
-          setSuggestionIndex(-1);
-          return true;  // swallow — do not forward to Ink (no key.return → no submit)
-        }
+    const stdin = process.stdin as NodeJS.ReadStream & { read: (size?: number) => unknown };
+    // Ink reads input via stdin.read() inside a 'readable' listener (see
+    // node_modules/ink/build/components/App.js) — NOT the 'data' event. So the
+    // ONLY way to transform what Ink's useInput sees is to wrap read() itself.
+    // (An earlier emit('data') wrapper was a no-op whenever stdin was in paused/
+    // readable mode, which is why ESC silently failed in the extension.)
+    //
+    // Here we:
+    //  - normalize kitty CSI-u sequences to the legacy bytes Ink decodes:
+    //    Escape \x1b[27u → \x1b, Shift+Tab \x1b[9;2u → \x1b[Z, Ctrl+<letter>
+    //    \x1b[<c>;5u → control byte. Without this, Escape/Ctrl+C/Shift+Tab arrive
+    //    as un-decodable text in kitty terminals (VS Code's xterm.js) and no-op.
+    //  - turn a newline-insert key (Opt/Shift+Enter) into an actual \n appended
+    //    to the prompt, and hide it from Ink so it doesn't submit.
+    const realRead = stdin.read.bind(stdin);
+    stdin.read = ((size?: number) => {
+      const chunk = realRead(size);
+      if (chunk === null || chunk === undefined) return chunk;
+      let s = Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk);
+      // Newline-insert key: append \n to the prompt and hand Ink an empty read
+      // so it never sees a key.return for it. Only at the prompt (not running /
+      // not entering the admin key), matching the previous guard.
+      if (!isRunningRef.current && !awaitingAdminKeyRef.current && isNewlineKey(s)) {
+        const next = inputRef.current + '\n';
+        inputRef.current = next;
+        setInput(next);
+        setSuggestionIndex(-1);
+        return Buffer.alloc(0);
       }
-      return innerEmit(event, ...(rest as []));
-    }) as typeof stdin.emit;
-    return () => { stdin.emit = innerEmit; };
+      if (s.includes('\x1b[27u') || s.includes('\x1b[9;2u') || /\x1b\[\d+;5u/.test(s)) {
+        s = normalizeKittyKeys(s);
+        return Buffer.from(s, 'utf8');
+      }
+      return chunk;
+    }) as typeof stdin.read;
+    return () => { stdin.read = realRead; };
   }, []);
 
   // Live mouse cursor position — drives the pet's eye-tracking. `null` means we haven't
