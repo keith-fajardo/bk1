@@ -4,8 +4,8 @@
 // gets sleepy, and reacts to your bk1 activity (each turn slightly feeds + cheers it up).
 //
 // State lives at ~/.bk1/pet.json with chmod 0600. Lifecycle is:
-//   0–1h        → egg     ( ◯ )
-//   1h–24h      → baby    (•‿•)
+//   0–10m       → egg     ( ◯ )
+//   10m–24h     → baby    (•‿•)
 //   24h+        → adult   ᕙ(◕‿◕)ᕗ
 //
 // Mood is independent of stage and derived from current stats:
@@ -54,6 +54,22 @@ export type PetColorName = keyof typeof PET_COLORS;
 export const PET_COLOR_NAMES = Object.keys(PET_COLORS) as PetColorName[];
 export const DEFAULT_PET_COLOR: PetColorName = 'green';
 
+// Colors a fresh pet may be assigned — every palette entry except any near-black
+// one, so the sprite stays visible on dark terminal themes. The palette is all
+// bright today (nothing is filtered), but the guard keeps the "never black"
+// guarantee if a dark color is ever added.
+const isNearBlack = (hex: string): boolean => /^#0{3}(0{3})?$/i.test(hex.trim());
+export const RANDOM_PET_COLOR_NAMES = PET_COLOR_NAMES.filter(
+  name => !isNearBlack(PET_COLORS[name]),
+);
+
+// A random body color for a newly hatched pet, never black. Falls back to the
+// default if the palette somehow filtered down to nothing.
+export function randomPetColor(): PetColorName {
+  const pool = RANDOM_PET_COLOR_NAMES.length ? RANDOM_PET_COLOR_NAMES : PET_COLOR_NAMES;
+  return pool[Math.floor(Math.random() * pool.length)] ?? DEFAULT_PET_COLOR;
+}
+
 export function petColorHex(pet: PetState): string {
   return PET_COLORS[pet.color ?? DEFAULT_PET_COLOR];
 }
@@ -61,7 +77,7 @@ export function petColorHex(pet: PetState): string {
 export type Stage = 'egg' | 'baby' | 'adult';
 export type Mood  = 'happy' | 'hungry' | 'sleepy' | 'sad' | 'angry' | 'wants_to_play';
 
-const STAGE_BABY_AT_MS  = 60 * 60 * 1000;        // 1 hour
+const STAGE_BABY_AT_MS  = 10 * 60 * 1000;        // 10 minutes
 const STAGE_ADULT_AT_MS = 24 * 60 * 60 * 1000;   // 24 hours
 
 // Decay rates per minute of real-world elapsed time. Tuned so a session of light use
@@ -102,7 +118,10 @@ function clamp(n: number, lo: number, hi: number): number {
 
 export const STARTING_COINS = 100;
 
-export function newPet(now: Date = new Date()): PetState {
+// `color` defaults to a random (never-black) palette color so each fresh egg
+// hatches a different hue. Pass an explicit color to pin it (tests do this for
+// determinism).
+export function newPet(now: Date = new Date(), color: PetColorName = randomPetColor()): PetState {
   return {
     name: null,
     born_at: now.toISOString(),
@@ -111,6 +130,7 @@ export function newPet(now: Date = new Date()): PetState {
     happiness: 80,
     energy: 100,
     coins: STARTING_COINS,
+    color,
   };
 }
 
@@ -704,10 +724,11 @@ export function readPetFrom(path: string): PetState | null {
         coins:          typeof data.coins === 'number' ? data.coins : STARTING_COINS,
         sleeping_until: typeof data.sleeping_until === 'string' ? data.sleeping_until : undefined,
         eating_until:   typeof data.eating_until   === 'string' ? data.eating_until   : undefined,
-        // color is intentionally NOT read from disk — it's a session-only
-        // setting that resets each time bk1 launches. The field stays on
-        // PetState so in-process code can set it for rendering, but writePetTo
-        // strips it before persisting.
+        // color persists: a pet's body color is part of its identity. A fresh
+        // egg hatches a random color (newPet) that we want to keep across
+        // launches, and the playroom color cycle is likewise sticky. Pre-color
+        // pet.json files (no color key) fall back to the render-time default.
+        color:          typeof data.color === 'string' ? (data.color as PetColorName) : undefined,
       };
     }
     return null;
@@ -718,10 +739,10 @@ export function readPetFrom(path: string): PetState | null {
 
 export function writePetTo(path: string, state: PetState): void {
   mkdirSync(dirname(path), { recursive: true });
-  // Strip session-only fields before serializing. `color` is per-launch;
-  // restoring it from disk would defeat the "reset on bk1 startup" intent.
-  const { color: _omitColor, ...persistable } = state;
-  writeFileSync(path, JSON.stringify(persistable, null, 2), 'utf-8');
+  // color is persisted (see readPetFrom) so the random hatch color and any
+  // playroom color cycle survive restarts. Undefined optional fields are
+  // dropped by JSON.stringify, so a color-less pet round-trips cleanly.
+  writeFileSync(path, JSON.stringify(state, null, 2), 'utf-8');
   chmodSync(path, 0o600);
 }
 

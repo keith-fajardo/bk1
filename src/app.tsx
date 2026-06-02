@@ -2765,8 +2765,8 @@ function App({ onLogout }: { onLogout: () => void }) {
         // explicit — the user typed the word "release" so we don't gate behind a confirm.
         const farewellName = nextPet.name ?? 'your pet';
         nextPet = newPet();
-        // newPet() returns a fresh state with no color set — so pet color
-        // resets automatically. The session alias lives separately, so we
+        // newPet() assigns a fresh random color, so the released pet's color is
+        // re-rolled automatically. The session alias lives separately, so we
         // clear it explicitly here.
         setSessionAlias(null);
         note = `You released ${farewellName} back into the mangroves. A new egg appears.`;
@@ -3475,10 +3475,9 @@ function App({ onLogout }: { onLogout: () => void }) {
         onSetAlias={setSessionAlias}
         onExit={() => setPlayroom(null)}
         onCycleColor={() => {
-          // Cycle through the palette. writePetTo strips `color` before
-          // hitting disk, so the change is in-memory for this session only.
-          // savePet still runs (keeps last_seen + other fields fresh) but
-          // doesn't persist the color change — resetting on next launch.
+          // Cycle through the palette. color now persists (writePetTo keeps
+          // it), so the cycled color sticks across launches — savePet writes
+          // it through like any other field.
           const current = pet.color ?? DEFAULT_PET_COLOR;
           const idx = PET_COLOR_NAMES.indexOf(current);
           const next = PET_COLOR_NAMES[(idx + 1) % PET_COLOR_NAMES.length]!;

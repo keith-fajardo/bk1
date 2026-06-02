@@ -8,6 +8,7 @@ import {
   addCoins, spendCoins, STARTING_COINS,
   renderPetView,
   readPetFrom, writePetTo,
+  randomPetColor, PET_COLORS, PET_COLOR_NAMES,
   type PetState,
 } from '../src/pet';
 import { writeFileSync } from 'fs';
@@ -17,16 +18,17 @@ const minutesLater = (mins: number) => new Date(T0.getTime() + mins * 60_000);
 const hoursLater   = (h: number)    => new Date(T0.getTime() + h * 3_600_000);
 const daysLater    = (d: number)    => new Date(T0.getTime() + d * 86_400_000);
 
-// born_at value that puts the pet past the 1h hatch threshold at T0. Interaction
-// tests need this because feed/play/sleep/autoFeed are no-ops while the pet is
-// still an egg — verifying the behavior requires a post-hatch pet.
+// born_at value that puts the pet past the 10-min hatch threshold at T0.
+// Interaction tests need this because feed/play/sleep/autoFeed are no-ops while
+// the pet is still an egg — verifying the behavior requires a post-hatch pet.
 const HATCHED_BORN_AT = new Date(T0.getTime() - 2 * 3_600_000).toISOString();
 
 describe('newPet', () => {
   test('produces a fresh pet with null name and healthy stats', () => {
     // Null name is load-bearing: it's how /pet knows to prompt for naming on first view.
     // If newPet ever defaults to a literal name, that prompt disappears and the UX breaks.
-    const p = newPet(T0);
+    // Pin the color so this stays deterministic — color randomness is covered separately.
+    const p = newPet(T0, 'green');
     expect(p.name).toBeNull();
     expect(p.hunger).toBe(0);
     expect(p.happiness).toBe(80);
@@ -34,6 +36,20 @@ describe('newPet', () => {
     expect(p.coins).toBe(STARTING_COINS);
     expect(p.born_at).toBe(T0.toISOString());
     expect(p.last_seen).toBe(T0.toISOString());
+    expect(p.color).toBe('green');
+  });
+
+  test('assigns a random, valid, non-black color by default', () => {
+    // Sample many draws: every result must be a real palette key and never black,
+    // so the sprite stays visible on dark themes.
+    for (let i = 0; i < 200; i++) {
+      const c = randomPetColor();
+      expect(PET_COLOR_NAMES).toContain(c);
+      expect(PET_COLORS[c].toLowerCase()).not.toBe('#000000');
+      expect(PET_COLORS[c].toLowerCase()).not.toBe('#000');
+    }
+    // And newPet() with no explicit color produces one of the random-eligible hues.
+    expect(PET_COLOR_NAMES).toContain(newPet(T0).color);
   });
 });
 
@@ -121,15 +137,15 @@ describe('tickPet (time-based decay)', () => {
 });
 
 describe('stage classification by age', () => {
-  test('< 1 hour old → egg', () => {
+  test('< 10 minutes old → egg', () => {
     const p = newPet(T0);
-    expect(stage(p, minutesLater(30))).toBe('egg');
-    expect(stage(p, minutesLater(59))).toBe('egg');
+    expect(stage(p, minutesLater(5))).toBe('egg');
+    expect(stage(p, minutesLater(9))).toBe('egg');
   });
 
-  test('1h–24h old → baby', () => {
+  test('10min–24h old → baby', () => {
     const p = newPet(T0);
-    expect(stage(p, minutesLater(60))).toBe('baby');
+    expect(stage(p, minutesLater(10))).toBe('baby');
     expect(stage(p, hoursLater(12))).toBe('baby');
     expect(stage(p, hoursLater(23))).toBe('baby');
   });
@@ -189,7 +205,7 @@ describe('mood classification by stats', () => {
 describe('petFace renders different faces per (stage, mood)', () => {
   test('egg stage uses egg face regardless of mood', () => {
     const p = newPet(T0);
-    expect(petFace(p, minutesLater(10))).toContain('◯');
+    expect(petFace(p, minutesLater(5))).toContain('◯');  // < 10-min hatch → still an egg
   });
 
   test('baby and adult have visibly distinct faces', () => {
@@ -364,7 +380,7 @@ describe('interactions', () => {
     // those stats untouched. Only last_seen advances. Without this guard, the UI
     // would show stat decay on an egg, implying it was already alive.
     const p: PetState = { ...newPet(T0), hunger: 30, happiness: 50, energy: 70 };
-    const later = minutesLater(10);
+    const later = minutesLater(5);  // still inside the 10-min egg window
     // play / petSleep / autoFeedFromActivity all share (state, now) signature.
     for (const fn of [play, petSleep, autoFeedFromActivity]) {
       const after = fn(p, later);
@@ -396,10 +412,12 @@ describe('persistence', () => {
   afterEach(() => { rmSync(tmp, { recursive: true, force: true }); });
 
   test('writePetTo creates parent dirs and round-trips state', () => {
-    const p = newPet(T0);
+    const p = newPet(T0, 'blue');  // pin color so the round-trip is deterministic
     writePetTo(path, p);
     expect(existsSync(path)).toBe(true);
     expect(readPetFrom(path)).toEqual(p);
+    // color must survive the round-trip now that it's persisted.
+    expect(readPetFrom(path)!.color).toBe('blue');
   });
 
   test('writePetTo applies chmod 0600 (same security treatment as auth.json)', () => {
