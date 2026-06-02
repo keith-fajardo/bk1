@@ -3,13 +3,17 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync, statSync } from 'fs
 import { resolve, dirname, basename } from 'path';
 import { createHash } from 'crypto';
 import { emitCoinEvent, COIN_REWARDS, COIN_PENALTIES } from './coin-events';
+import { getProjectDir } from './project-dir';
 
-const PROJECT_DIR = resolve(process.env.DBT_PROJECT_DIR ?? process.cwd());
-const DB_PATH = resolve(PROJECT_DIR, 'target/bk1_state.db');
+// Per-project paths are derived from the LIVE project dir (getProjectDir) so a
+// mid-session /project switch re-points them. The state DB connection is a
+// singleton (see getDb / resetDb) — resetDb must be called on a switch so the
+// next getDb() opens the new project's DB.
+const dbPath = () => resolve(getProjectDir(), 'target/bk1_state.db');
 // Lint HTML report — written on every lint_run so the user has a clickable artifact
 // of the latest violations, and so /lint-deep can skip its expensive semantic pass
 // when a recent report already exists (the app prompts the user before overwriting).
-export const LINT_REPORT_PATH = resolve(PROJECT_DIR, '.bk1', 'lint-report.html');
+export const lintReportPath = () => resolve(getProjectDir(), '.bk1', 'lint-report.html');
 
 interface ModelRow {
   unique_id: string;
@@ -31,10 +35,19 @@ interface ManifestModelNode {
 
 let _db: Database | null = null;
 
+// Close and forget the current project's DB connection. Called on a /project
+// switch so the next getDb() opens the new project's target/bk1_state.db.
+// Closing matters: an open bun:sqlite handle holds the file, and a stale
+// connection would otherwise keep serving the old project's model/lint rows.
+export function resetDb(): void {
+  if (_db) { try { _db.close(); } catch {} _db = null; }
+}
+
 function getDb(): Database {
   if (_db) return _db;
-  mkdirSync(dirname(DB_PATH), { recursive: true });
-  _db = new Database(DB_PATH);
+  const path = dbPath();
+  mkdirSync(dirname(path), { recursive: true });
+  _db = new Database(path);
   _db.run(`
     CREATE TABLE IF NOT EXISTS models (
       unique_id        TEXT PRIMARY KEY,
@@ -75,20 +88,20 @@ function getMtime(filePath: string): string {
 }
 
 function getProjectName(): string {
-  const yml = resolve(PROJECT_DIR, 'dbt_project.yml');
-  if (!existsSync(yml)) return basename(PROJECT_DIR);
+  const yml = resolve(getProjectDir(), 'dbt_project.yml');
+  if (!existsSync(yml)) return basename(getProjectDir());
   for (const line of readFileSync(yml, 'utf-8').split('\n')) {
     const m = line.match(/^name:\s*['"]?([^'"#\s]+)/);
     if (m) return m[1]!;
   }
-  return basename(PROJECT_DIR);
+  return basename(getProjectDir());
 }
 
 interface SyncStats { total: number; added: number; changed: number; unchanged: number; pruned: number; }
 
 // Incremental sync — stats all SQL files first (fast), only reads content for changed/new files.
 async function incrementalSync(): Promise<SyncStats> {
-  const manifestPath = resolve(PROJECT_DIR, 'target/manifest.json');
+  const manifestPath = resolve(getProjectDir(), 'target/manifest.json');
   if (!existsSync(manifestPath)) throw new Error('target/manifest.json not found. Run dbt compile or dbt parse first.');
 
   const manifest = JSON.parse(readFileSync(manifestPath, 'utf-8')) as { nodes: Record<string, ManifestModelNode> };
@@ -98,8 +111,8 @@ async function incrementalSync(): Promise<SyncStats> {
   // Step 1: stat all SQL files (syscall only — no content read)
   const statted = models.map(m => ({
     model: m,
-    sqlPath: resolve(PROJECT_DIR, m.original_file_path),
-    mtime: getMtime(resolve(PROJECT_DIR, m.original_file_path)),
+    sqlPath: resolve(getProjectDir(), m.original_file_path),
+    mtime: getMtime(resolve(getProjectDir(), m.original_file_path)),
   }));
 
   // Step 2: bulk fetch all stored rows in one query
@@ -117,7 +130,7 @@ async function incrementalSync(): Promise<SyncStats> {
     if (existing && existing.sql_mtime === s.mtime) continue; // unchanged — skip disk read
     const { hash, content: sqlContent } = readAndHash(s.sqlPath);
     const yamlRelPath = s.model.original_file_path.replace(/\.sql$/, '.yml');
-    const { content: yamlContent } = readAndHash(resolve(PROJECT_DIR, yamlRelPath));
+    const { content: yamlContent } = readAndHash(resolve(getProjectDir(), yamlRelPath));
     reads.set(s.model.unique_id, { hash, sqlContent, yamlContent, yamlRelPath });
   }
 
@@ -302,7 +315,7 @@ export async function lintRun(binaryPath: string, force: boolean): Promise<strin
       existsSync(pythonPath) ? (force ? ['python', pythonPath, '.', '--no-cache'] : ['python', pythonPath, '.']) : null,
     ]) {
       if (!cmd) continue;
-      const proc = Bun.spawn(cmd, { cwd: PROJECT_DIR, stdout: 'pipe', stderr: 'pipe' });
+      const proc = Bun.spawn(cmd, { cwd: getProjectDir(), stdout: 'pipe', stderr: 'pipe' });
       await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
       await proc.exited;
       ran = true;
@@ -347,7 +360,7 @@ export async function lintRun(binaryPath: string, force: boolean): Promise<strin
       details:         agg.batchViolations,
     },
     semantic_review_queue: agg.semanticQueue,
-    report_path:           LINT_REPORT_PATH,
+    report_path:           lintReportPath(),
     cached:                canUseCache,
   });
 }
@@ -437,8 +450,8 @@ function writeLintReportHtml(input: {
 </body>
 </html>`;
 
-  mkdirSync(dirname(LINT_REPORT_PATH), { recursive: true });
-  writeFileSync(LINT_REPORT_PATH, html, 'utf-8');
+  mkdirSync(dirname(lintReportPath()), { recursive: true });
+  writeFileSync(lintReportPath(), html, 'utf-8');
 }
 
 // Returns a batch of models that need linting. limit controls batch size (default 100).
@@ -693,7 +706,7 @@ export function fetchContent(paths: string[], projection?: Projection): string {
   for (const p of paths) {
     const row = stmt.get(p);
     const content = row?.content ?? (() => {
-      const full = resolve(PROJECT_DIR, p);
+      const full = resolve(getProjectDir(), p);
       return existsSync(full) ? readFileSync(full, 'utf-8') : null;
     })();
     if (!content) continue;

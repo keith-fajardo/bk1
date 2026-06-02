@@ -1,14 +1,15 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { existsSync, mkdirSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
-import { executeTool, PROJECT_DIR } from '../src/tools';
+import { executeTool } from '../src/tools';
+import { getProjectDir } from '../src/project-dir';
 
 // Relative paths (what the agent actually passes) and their absolute equivalents.
 const TMP_REL  = 'tests/.tmp';
-const TMP_ABS  = join(PROJECT_DIR, TMP_REL);
+const TMP_ABS  = join(getProjectDir(), TMP_REL);
 const SMALL_REL = `${TMP_REL}/small.txt`;
 const HUGE_REL  = `${TMP_REL}/huge.txt`;
-const TARGET_ABS = join(PROJECT_DIR, 'target');
+const TARGET_ABS = join(getProjectDir(), 'target');
 const MANIFEST_REL = 'target/manifest.json';
 const RUN_RESULTS_REL = 'target/run_results.json';
 
