@@ -5,9 +5,10 @@ import { spawnSync } from 'node:child_process';
 import { render, Box, Text, Static, useInput, measureElement, type DOMElement } from 'ink';
 import Spinner from 'ink-spinner';
 import type Anthropic from '@anthropic-ai/sdk';
-import { runAgent, AgentAbortedError, resetAnthropicClient, type TokenUsage } from './agent';
-import { getProjectDir } from './project-dir';
-import { lintReportPath } from './state';
+import { runAgent, AgentAbortedError, resetAnthropicClient, rebuildSystemPrompt, type TokenUsage } from './agent';
+import { getProjectDir, setProjectDir, isDbtProject } from './project-dir';
+import { lintReportPath, resetDb } from './state';
+import { getRecentProjects, recordRecentProject } from './recent-projects';
 import { bk1AssetsDir } from './bk1-home';
 import { BK1_VERSION } from './version';
 import { createSession, saveSessionMessages, loadSessionMessages, searchSessions, formatSessionLine, type SessionSearchHit, type StoredMessage } from './sessions';
@@ -232,6 +233,44 @@ function ModelPicker({ currentIdx }: { currentIdx: number }) {
       </Box>
     </Box>
   );
+}
+
+// /project switcher. Lists recently-used dbt projects (arrow-select) and lets
+// the user type/paste a path after "/project " to switch somewhere new. The
+// current project is marked. `typed` is the text after the command, if any —
+// when non-empty it takes precedence over the arrow selection on Enter.
+function ProjectPicker({ recents, currentIdx, typed, current }: {
+  recents: string[]; currentIdx: number; typed: string; current: string;
+}) {
+  return (
+    <Box flexDirection="column" marginBottom={0}>
+      {recents.length === 0 ? (
+        <Box paddingX={2}><Text color="#5A8060">No recent projects — type a path: /project &lt;path&gt;</Text></Box>
+      ) : recents.map((p, i) => {
+        const active = i === currentIdx && !typed;
+        const isCurrent = resolvePathEq(p, current);
+        return (
+          <Box key={p} paddingX={2} gap={1}>
+            <Text color={active ? '#C0FAD2' : '#5A8060'} bold={active}>{active ? '●' : ' '}</Text>
+            <Text color={active ? '#C0FAD2' : '#7AB890'}>{p}</Text>
+            {isCurrent && <Text color="#3D6650">(current)</Text>}
+          </Box>
+        );
+      })}
+      <Box paddingX={2} marginTop={0}>
+        <Text color="#5A8060">
+          {typed ? `Enter to switch to: ${typed}` : '↑↓ navigate · Enter switch · or type a path after /project'}
+        </Text>
+      </Box>
+    </Box>
+  );
+}
+
+// Path-equality helper for marking the current project in the list (avoids a
+// trailing-slash mismatch). Module-scope so ProjectPicker can use it.
+function resolvePathEq(a: string, b: string): boolean {
+  const norm = (s: string) => s.replace(/\/+$/, '');
+  return norm(a) === norm(b);
 }
 
 // Playroom picker — shown when input starts with "/pet playroom". Mirrors the
@@ -1043,6 +1082,12 @@ function WordmarkLine({ line, color }: { line: string; color: string }) {
   );
 }
 
+// Default foreground for the agent's response body. Without an explicit color
+// Ink falls through to the terminal's default white, which reads as stark/bright
+// on a dark theme. A muted light-grey (à la Claude Code) is softer on the eyes
+// while staying clearly readable. Headings/inline emphasis keep their own colors.
+const BODY_FG = '#C5CDD3';
+
 function RichLine({ line }: { line: string }) {
   // Pet sprite line: identified by the zero-width-space sentinel that pet.ts prefixes
   // onto every encoded sprite row. Match before any markdown logic so the encoded
@@ -1081,11 +1126,11 @@ function RichLine({ line }: { line: string }) {
 
   const spans = parseInline(line);
   return (
-    <Text wrap="wrap">
+    <Text wrap="wrap" color={BODY_FG}>
       {spans.map((s, i) =>
         s.color || s.bold || s.italic
           ? <Text key={i} color={s.color} bold={!!s.bold} italic={!!s.italic}>{s.text}</Text>
-          : <Text key={i}>{s.text}</Text>
+          : <Text key={i} color={BODY_FG}>{s.text}</Text>
       )}
     </Text>
   );
@@ -2164,6 +2209,7 @@ function App({ onLogout }: { onLogout: () => void }) {
   const [suggestionIndex, setSuggestionIndex] = useState(-1);
   const [mode, setMode] = useState<Mode>('plan');
   const [modelIdx, setModelIdx] = useState(DEFAULT_MODEL_IDX);
+  const [projectIdx, setProjectIdx] = useState(0);
   const [petPlayIdx, setPetPlayIdx] = useState(0);
   const [petFeedIdx, setPetFeedIdx] = useState(0);
   const [petPlayroomIdx, setPetPlayroomIdx] = useState(0);
@@ -2187,6 +2233,9 @@ function App({ onLogout }: { onLogout: () => void }) {
     try {
       currentSessionIdRef.current = createSession(getProjectDir(), MODELS[DEFAULT_MODEL_IDX]!.id);
     } catch { /* DB unavailable — history will be a no-op for this session */ }
+    // Seed the recents list with the launch dir so the very first /project
+    // switch already has somewhere to go back to.
+    recordRecentProject(getProjectDir());
   }, []);
   useEffect(() => {
     if (currentSessionIdRef.current === null || messages.length === 0) return;
@@ -2287,11 +2336,13 @@ function App({ onLogout }: { onLogout: () => void }) {
   const petPlayIdxRef = useRef(0);
   const petFeedIdxRef = useRef(0);
   const petPlayroomIdxRef = useRef(0);
+  const projectIdxRef = useRef(0);
   useEffect(() => { modelIdxRef.current = modelIdx; }, [modelIdx]);
   useEffect(() => { modeRef.current = mode; }, [mode]);
   useEffect(() => { petPlayIdxRef.current = petPlayIdx; }, [petPlayIdx]);
   useEffect(() => { petFeedIdxRef.current = petFeedIdx; }, [petFeedIdx]);
   useEffect(() => { petPlayroomIdxRef.current = petPlayroomIdx; }, [petPlayroomIdx]);
+  useEffect(() => { projectIdxRef.current = projectIdx; }, [projectIdx]);
   // Lint phase tracking refs — readable inside the memoised submit callback
   const lintProgressRef = useRef<LintProgress | null>(null);
   const lastModelStateActionRef = useRef<string | null>(null);
@@ -2511,13 +2562,47 @@ function App({ onLogout }: { onLogout: () => void }) {
   // The startsWith check uses a trailing space so `/pet play` doesn't get
   // misclassified as a playroom intent while the user is still typing.
   const isPetPlayroomPicker = input === '/pet playroom' || input.startsWith('/pet playroom ');
+  // /project (with or without a trailing path) → recents picker. Trailing space
+  // so a future command sharing the prefix isn't misclassified mid-type.
+  const isProjectPicker = input === '/project' || input.startsWith('/project ');
+  // The text typed after "/project " — when non-empty, Enter switches to this
+  // path instead of the arrow-selected recent.
+  const projectTyped = isProjectPicker ? input.replace(/^\/project\s*/, '').trim() : '';
+  const projectRecents = useMemo(() => getRecentProjects(), [isProjectPicker]);
 
   const suggestions = useMemo(() => {
-    if (isModelPicker || isPetPlayPicker || isPetFeedPicker || isPetPlayroomPicker) return [] as [string, typeof SKILLS[string]][];
+    if (isModelPicker || isPetPlayPicker || isPetFeedPicker || isPetPlayroomPicker || isProjectPicker) return [] as [string, typeof SKILLS[string]][];
     if (!input.startsWith('/')) return [] as [string, typeof SKILLS[string]][];
     const partial = input.slice(1).split(' ')[0]?.toLowerCase() ?? '';
     return Object.entries(SKILLS).filter(([cmd]) => cmd.startsWith(partial)) as [string, typeof SKILLS[string]][];
-  }, [input, isModelPicker, isPetPlayPicker, isPetFeedPicker, isPetPlayroomPicker]);
+  }, [input, isModelPicker, isPetPlayPicker, isPetFeedPicker, isPetPlayroomPicker, isProjectPicker]);
+
+  // Switch the active dbt project mid-session (the /project picker calls this).
+  // Keeps the conversation on screen but re-points everything project-keyed:
+  // the dir getter, the state DB connection, the agent's system prompt, and the
+  // session log. A "Switched project" info line demarcates the kept history.
+  // Returns an error string on failure (bad path) so the caller can surface it
+  // without anything having been torn down. Never switches mid-agent-run.
+  const changeProject = useCallback((rawPath: string): string | null => {
+    if (isRunningRef.current) return 'Cannot switch project while the agent is running.';
+    const target = rawPath.trim();
+    if (!target) return 'No path given.';
+    if (!isDbtProject(target)) return `Not a dbt project (no dbt_project.yml): ${target}`;
+    let resolved: string;
+    try { resolved = setProjectDir(target); }
+    catch (err) { return err instanceof Error ? err.message : String(err); }
+    // Re-point per-project state. Order doesn't matter between these three; all
+    // read the now-updated getProjectDir() lazily.
+    resetDb();
+    rebuildSystemPrompt();
+    // Start a fresh session row for the new project so history is filed under
+    // the right project; keep the on-screen messages (user chose "keep chat").
+    try { currentSessionIdRef.current = createSession(resolved, MODELS[modelIdxRef.current]!.id); }
+    catch { currentSessionIdRef.current = null; }
+    recordRecentProject(resolved);
+    setMessages(prev => [...prev, { role: 'assistant', info: true, content: `Switched project to ${resolved}` }]);
+    return null;
+  }, []);
 
   const submit = useCallback(async () => {
     // Normalize line breaks before anything reads the buffer: a stray \r (from
@@ -2610,6 +2695,26 @@ function App({ onLogout }: { onLogout: () => void }) {
     if (raw.startsWith('/model')) {
       // Tab already cycled the selection — Enter just closes the picker
       setInput(''); inputRef.current = ''; setSuggestionIndex(-1);
+      return;
+    }
+    if (raw === '/project' || raw.startsWith('/project ')) {
+      // Switch the active dbt project. A typed path (after "/project ") wins;
+      // otherwise use the arrow-selected recent. changeProject re-points all
+      // project-keyed state and pushes a "Switched project" line; on failure it
+      // returns an error string we surface in the chat.
+      setInput(''); inputRef.current = ''; setSuggestionIndex(-1);
+      // Read recents + selection fresh (this callback has [] deps; the captured
+      // state would be stale — mirror the petPlay/feed picker ref pattern).
+      const typed = raw.replace(/^\/project\s*/, '').trim();
+      const recents = getRecentProjects();
+      const target = typed || recents[projectIdxRef.current] || '';
+      if (!target) {
+        setMessages(prev => [...prev, { role: 'assistant', content: 'Usage: /project <path>, or pick from recents (arrow keys).' }]);
+        return;
+      }
+      const err = changeProject(target);
+      if (err) setMessages(prev => [...prev, { role: 'assistant', content: err }]);
+      setProjectIdx(0); projectIdxRef.current = 0;
       return;
     }
     if (raw === '/logout') {
@@ -3288,6 +3393,19 @@ function App({ onLogout }: { onLogout: () => void }) {
       return;
     }
 
+    // /project arrow cycling — navigate the recents list. Only swallow up/down;
+    // Enter falls through to submit() which performs the switch. No-op if the
+    // user is typing a path (no recents to cycle in that case is fine).
+    if ((inputRef.current === '/project' || inputRef.current.startsWith('/project '))
+        && (key.upArrow || key.downArrow)) {
+      const total = projectRecents.length;
+      if (total > 0) {
+        if (key.upArrow) setProjectIdx(i => (i - 1 + total) % total);
+        else             setProjectIdx(i => (i + 1) % total);
+      }
+      return;
+    }
+
     // History-scrub continuation — once we're actively scrubbing (idx !== -1),
     // up/down stay bound to history even if the recalled prompt happens to be a
     // slash command that lights up the Suggestions list. Without this, pressing
@@ -3551,6 +3669,8 @@ function App({ onLogout }: { onLogout: () => void }) {
         <Box marginTop={1} flexDirection="column">
           {isModelPicker
             ? <ModelPicker currentIdx={modelIdx} />
+            : isProjectPicker
+              ? <ProjectPicker recents={projectRecents} currentIdx={projectIdx} typed={projectTyped} current={getProjectDir()} />
             : isPetPlayroomPicker
               ? <PlayroomPicker currentIdx={petPlayroomIdx} />
               : isPetPlayPicker
@@ -3610,28 +3730,28 @@ function App({ onLogout }: { onLogout: () => void }) {
         {(msg, i) => (
           <Box key={i} flexDirection="column" marginBottom={1} paddingX={2} marginTop={i === 0 ? 1 : 0}>
             {msg.role === 'user' ? (() => {
-              // Right-aligned bordered bubble so the user can visually distinguish
-              // their own prompts from the agent's left-aligned plain output.
-              // Each newline-separated line renders as its own Text inside a
-              // column-direction Box. Ink's wrap="wrap" on a single Text element
+              // Bordered bubble (distinct background) so the user can visually
+              // distinguish their own prompts from the agent's left-aligned plain
+              // output. Each newline-separated line renders as its own Text inside
+              // a column-direction Box. Ink's wrap="wrap" on a single Text element
               // with embedded \n sometimes collapses the newlines when the
               // parent Box has a fixed width — splitting + flexDirection=column
               // sidesteps that path entirely.
               //
-              // Fixed width (60% of the terminal): every prompt bubble is the same
-              // size regardless of content, rather than hugging the longest line.
-              // Still right-aligned (justifyContent flex-end) so it reads as the
-              // user's side. Lines longer than the box wrap inside it.
+              // Width matches the input box (InputBar): cols-5, the same
+              // resize-safe margin HRule uses, so the prompt history and the live
+              // input box line up at one consistent width. Both sit inside a
+              // paddingX={2} wrapper, so cols-5 spans identically. (No longer
+              // right-aligned — at full width that's a no-op.) Lines longer than
+              // the box wrap inside it.
               const cols = process.stdout.columns ?? 80;
               const bubbleLines = msg.content.split('\n');
-              const innerW = Math.max(20, Math.floor(cols * 0.6));
+              const boxWidth = Math.max(20, cols - 5);
               return (
-                <Box justifyContent="flex-end">
-                  <Box borderStyle="round" borderColor="#6B5E8C" paddingX={1} width={innerW + 4} flexDirection="column">
-                    {bubbleLines.map((line, j) => (
-                      <Text key={j} backgroundColor="#2E2940" color="#D8CFEF" wrap="wrap">{line || ' '}</Text>
-                    ))}
-                  </Box>
+                <Box borderStyle="round" borderColor="#6B5E8C" paddingX={1} width={boxWidth} flexDirection="column">
+                  {bubbleLines.map((line, j) => (
+                    <Text key={j} backgroundColor="#2E2940" color="#D8CFEF" wrap="wrap">{line || ' '}</Text>
+                  ))}
                 </Box>
               );
             })() : msg.info ? (
@@ -3709,6 +3829,8 @@ function App({ onLogout }: { onLogout: () => void }) {
 
           {!confirmPrompt && (isModelPicker
             ? <ModelPicker currentIdx={modelIdx} />
+            : isProjectPicker
+              ? <ProjectPicker recents={projectRecents} currentIdx={projectIdx} typed={projectTyped} current={getProjectDir()} />
             : isPetPlayroomPicker
               ? <PlayroomPicker currentIdx={petPlayroomIdx} />
               : isPetPlayPicker
