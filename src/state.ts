@@ -310,14 +310,17 @@ export async function lintRun(binaryPath: string, force: boolean): Promise<strin
   if (!canUseCache) {
     const pythonPath = binaryPath.replace(/bk1-lint$/, 'dbt_lint.py');
     let ran = false;
+    let exitCode = 0;
+    let binStderr = '';
     for (const cmd of [
       existsSync(binaryPath) ? (force ? [binaryPath, '.', '--no-cache'] : [binaryPath, '.']) : null,
       existsSync(pythonPath) ? (force ? ['python', pythonPath, '.', '--no-cache'] : ['python', pythonPath, '.']) : null,
     ]) {
       if (!cmd) continue;
       const proc = Bun.spawn(cmd, { cwd: getProjectDir(), stdout: 'pipe', stderr: 'pipe' });
-      await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
-      await proc.exited;
+      const [, stderr] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+      exitCode = await proc.exited;
+      binStderr = stderr;
       ran = true;
       break;
     }
@@ -328,6 +331,17 @@ export async function lintRun(binaryPath: string, force: boolean): Promise<strin
         message: `bk1-lint not found at ${binaryPath}. Run: cd lint && cargo build --release && cp target/release/bk1-lint ${dirname(binaryPath)}/`,
         sync,
         batch: { size: batchRows.length, remaining, queue: batchRows.map(r => r.name) },
+      });
+    }
+
+    // The binary crashed (e.g. a panic) — surface its stderr instead of letting
+    // the downstream check report a generic 'violations_not_found' with no cause.
+    if (exitCode !== 0) {
+      return JSON.stringify({
+        error: 'binary_failed',
+        exit_code: exitCode,
+        stderr: binStderr.trim().split('\n').slice(0, 20).join('\n'),
+        sync,
       });
     }
   }
