@@ -126,7 +126,7 @@ bk1-lint <dbt_project_dir> --stdout --fail-on major > violations.json
 - `--stdout` writes the violations JSON to stdout (the "written to …" note goes to stderr, so the redirect captures clean JSON).
 - `--fail-on <severity>` exits non-zero when any violation meets or exceeds the threshold — `blocker`, `major`, or `minor` (severities rank `blocker > major > minor`, so `--fail-on major` also fails on blockers). Omit it to always exit 0 and just emit the report.
 
-A copy-paste GitHub Actions workflow that downloads `bk1-lint` from the latest release and fails the build on `major`+ violations lives at [`.github/workflows/dbt-lint.yml`](.github/workflows/dbt-lint.yml).
+A copy-paste GitHub Actions workflow that downloads `bk1-lint` from the latest release and fails the build on `major`+ violations lives at [`examples/ci-workflows/dbt-lint.yml`](examples/ci-workflows/dbt-lint.yml).
 
 ### Copilot-style PR review
 
@@ -138,7 +138,7 @@ bk1-review --json --project-dir <path>     # print findings JSON, no GitHub
 bk1-review --dry-run --pr <n> --repo <o/r> # print the would-be review, post nothing
 ```
 
-Unlike `bk1-lint`, this needs an `ANTHROPIC_API_KEY` (it drives the agent) and a `GITHUB_TOKEN` with `pull-requests: write`. It works on same-repo PRs — forked-PR tokens are read-only. The sample workflow is at [`.github/workflows/dbt-review.yml`](.github/workflows/dbt-review.yml).
+Unlike `bk1-lint`, this needs an `ANTHROPIC_API_KEY` (it drives the agent) and a `GITHUB_TOKEN` with `pull-requests: write`. It works on same-repo PRs — forked-PR tokens are read-only. The sample workflow is at [`examples/ci-workflows/dbt-review.yml`](examples/ci-workflows/dbt-review.yml).
 
 ## Pet
 

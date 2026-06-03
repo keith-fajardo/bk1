@@ -87,7 +87,7 @@ tests/              bun:test suites (aggregation correctness, skill contract)
    stdout; `--fail-on <blocker|major|minor>` exits non-zero past a severity threshold.
    Both are opt-in — the no-flag path (write to `<binary_dir>/data`, always exit 0) is
    what `lintRun` relies on, so do not change that default. Sample workflow:
-   [.github/workflows/dbt-lint.yml](.github/workflows/dbt-lint.yml).
+   [examples/ci-workflows/dbt-lint.yml](examples/ci-workflows/dbt-lint.yml).
 
 ### Headless PR review ([src/headless-review.ts](src/headless-review.ts))
 `bk1-review` is a SECOND compiled binary (entry: [src/headless-review.ts](src/headless-review.ts),
@@ -109,7 +109,7 @@ Gotchas baked into the code: `--commit` must be the PR HEAD sha (not the merge c
 inline comments 422; `--project-dir` goes through `setProjectDir` (project-dir.ts resolves at
 import, so a late env mutation wouldn't take); the batched review folds comments into the body
 on a 422 so a run never silently posts nothing. Sample workflow:
-[.github/workflows/dbt-review.yml](.github/workflows/dbt-review.yml).
+[examples/ci-workflows/dbt-review.yml](examples/ci-workflows/dbt-review.yml).
 
 ### Skills ([src/skills.ts](src/skills.ts))
 Each skill's `expand(args)` returns a prompt string injected as a user message. **Skills

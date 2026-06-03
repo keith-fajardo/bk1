@@ -10,7 +10,8 @@
 # GitHub token with pull-requests:write. It only works on same-repo PRs — forked-PR
 # tokens are read-only and the review POST would 403.
 #
-# To use it in your own dbt project, copy this file into <your-repo>/.github/workflows/
+# This is a TEMPLATE — it lives under examples/, NOT .github/workflows/, so it does
+# not run from this repo. To use it, copy this file into <your-repo>/.github/workflows/
 # and set the ANTHROPIC_API_KEY secret. Adjust DBT_PROJECT_DIR if your project isn't
 # at the repo root.
 

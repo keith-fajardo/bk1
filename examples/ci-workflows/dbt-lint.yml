@@ -5,8 +5,9 @@
 # the dbt project, applies the rule set, and (with --fail-on) exits non-zero when
 # violations meet a severity threshold. That exit code is what fails the job.
 #
-# This lints THIS repo's dbt project. To use it in your own dbt project, copy this
-# file into <your-repo>/.github/workflows/ and adjust `working-directory` /
+# This is a TEMPLATE — it lives under examples/, NOT .github/workflows/, so it does
+# not run from this repo. To use it, copy this file into your dbt repo's
+# <your-repo>/.github/workflows/ and adjust `working-directory` /
 # DBT_PROJECT_DIR below to point at the dir containing your dbt_project.yml.
 
 name: dbt-lint
