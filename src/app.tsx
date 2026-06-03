@@ -6,7 +6,7 @@ import { render, Box, Text, Static, useInput, measureElement, type DOMElement } 
 import Spinner from 'ink-spinner';
 import type Anthropic from '@anthropic-ai/sdk';
 import { runAgent, AgentAbortedError, resetAnthropicClient, rebuildSystemPrompt, type TokenUsage } from './agent';
-import { getProjectDir, setProjectDir, isDbtProject, projectAccessError } from './project-dir';
+import { getProjectDir, setProjectDir, isDbtProject, checkProjectAccess } from './project-dir';
 import { lintReportPath, resetDb } from './state';
 import { getRecentProjects, recordRecentProject } from './recent-projects';
 import { bk1AssetsDir } from './bk1-home';
@@ -272,6 +272,31 @@ function ProjectPicker({ recents, currentIdx, typed, current }: {
 function resolvePathEq(a: string, b: string): boolean {
   const norm = (s: string) => s.replace(/\/+$/, '');
   return norm(a) === norm(b);
+}
+
+// The app hosting bk1, derived from $TERM_PROGRAM — this is the process macOS
+// holds TCC decisions against, so it's the one the user must grant access. Used
+// to name it in the Full Disk Access guidance instead of a vague "your terminal".
+function hostTerminalName(): string {
+  const tp = process.env.TERM_PROGRAM ?? '';
+  return {
+    Apple_Terminal: 'Terminal',
+    'iTerm.app': 'iTerm',
+    vscode: 'VS Code',
+    WarpTerminal: 'Warp',
+    WezTerm: 'WezTerm',
+    ghostty: 'Ghostty',
+    Hyper: 'Hyper',
+    Tabby: 'Tabby',
+  }[tp] ?? (tp || 'your terminal app');
+}
+
+// Deep-link straight to System Settings → Privacy & Security → Full Disk Access.
+// macOS won't re-prompt a terminal once it's been denied, so the toggle is the
+// only way back — this lands the user on the exact pane. Mirrors the spawnSync
+// `code` launch used to open files in VS Code.
+function openFullDiskAccessSettings(): void {
+  spawnSync('open', ['x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles'], { stdio: 'ignore' });
 }
 
 // Playroom picker — shown when input starts with "/pet playroom". Mirrors the
@@ -2567,17 +2592,42 @@ function App({ onLogout }: { onLogout: () => void }) {
   // the dir getter, the state DB connection, the agent's system prompt, and the
   // session log. A "Switched project" info line demarcates the kept history.
   // Returns an error string on failure (bad path) so the caller can surface it
-  // without anything having been torn down. Never switches mid-agent-run.
+  // without anything having been torn down. The macOS permission case is handled
+  // in-place (guided Full Disk Access flow) and returns null so the caller adds
+  // nothing further. Never switches mid-agent-run.
   const changeProject = useCallback((rawPath: string): string | null => {
     if (isRunningRef.current) return 'Cannot switch project while the agent is running.';
     const target = rawPath.trim();
     if (!target) return 'No path given.';
     if (!isDbtProject(target)) return `Not a dbt project (no dbt_project.yml): ${target}`;
     // dbt_project.yml exists but may be unreadable (macOS TCC on ~/Desktop etc.).
-    // Fail here rather than half-switching into a session whose system prompt and
+    // Probe here rather than half-switching into a session whose system prompt and
     // file reads would all hit EPERM.
-    const accessErr = projectAccessError(target);
-    if (accessErr) return accessErr;
+    const access = checkProjectAccess(target);
+    if (!access.ok) {
+      // On macOS a denial is almost always TCC: the host terminal lacks Full Disk
+      // Access for the gated folder. Name it and offer a one-key jump to the exact
+      // Settings pane — macOS won't re-prompt once denied, so this is the way back.
+      if (access.denied && process.platform === 'darwin') {
+        const app = hostTerminalName();
+        setMessages(prev => [...prev, { role: 'assistant', info: true, content:
+          `macOS is blocking ${app} from reading files in ${target}.\n\n` +
+          `This is macOS Privacy (TCC) — the Desktop, Documents and Downloads folders are gated per app. ` +
+          `Grant ${app} Full Disk Access, fully quit and relaunch it, then retry /project ${target}.\n\n` +
+          `(Or move the project out of those three folders — anywhere else isn't gated.)` }]);
+        pendingConfirmActionRef.current = {
+          onYes: () => {
+            openFullDiskAccessSettings();
+            setMessages(prev => [...prev, { role: 'assistant', info: true, content:
+              `Opened System Settings → Full Disk Access. Enable ${app}, quit and relaunch it, then retry /project.` }]);
+          },
+          onNo: () => {},
+        };
+        setConfirmPrompt(`Open System Settings → Full Disk Access for ${app} now? (yes/no)`);
+        return null;
+      }
+      return access.message;
+    }
     let resolved: string;
     try { resolved = setProjectDir(target); }
     catch (err) { return err instanceof Error ? err.message : String(err); }

@@ -2,7 +2,7 @@ import { describe, expect, test, afterEach } from 'bun:test';
 import { mkdtempSync, writeFileSync, rmSync, chmodSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { getProjectDir, setProjectDir, isDbtProject, projectAccessError } from '../src/project-dir';
+import { getProjectDir, setProjectDir, isDbtProject, checkProjectAccess } from '../src/project-dir';
 
 // The dir bk1 launched in. Captured before any test mutates it so afterEach can
 // restore it — the project dir is module-global, so a leaked change would
@@ -50,21 +50,25 @@ describe('setProjectDir', () => {
   });
 });
 
-describe('projectAccessError', () => {
-  test('null when dbt_project.yml is readable', () => {
-    expect(projectAccessError(makeDir(true))).toBeNull();
+describe('checkProjectAccess', () => {
+  test('ok when dbt_project.yml is readable', () => {
+    expect(checkProjectAccess(makeDir(true))).toEqual({ ok: true });
   });
 
   // Regression: existsSync (so isDbtProject) passes but readFileSync throws —
-  // the macOS-TCC case that used to crash the TUI on /project switch.
-  test('reports a permission error when dbt_project.yml exists but is unreadable', () => {
+  // the macOS-TCC case that used to crash the TUI on /project switch. The
+  // `denied` flag is what drives the guided Full Disk Access flow.
+  test('flags a permission denial when dbt_project.yml exists but is unreadable', () => {
     const dir = makeDir(true);
     const file = join(dir, 'dbt_project.yml');
     chmodSync(file, 0o000);
     try {
-      const err = projectAccessError(dir);
+      const access = checkProjectAccess(dir);
       // Skip the assertion if the runner can read it anyway (e.g. running as root).
-      if (err !== null) expect(err).toMatch(/permission denied/i);
+      if (!access.ok) {
+        expect(access.denied).toBe(true);
+        expect(access.message).toMatch(/permission denied/i);
+      }
     } finally {
       chmodSync(file, 0o644);  // restore so afterEach can rm the temp dir
     }
