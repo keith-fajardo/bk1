@@ -1,5 +1,5 @@
 import Anthropic from '@anthropic-ai/sdk';
-import { existsSync, readFileSync } from 'fs';
+import { readFileSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 import { SYSTEM_PROMPT } from './system-prompt';
@@ -78,12 +78,21 @@ function extractWarehouseType(profilesYml: string): string | null {
   return null;
 }
 
+// Reading project config for the prompt must never crash the app: a file can
+// exist yet be unreadable (EPERM under macOS TCC for ~/Desktop, ~/Documents,
+// ~/Downloads). A raw readFileSync throw here would propagate through
+// rebuildSystemPrompt() and take down the whole TUI on a /project switch (and at
+// launch). Skip what we can't read; changeProject surfaces the permission error.
+function readIfReadable(path: string): string | null {
+  try { return readFileSync(path, 'utf-8'); }
+  catch { return null; }
+}
+
 function buildSystemPrompt(): string {
   const parts: string[] = [SYSTEM_PROMPT];
 
-  const dbtProjectPath = join(getProjectDir(), 'dbt_project.yml');
-  if (existsSync(dbtProjectPath)) {
-    const dbtProject = readFileSync(dbtProjectPath, 'utf-8');
+  const dbtProject = readIfReadable(join(getProjectDir(), 'dbt_project.yml'));
+  if (dbtProject) {
     parts.push(`## dbt_project.yml (project config — use this for project name, profile, and schema/materialization defaults)\n\n${dbtProject}`);
   }
 
@@ -93,8 +102,9 @@ function buildSystemPrompt(): string {
     join(homedir(), '.dbt', 'profiles.yml'),
   ];
   for (const p of profilesCandidates) {
-    if (existsSync(p)) {
-      const warehouseType = extractWarehouseType(readFileSync(p, 'utf-8'));
+    const yml = readIfReadable(p);
+    if (yml) {
+      const warehouseType = extractWarehouseType(yml);
       if (warehouseType) {
         parts.push(`## Warehouse Adapter\n\n${warehouseType}`);
       }
@@ -102,9 +112,8 @@ function buildSystemPrompt(): string {
     }
   }
 
-  const claudeMdPath = join(getProjectDir(), 'CLAUDE.md');
-  if (existsSync(claudeMdPath)) {
-    const claudeMd = readFileSync(claudeMdPath, 'utf-8');
+  const claudeMd = readIfReadable(join(getProjectDir(), 'CLAUDE.md'));
+  if (claudeMd) {
     parts.push(`## Project Instructions (CLAUDE.md)\n\n${claudeMd}`);
   }
 

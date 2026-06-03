@@ -1,8 +1,8 @@
 import { describe, expect, test, afterEach } from 'bun:test';
-import { mkdtempSync, writeFileSync, rmSync } from 'fs';
+import { mkdtempSync, writeFileSync, rmSync, chmodSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { getProjectDir, setProjectDir, isDbtProject } from '../src/project-dir';
+import { getProjectDir, setProjectDir, isDbtProject, projectAccessError } from '../src/project-dir';
 
 // The dir bk1 launched in. Captured before any test mutates it so afterEach can
 // restore it — the project dir is module-global, so a leaked change would
@@ -47,5 +47,26 @@ describe('setProjectDir', () => {
     const bad = makeDir(false);
     expect(() => setProjectDir(bad)).toThrow(/not a dbt project/i);
     expect(getProjectDir()).toBe(good);  // failed switch must not mutate state
+  });
+});
+
+describe('projectAccessError', () => {
+  test('null when dbt_project.yml is readable', () => {
+    expect(projectAccessError(makeDir(true))).toBeNull();
+  });
+
+  // Regression: existsSync (so isDbtProject) passes but readFileSync throws —
+  // the macOS-TCC case that used to crash the TUI on /project switch.
+  test('reports a permission error when dbt_project.yml exists but is unreadable', () => {
+    const dir = makeDir(true);
+    const file = join(dir, 'dbt_project.yml');
+    chmodSync(file, 0o000);
+    try {
+      const err = projectAccessError(dir);
+      // Skip the assertion if the runner can read it anyway (e.g. running as root).
+      if (err !== null) expect(err).toMatch(/permission denied/i);
+    } finally {
+      chmodSync(file, 0o644);  // restore so afterEach can rm the temp dir
+    }
   });
 });

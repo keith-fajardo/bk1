@@ -6,7 +6,7 @@ import { render, Box, Text, Static, useInput, measureElement, type DOMElement } 
 import Spinner from 'ink-spinner';
 import type Anthropic from '@anthropic-ai/sdk';
 import { runAgent, AgentAbortedError, resetAnthropicClient, rebuildSystemPrompt, type TokenUsage } from './agent';
-import { getProjectDir, setProjectDir, isDbtProject } from './project-dir';
+import { getProjectDir, setProjectDir, isDbtProject, projectAccessError } from './project-dir';
 import { lintReportPath, resetDb } from './state';
 import { getRecentProjects, recordRecentProject } from './recent-projects';
 import { bk1AssetsDir } from './bk1-home';
@@ -2573,6 +2573,11 @@ function App({ onLogout }: { onLogout: () => void }) {
     const target = rawPath.trim();
     if (!target) return 'No path given.';
     if (!isDbtProject(target)) return `Not a dbt project (no dbt_project.yml): ${target}`;
+    // dbt_project.yml exists but may be unreadable (macOS TCC on ~/Desktop etc.).
+    // Fail here rather than half-switching into a session whose system prompt and
+    // file reads would all hit EPERM.
+    const accessErr = projectAccessError(target);
+    if (accessErr) return accessErr;
     let resolved: string;
     try { resolved = setProjectDir(target); }
     catch (err) { return err instanceof Error ? err.message : String(err); }
