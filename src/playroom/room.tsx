@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { Box, Text, useInput } from 'ink';
 import { PlayroomSidecar } from './sidecar';
-import { PetSpriteLine } from '../app';
+import { PetSpriteLine } from './pet-sprite-line';
 import { petSprite, petColorHex, type PetState } from '../pet';
 import { encodeMessage, parseGameMessage } from './messages';
 import { isValidPin, PIN_LENGTH, type PlayerRole } from './relay-protocol';

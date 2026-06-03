@@ -1,3 +1,9 @@
+always check the features memory and check if it's already added
+always check the bug memory and check if the bug is already added
+always add a feature into memory feature if a new feature is added
+always add a bug into memory if new bug is added
+always tag the feature if it's shipped or a do
+always tag a bug if it's fixed or not yet
 # bk1
 
 bk1 is a Terminal UI coding agent for dbt projects. The name comes from "bakawan" — the
@@ -50,6 +56,9 @@ tests/              bun:test suites (aggregation correctness, skill contract)
     bun test            Run all tests
     bun run build:lint  Rebuild the Rust binary only
     bun run build:all   Compile single binary to ~/.local/bin/bk1
+    bun run deps:check  Fail if any import cycle exists (run before structural merges)
+    bun run deps:map    Fan-out summary — which files pull in the most
+    bun run deps:impact <id>  Reverse deps of a file (e.g. deps:impact pet.ts)
 
 `DBT_PROJECT_DIR` overrides the working directory bk1 operates against.
 
@@ -145,6 +154,31 @@ The lint_run response field names are pinned by `LINT_RESPONSE_VIOLATIONS_FIELDS
 parses [src/skills.ts](src/skills.ts) for `violations.<field>` references and fails if
 any reference isn't on the allowlist. This guards against the prior bug where the skill
 silently referenced a non-existent field and the LLM fell back to the wrong one.
+
+### Module dependency map — impact analysis for *this* codebase
+The "Impact-aware editing" section above is bk1's blast radius for *target dbt models*. This
+is the same idea one level up: the blast radius of editing **bk1's own source**. It's powered
+by `madge` (devDependency) over `src/`, surfaced as three scripts — no checked-in graph to go
+stale, the graph is queried fresh each run:
+
+- `bun run deps:check` — `--circular`. Must print "No circular dependency found!". Run it
+  before merging anything structural. A reported cycle is a back-edge to break, and the fix
+  pattern is fixed: extract the shared symbol into a neutral **leaf** module both sides import
+  from. Precedent: `PetSpriteLine` lived in [src/app.tsx](src/app.tsx) while the 7 playroom
+  games imported it back from `../app`, cycling app ⇄ room. Extracting it to the leaf
+  [src/playroom/pet-sprite-line.tsx](src/playroom/pet-sprite-line.tsx) (fan-in 8, fan-out 0)
+  killed all 7 cycles at once.
+- `bun run deps:impact <id>` — "I'm about to change this file, what imports it?" The reverse-
+  dependency list *is* the re-test/re-check scope. Id is relative to `src/`, e.g.
+  `bun run deps:impact pet.ts` or `bun run deps:impact playroom/messages.ts`.
+- `bun run deps:map` — `--summary`, fan-out per file. The hubs (high fan-out: `app.tsx`,
+  `playroom/room.tsx`, `headless-review.ts`) wire many modules together; the high-**fan-in**
+  leaves (`pet.ts`, `bk1-home.ts`, `playroom/{messages,sidecar,relay-protocol}.ts`,
+  `project-dir.ts`) are the danger zone — a change there ripples into 6–11 files. Run the
+  command for the current numbers rather than trusting this list, which is a snapshot.
+
+`madge` is dev-only — it is never imported by `src/`, so `bun build --compile` doesn't bundle
+it into the shipped binary.
 
 ## Conventions for editing this codebase
 

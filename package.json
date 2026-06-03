@@ -16,6 +16,9 @@
     "relay": "bun src/playroom/relay-server.ts",
     "relay:deploy": "cd relay && npx wrangler deploy",
     "relay:dev": "cd relay && npx wrangler dev",
+    "deps:check": "madge --extensions ts,tsx --circular src/",
+    "deps:map": "madge --extensions ts,tsx --summary src/",
+    "deps:impact": "madge --extensions ts,tsx src/ --depends",
     "test": "bun test"
   },
   "dependencies": {
@@ -28,6 +31,7 @@
   "devDependencies": {
     "@types/bun": "latest",
     "@types/react": "^18.3.0",
+    "madge": "^8.0.0",
     "react-devtools-core": "^7.0.1",
     "typescript": "^5.0.0"
   }

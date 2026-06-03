@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { Box, Text, useInput } from 'ink';
-import { PetSpriteLine } from '../app';
+import { PetSpriteLine } from './pet-sprite-line';
 import { petSprite, petSpriteHappy, petSpriteSad, type PetState } from '../pet';
 import type { PlayroomSidecar } from './sidecar';
 import {
