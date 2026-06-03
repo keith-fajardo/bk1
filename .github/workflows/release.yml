@@ -11,8 +11,8 @@ name: Release
 # pushing to main — NOT by hand-tagging. Ordinary pushes that don't change the
 # version no-op at the gate, so the 3-platform matrix never spins up.
 #
-# Tarball layout: bk1, bk1-lint, kimball/kimball.db at the root. bk1 resolves
-# its sidecars sibling-of-binary at runtime (see src/bk1-home.ts).
+# Tarball layout: bk1, bk1-review, bk1-lint, kimball/kimball.db at the root. bk1
+# resolves its sidecars sibling-of-binary at runtime (see src/bk1-home.ts).
 
 on:
   push:
@@ -100,6 +100,11 @@ jobs:
         # that crashes the binary on launch.
         run: bun build --compile --target=${{ matrix.bun_target }} --define process.env.DEV='"false"' --outfile bk1 src/app.tsx
 
+      - name: Compile bk1-review binary
+        # Headless CI review entry (no Ink). Same --define DCE rationale as bk1 above:
+        # harmless here, kept uniform with the TUI build.
+        run: bun build --compile --target=${{ matrix.bun_target }} --define process.env.DEV='"false"' --outfile bk1-review src/headless-review.ts
+
       - name: Stage release artifacts
         run: |
           set -euo pipefail
@@ -107,9 +112,10 @@ jobs:
           STAGE="bk1-${VERSION}-${{ matrix.platform }}"
           mkdir -p "$STAGE/kimball"
           cp bk1 "$STAGE/bk1"
+          cp bk1-review "$STAGE/bk1-review"
           cp sidecars/lint/target/${{ matrix.rust_target }}/release/bk1-lint "$STAGE/bk1-lint"
           cp skills_data/kimball/kimball.db "$STAGE/kimball/kimball.db"
-          chmod +x "$STAGE/bk1" "$STAGE/bk1-lint"
+          chmod +x "$STAGE/bk1" "$STAGE/bk1-review" "$STAGE/bk1-lint"
           tar -czf "${STAGE}.tar.gz" -C "$STAGE" .
           shasum -a 256 "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256"
           echo "STAGE=$STAGE" >> "$GITHUB_ENV"

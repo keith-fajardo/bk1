@@ -28,10 +28,39 @@ struct Args {
     /// Skip SQL static analysis
     #[arg(long)]
     no_sql: bool,
+
+    /// Write the violations JSON to stdout instead of a file. The "written to ..."
+    /// note still goes to stderr, so stdout stays clean for piping in CI.
+    #[arg(long)]
+    stdout: bool,
+
+    /// Exit non-zero if any violation at or above this severity is present.
+    /// One of: blocker, major, minor. Severities rank blocker > major > minor,
+    /// so --fail-on major also fails on blockers. Omit to always exit 0.
+    #[arg(long, value_name = "SEVERITY")]
+    fail_on: Option<String>,
+}
+
+/// blocker > major > minor; higher number = more severe. Unknown severities
+/// rank below minor so a typo can never satisfy a --fail-on threshold silently.
+fn severity_rank(severity: &str) -> u8 {
+    match severity {
+        "blocker" => 3,
+        "major" => 2,
+        "minor" => 1,
+        _ => 0,
+    }
 }
 
 fn main() {
     let args = Args::parse();
+
+    if let Some(threshold) = &args.fail_on {
+        if severity_rank(threshold) == 0 {
+            eprintln!("Error: --fail-on must be one of: blocker, major, minor (got '{threshold}')");
+            std::process::exit(2);
+        }
+    }
 
     let project_root = match PathBuf::from(&args.project_root).canonicalize() {
         Ok(p) => p,
@@ -51,21 +80,6 @@ fn main() {
 
     let project_name = read_project_name(&project_root);
     let claude_info = claude_md::parse(&project_root);
-
-    // Resolve output base: explicit --output-dir wins; otherwise derive from the
-    // binary's own location so the TS caller (which reads from <binary_dir>/data)
-    // and the writer stay in sync without hardcoding any user or path.
-    let base_dir = match &args.output_dir {
-        Some(p) => PathBuf::from(p),
-        None => std::env::current_exe()
-            .ok()
-            .and_then(|exe| exe.parent().map(|p| p.join("data")))
-            .unwrap_or_else(|| PathBuf::from("data")),
-    };
-    let output_dir = base_dir.join(&project_name);
-    fs::create_dir_all(&output_dir).unwrap_or_else(|e| {
-        eprintln!("Warning: could not create output dir: {e}");
-    });
 
     let mut violations: Vec<Violation> = Vec::new();
 
@@ -104,11 +118,45 @@ fn main() {
     let output = build_output(&project_name, violations, select_star_candidates, semantic_queue);
     let json = serde_json::to_string_pretty(&output).expect("serialization failed");
 
-    let violations_path = output_dir.join("violations.json");
-    fs::write(&violations_path, &json).unwrap_or_else(|e| {
-        eprintln!("Warning: could not write violations.json: {e}");
-    });
-    eprintln!("violations.json written to {}", violations_path.display());
+    if args.stdout {
+        println!("{json}");
+        eprintln!("violations.json written to stdout");
+    } else {
+        // Resolve output base: explicit --output-dir wins; otherwise derive from the
+        // binary's own location so the TS caller (which reads from <binary_dir>/data)
+        // and the writer stay in sync without hardcoding any user or path.
+        let base_dir = match &args.output_dir {
+            Some(p) => PathBuf::from(p),
+            None => std::env::current_exe()
+                .ok()
+                .and_then(|exe| exe.parent().map(|p| p.join("data")))
+                .unwrap_or_else(|| PathBuf::from("data")),
+        };
+        let output_dir = base_dir.join(&project_name);
+        fs::create_dir_all(&output_dir).unwrap_or_else(|e| {
+            eprintln!("Warning: could not create output dir: {e}");
+        });
+        let violations_path = output_dir.join("violations.json");
+        fs::write(&violations_path, &json).unwrap_or_else(|e| {
+            eprintln!("Warning: could not write violations.json: {e}");
+        });
+        eprintln!("violations.json written to {}", violations_path.display());
+    }
+
+    // CI gate: exit non-zero when a violation meets or exceeds the --fail-on
+    // threshold. Reported on stderr so it's visible above the JSON in logs.
+    if let Some(threshold) = &args.fail_on {
+        let min_rank = severity_rank(threshold);
+        let failing = output
+            .violations
+            .iter()
+            .filter(|v| severity_rank(&v.severity) >= min_rank)
+            .count();
+        if failing > 0 {
+            eprintln!("Found {failing} violation(s) at or above '{threshold}' severity.");
+            std::process::exit(1);
+        }
+    }
 }
 
 fn read_project_name(root: &Path) -> String {

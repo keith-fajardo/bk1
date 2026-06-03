@@ -1,0 +1,68 @@
+# Sample GitHub Actions workflow: run bk1-lint as a CI gate on a dbt project.
+#
+# bk1-lint is the standalone mechanical linter shipped inside every bk1 release
+# tarball. It needs no Bun, no Rust, no Anthropic API key, and no TTY — it walks
+# the dbt project, applies the rule set, and (with --fail-on) exits non-zero when
+# violations meet a severity threshold. That exit code is what fails the job.
+#
+# This lints THIS repo's dbt project. To use it in your own dbt project, copy this
+# file into <your-repo>/.github/workflows/ and adjust `working-directory` /
+# DBT_PROJECT_DIR below to point at the dir containing your dbt_project.yml.
+
+name: dbt-lint
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    env:
+      # Path to the dbt project root (the dir holding dbt_project.yml). "." = repo root.
+      DBT_PROJECT_DIR: .
+      # Which bk1 release to pull bk1-lint from. "latest" tracks the newest release;
+      # pin to a tag (e.g. v0.4.18) for reproducible CI.
+      BK1_VERSION: latest
+      # Fail the job on violations at or above this severity: blocker | major | minor.
+      FAIL_ON: major
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download bk1-lint
+        run: |
+          set -euo pipefail
+          if [ "$BK1_VERSION" = "latest" ]; then
+            TAG=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName)
+          else
+            TAG="$BK1_VERSION"
+          fi
+          echo "Using bk1 release $TAG"
+          ASSET="bk1-${TAG#v}-linux-x64.tar.gz"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$ASSET" --output bk1.tar.gz
+          # bk1-lint sits at the tarball root alongside bk1 and kimball/.
+          tar -xzf bk1.tar.gz ./bk1-lint
+          chmod +x ./bk1-lint
+        env:
+          # If you copy this into a different repo, point GITHUB_REPOSITORY at the
+          # repo that publishes bk1 releases (owner/name), not your dbt repo.
+          GITHUB_REPOSITORY: keith-fajardo/bk1
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Lint dbt project
+        run: |
+          set -euo pipefail
+          # --stdout writes the violations JSON to stdout (the "written to ..." note
+          # goes to stderr, so the redirect below captures clean JSON).
+          # --fail-on makes the binary exit 1 when a violation meets the threshold.
+          ./bk1-lint "$DBT_PROJECT_DIR" --stdout --fail-on "$FAIL_ON" > violations.json
+
+      - name: Upload violations report
+        # Keep the JSON even when the lint step fails the job, so the report is
+        # downloadable from the run's Artifacts section either way.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bk1-lint-violations
+          path: violations.json

@@ -74,11 +74,57 @@ tests/              bun:test suites (aggregation correctness, skill contract)
    Models with prior violations stay in the queue until explicitly `mark_linted` as clean.
 4. `aggregateViolations` is a pure function — extracted so the response-shape logic is
    unit-testable without spawning the binary.
+5. The binary doubles as a headless CI linter. `--stdout` prints violations.json to
+   stdout; `--fail-on <blocker|major|minor>` exits non-zero past a severity threshold.
+   Both are opt-in — the no-flag path (write to `<binary_dir>/data`, always exit 0) is
+   what `lintRun` relies on, so do not change that default. Sample workflow:
+   [.github/workflows/dbt-lint.yml](.github/workflows/dbt-lint.yml).
+
+### Headless PR review ([src/headless-review.ts](src/headless-review.ts))
+`bk1-review` is a SECOND compiled binary (entry: [src/headless-review.ts](src/headless-review.ts),
+built via `bun run build:review`, staged into the release tarball next to `bk1`/`bk1-lint`).
+It's Ink-free — it drives the same `runAgent` loop the TUI uses, with console callbacks, then
+posts a Copilot-style PR review (inline comments where findings map to changed diff lines, a
+summary comment for the rest). It NEVER edits files.
+
+The split that makes it reliable: **mechanical findings come straight from `lintRun` in-process
+(deterministic, no LLM); the agent only runs the semantic pass.** An earlier all-LLM version
+dropped deterministic findings and intermittently emitted no JSON — don't route mechanical
+violations back through the model. The semantic half is the `lint-deep-headless` skill
+(internal, filtered from `/help` via `INTERNAL_SKILLS`); the binary passes it the queue via
+args and it returns a JSON array of semantic findings only. The pure glue (diff parse, line
+match, payload build, score) lives in [src/review-mapping.ts](src/review-mapping.ts) and is
+unit-tested in [tests/review-mapping.test.ts](tests/review-mapping.test.ts) without the agent
+or network. GitHub I/O is the thin `fetch` layer in [src/github-review.ts](src/github-review.ts).
+Gotchas baked into the code: `--commit` must be the PR HEAD sha (not the merge commit) or
+inline comments 422; `--project-dir` goes through `setProjectDir` (project-dir.ts resolves at
+import, so a late env mutation wouldn't take); the batched review folds comments into the body
+on a 422 so a run never silently posts nothing. Sample workflow:
+[.github/workflows/dbt-review.yml](.github/workflows/dbt-review.yml).
 
 ### Skills ([src/skills.ts](src/skills.ts))
 Each skill's `expand(args)` returns a prompt string injected as a user message. **Skills
 are LLM instructions, not code.** They are brittle by nature — when a skill references a
 structured field of a tool response, add a contract test (see below).
+
+Column-level is two-trigger because the tracer needs *compiled* SQL and `write_file` runs
+before the edit is compiled:
+  1. **On write_file** — `diffColumns` (pure, [src/lineage.ts](src/lineage.ts)) compares old
+     vs new *raw* SQL output columns: removed/added are reliable name-level (no ref()
+     resolution needed), redefined only when both sides trace cleanly. Summarized inline via
+     `formatColumnDiff` and persisted via `recordColumnChanges` → the `pending_column_changes`
+     JSON column on the `models` table ([src/state.ts](src/state.ts)). `incrementalSync` never
+     writes that column, so it survives a sync.
+  2. **On run_dbt_command** — after a successful `compile`/`build`/`run` (exit 0),
+     `postCompileColumnTaint` drains the pending changes for the models that command touched
+     (parsed from `--select`/`-s`/`--models`, else project-wide) and runs `propagateColumnTaint`
+     against the now-fresh `target/compiled` SQL, appending the accurate downstream column taint.
+     This fires only on the agent's *own* explicit dbt call — `write_file` never shells out to
+     dbt itself, preserving the "agent decides when to run dbt" invariant.
+`diffColumns` is unit-tested ([tests/column-diff.test.ts](tests/column-diff.test.ts)); the
+record/drain SQLite round-trip and `postCompileColumnTaint`'s manifest glue are typed but not
+yet covered by a test (no dbt fixture project in-repo). Exposures still aren't in either report
+(manifest exposure shape unverified — no compiled manifest present to check against).
 
 ### Response shape contract
 The lint_run response field names are pinned by `LINT_RESPONSE_VIOLATIONS_FIELDS` in

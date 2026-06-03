@@ -610,6 +610,77 @@ Recompute score and print:
 If new score < 90 with remaining auto-fixable findings, offer another approval round. Otherwise stop and summarise human-only follow-up.`,
   },
 
+  // The SEMANTIC half of the bk1-review CI flow. The binary runs the mechanical linter
+  // itself (deterministic) and computes the score in code; this skill only does the part
+  // that needs an LLM — judging description quality and staging-join complexity — over a
+  // queue of files the binary passes in via args. It emits ONE JSON array of findings and
+  // nothing else. It NEVER edits files, calls mark_linted, or runs dbt — a PR gate must not
+  // rewrite the PR. Not exposed in the TUI command list (filtered by INTERNAL_SKILLS).
+  'lint-deep-headless': {
+    description: 'Headless semantic review for CI — emits findings JSON, never edits',
+    usage: '(internal — bk1-review)',
+    expand: (args) => `Run the semantic half of a CI dbt review over a fixed list of files. No preamble, no questions. Follow these steps EXACTLY — do not improvise.
+
+Files to review (one path per line):
+${args || '(none)'}
+
+Hard rules:
+- The ONLY tools you may use are model_state action="fetch_content" and the agent tool (for sub-agents). NEVER call lint_run, run_dbt_command, bash, write_file, read_file, query_run_results, or any other tool/action.
+- NEVER edit, write, rename, or delete any file. NEVER call mark_linted. NEVER run dbt build/parse/compile. This is read-only.
+- If the file list above is "(none)" or empty, do NOT call any tool — immediately output the empty result \`\`\`json
+[]
+\`\`\` and stop.
+
+## Step 1 — Derive per-rule lists from the file list above
+
+- Rule A → every .yml file
+- Rule C → paths starting with "models/staging/" ending in ".sql"
+
+Skip a rule whose list is empty.
+
+## Step 2 — Spawn one sub-agent per non-empty rule, in parallel
+
+Call the agent tool once per rule in a SINGLE response. Set description= to the short label.
+
+Sub-agent prompt template (fill in RULE, FILE LIST, PROJECTION):
+---
+You are a dbt code reviewer checking one specific rule.
+
+Rule: <RULE>
+
+Files to review:
+<FILE LIST — one path per line>
+
+Instructions:
+- Call model_state action="fetch_content", paths=[<JSON array>], projection="<PROJECTION>" as your FIRST and ONLY tool call. The projection returns a rule-specific slim view, not raw content. Do NOT use read_file. Do NOT call fetch_content without the projection.
+- Each file in the result is delimited by: === <path> ===
+- Check ONLY this rule. "select * from final" and "select * from renamed" are NEVER violations — the column list is explicit in the CTE above. Only flag select * inside transformation CTEs, or when the entire model is a bare "select * from {{ ref(...) }}".
+- evidence MUST be a single verbatim line copied from the file (so it can be located in the diff), not a paraphrase.
+- Return ONLY a JSON array (no narration, no fences): [{"file": "<path>", "severity": "major|minor", "evidence": "<verbatim line>", "suggested_fix": "<change>", "rule": "<RULE short name>"}]
+- Return [] if no violations. Exclude anything you are unsure about (do not emit "ambiguous").
+---
+
+Rule → label → projection → rule short name:
+  A → "Semantic: description quality" → projection="descriptions" → "description_quality"
+  C → "Semantic: staging joins" → projection="sql_compact" → "staging_transformation"
+
+Rule text (verbatim):
+  A: Model and column descriptions must be meaningful and non-trivial. Flag vague descriptions (e.g. "This model contains data", "TODO", single-word, restatement of the model name). Severity: major if model description is trivial, minor if column description is trivial.
+  C: Staging models must not contain heavy joins or transformations. Flag JOIN clauses, GROUP BY, window functions, or complex CASE beyond simple renaming and type casting. Severity: major.
+
+## Step 3 — Merge and emit, then STOP
+
+Concatenate every sub-agent's JSON array. For each finding add "check_type":"semantic" (and ensure "rule" is set). Then output EXACTLY ONE fenced json block — a JSON ARRAY of the findings — and nothing after it:
+
+\`\`\`json
+[{"file":"<path>","severity":"major|minor","evidence":"<verbatim line>","suggested_fix":"<change>","check_type":"semantic","rule":"<short name>"}]
+\`\`\`
+
+If there are no semantic findings, emit \`\`\`json
+[]
+\`\`\`. Do not write anything after the closing fence.`,
+  },
+
   plan: {
     description: 'Plan mode — agent outlines a plan and waits for approval before any tool call',
     usage: '/plan',
@@ -668,7 +739,7 @@ If new score < 90 with remaining auto-fixable findings, offer another approval r
     usage: '/help',
     expand: () => {
       const lines = Object.entries(SKILLS)
-        .filter(([k]) => k !== 'help')
+        .filter(([k]) => k !== 'help' && !INTERNAL_SKILLS.has(k))
         .map(([, s]) => `${s.usage} — ${s.description}`)
         .join('\n');
       return `Print the list of available bk1 slash commands exactly as shown, one per line, no extra commentary:\n\n${lines}\n/help — Show available slash commands`;
@@ -677,8 +748,15 @@ If new score < 90 with remaining auto-fixable findings, offer another approval r
 
 };
 
+// Skills that exist only for non-interactive callers (e.g. the bk1-review binary)
+// and must not appear in /help or the unknown-command suggestion list.
+const INTERNAL_SKILLS = new Set(['lint-deep-headless']);
+
 function commandList(): string {
-  return Object.values(SKILLS).map(s => s.usage).join(', ');
+  return Object.entries(SKILLS)
+    .filter(([k]) => !INTERNAL_SKILLS.has(k))
+    .map(([, s]) => s.usage)
+    .join(', ');
 }
 
 export function expandSkill(input: string): { display: string; prompt: string } | null {

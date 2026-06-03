@@ -1,0 +1,72 @@
+# Sample GitHub Actions workflow: run bk1-review as a Copilot-style PR reviewer.
+#
+# bk1-review is the headless semantic reviewer shipped inside every bk1 release
+# tarball. On a pull request it runs the same /lint-deep pass the TUI runs (mechanical
+# + LLM semantic checks), then posts the findings as a PR review: inline comments on
+# the changed lines it can place, and a summary comment for the rest. It NEVER edits
+# files. With --fail-on it also exits non-zero past a severity threshold, failing the job.
+#
+# Unlike bk1-lint, this needs an Anthropic API key (it drives the agent) and a
+# GitHub token with pull-requests:write. It only works on same-repo PRs — forked-PR
+# tokens are read-only and the review POST would 403.
+#
+# To use it in your own dbt project, copy this file into <your-repo>/.github/workflows/
+# and set the ANTHROPIC_API_KEY secret. Adjust DBT_PROJECT_DIR if your project isn't
+# at the repo root.
+
+name: dbt-review
+
+on:
+  pull_request:
+
+# The default GITHUB_TOKEN needs pull-requests:write to post review comments.
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    env:
+      DBT_PROJECT_DIR: .
+      # Which bk1 release to pull bk1-review from. "latest" tracks the newest release;
+      # pin to a tag (e.g. v0.4.18) for reproducible CI.
+      BK1_VERSION: latest
+      # The repo that PUBLISHES bk1 releases — not your dbt repo. Used only to fetch the
+      # tarball; the review is posted to $GITHUB_REPOSITORY (the PR's repo).
+      BK1_RELEASE_REPO: keith-fajardo/bk1
+      # Fail the job on findings at or above this severity: blocker | major | minor.
+      FAIL_ON: major
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download bk1-review
+        run: |
+          set -euo pipefail
+          if [ "$BK1_VERSION" = "latest" ]; then
+            TAG=$(gh release view --repo "$BK1_RELEASE_REPO" --json tagName -q .tagName)
+          else
+            TAG="$BK1_VERSION"
+          fi
+          echo "Using bk1 release $TAG"
+          ASSET="bk1-${TAG#v}-linux-x64.tar.gz"
+          gh release download "$TAG" --repo "$BK1_RELEASE_REPO" --pattern "$ASSET" --output bk1.tar.gz
+          # bk1-review sits at the tarball root alongside bk1 and bk1-lint.
+          tar -xzf bk1.tar.gz ./bk1-review ./bk1-lint
+          chmod +x ./bk1-review ./bk1-lint
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Review dbt project
+        run: |
+          set -euo pipefail
+          # --commit must be the PR HEAD sha (github.sha is the merge commit, which
+          # would 422 when attaching inline comments).
+          ./bk1-review \
+            --pr "${{ github.event.pull_request.number }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --commit "${{ github.event.pull_request.head.sha }}" \
+            --fail-on "$FAIL_ON"
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

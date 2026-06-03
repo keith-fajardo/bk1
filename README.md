@@ -115,6 +115,31 @@ See [`src/skills.ts`](src/skills.ts) for the full set.
 
 Open it in any browser or VS Code's preview. Inline CSS, no assets, no JS — just a sortable view of the rule summary and per-violation details (severity, file, evidence, suggested fix). Re-running `/lint` overwrites it. Re-running `/lint-deep` checks for the file first and asks before running the (expensive) semantic pass again — saves tokens when you already have a recent baseline.
 
+## Run in CI
+
+The mechanical linter is a standalone binary (`bk1-lint`) that runs headless — no Bun, no Rust, no Anthropic API key, no TTY. Every release tarball ships it alongside `bk1`, so you can gate pull requests on dbt conventions without the interactive TUI.
+
+```
+bk1-lint <dbt_project_dir> --stdout --fail-on major > violations.json
+```
+
+- `--stdout` writes the violations JSON to stdout (the "written to …" note goes to stderr, so the redirect captures clean JSON).
+- `--fail-on <severity>` exits non-zero when any violation meets or exceeds the threshold — `blocker`, `major`, or `minor` (severities rank `blocker > major > minor`, so `--fail-on major` also fails on blockers). Omit it to always exit 0 and just emit the report.
+
+A copy-paste GitHub Actions workflow that downloads `bk1-lint` from the latest release and fails the build on `major`+ violations lives at [`.github/workflows/dbt-lint.yml`](.github/workflows/dbt-lint.yml).
+
+### Copilot-style PR review
+
+`bk1-review` is the headless, review-only counterpart that posts findings directly onto a pull request — inline comments on the changed lines it can place, and a summary comment for the rest. It runs the same checks as `/lint-deep`: the mechanical rules **plus** the LLM semantic pass (description quality, staging-join detection). The mechanical findings are computed deterministically in-binary; only the semantic judgement uses the agent. It never edits files.
+
+```
+bk1-review --pr <n> --repo <owner/name> --commit <head-sha> --fail-on major
+bk1-review --json --project-dir <path>     # print findings JSON, no GitHub
+bk1-review --dry-run --pr <n> --repo <o/r> # print the would-be review, post nothing
+```
+
+Unlike `bk1-lint`, this needs an `ANTHROPIC_API_KEY` (it drives the agent) and a `GITHUB_TOKEN` with `pull-requests: write`. It works on same-repo PRs — forked-PR tokens are read-only. The sample workflow is at [`.github/workflows/dbt-review.yml`](.github/workflows/dbt-review.yml).
+
 ## Pet
 
 bk1 keeps a tiny Tamagotchi-style pixel pet in the status footer. It blinks, tracks the mouse cursor, ages from egg → baby → adult, and has discrete moods (`happy`, `hungry`, `sleepy`, `sad`, `angry`, `wants_to_play`).
