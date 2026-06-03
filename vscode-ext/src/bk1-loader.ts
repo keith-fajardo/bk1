@@ -15,8 +15,10 @@
 // pet.json, usage.db) lives at ~/.bk1 regardless, so it survives extension
 // upgrades and version directory rotation.
 //
-// Older version directories are intentionally left in place — they're small in
-// aggregate and let users roll back the extension without re-downloading.
+// After a successful install we garbage-collect stale version directories,
+// keeping the current version plus the KEEP_RECENT most-recent others so a user
+// can still roll the extension back one or two versions without re-downloading.
+// Each version dir is ~80MB, so unbounded accumulation is the real cost here.
 
 import * as vscode from 'vscode';
 import * as fs from 'fs';
@@ -58,6 +60,50 @@ function isInstalled(root: string): boolean {
   return fs.existsSync(path.join(root, 'bk1'))
       && fs.existsSync(path.join(root, 'bk1-lint'))
       && fs.existsSync(path.join(root, 'kimball', 'kimball.db'));
+}
+
+// How many non-current version dirs to retain for rollback (current is always kept).
+const KEEP_RECENT = 2;
+
+// Descending semver compare. Non-semver names sort last so they're pruned first
+// (they're either junk or a partially-extracted dir from an aborted download).
+function compareVersionsDesc(a: string, b: string): number {
+  const pa = a.split('.').map(Number);
+  const pb = b.split('.').map(Number);
+  if (pa.some(isNaN) || pb.some(isNaN)) {
+    if (pa.some(isNaN) && pb.some(isNaN)) return a < b ? 1 : a > b ? -1 : 0;
+    return pa.some(isNaN) ? 1 : -1;
+  }
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const diff = (pb[i] ?? 0) - (pa[i] ?? 0);
+    if (diff !== 0) return diff;
+  }
+  return 0;
+}
+
+// Remove old version directories under <globalStorage>/bk1/, keeping the current
+// version plus the KEEP_RECENT most-recent others. Best-effort: any failure is
+// swallowed so a stuck/locked dir never blocks activation. Only ever touches
+// children of the bk1/ versioned dir — never ~/.bk1 user data.
+function pruneOldVersions(ctx: vscode.ExtensionContext): void {
+  try {
+    const versionsDir = path.dirname(installRoot(ctx));
+    const entries = fs.readdirSync(versionsDir, { withFileTypes: true })
+      .filter((e) => e.isDirectory())
+      .map((e) => e.name);
+
+    const keep = new Set([BK1_VERSION]);
+    for (const name of entries.filter((n) => n !== BK1_VERSION).sort(compareVersionsDesc).slice(0, KEEP_RECENT)) {
+      keep.add(name);
+    }
+
+    for (const name of entries) {
+      if (keep.has(name)) continue;
+      fs.rmSync(path.join(versionsDir, name), { recursive: true, force: true });
+    }
+  } catch {
+    // best-effort cleanup — disk reclamation is never worth failing activation
+  }
 }
 
 // Follows GitHub's release-asset redirect to S3. Resolves to the final body
@@ -120,7 +166,10 @@ export async function ensureBk1(ctx: vscode.ExtensionContext): Promise<string> {
 
   const platform = detectPlatform();
   const root = installRoot(ctx);
-  if (isInstalled(root)) return path.join(root, 'bk1');
+  if (isInstalled(root)) {
+    pruneOldVersions(ctx);
+    return path.join(root, 'bk1');
+  }
 
   const asset = `bk1-${BK1_VERSION}-${platform.tag}.tar.gz`;
   const url   = `https://github.com/${REPO}/releases/download/v${BK1_VERSION}/${asset}`;
@@ -140,5 +189,6 @@ export async function ensureBk1(ctx: vscode.ExtensionContext): Promise<string> {
     );
   }
 
+  pruneOldVersions(ctx);
   return path.join(root, 'bk1');
 }

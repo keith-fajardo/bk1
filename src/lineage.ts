@@ -446,6 +446,57 @@ function mergeUnion(branches: ColumnLineage[]): ColumnLineage {
   return merged;
 }
 
+// ─── Same-model column diff ──────────────────────────────────────────────────────
+//
+// "Which output columns changed between two versions of a model?" Used by write_file
+// to detect, the instant an edit lands, whether a column was removed/renamed (the case
+// that silently breaks downstream ref('model').col), added, or redefined to derive from
+// different upstream columns. Runs on raw (uncompiled) SQL: added/removed are pure
+// SELECT-list-name comparisons that don't need ref() resolution, so they're reliable
+// pre-compile; redefined is only reported when BOTH sides trace cleanly (sources != null),
+// otherwise the ambiguity is left for the post-compile cross-model trace to resolve.
+
+export interface ColumnDiff {
+  added: string[];
+  removed: string[];
+  // Columns present in both with a different resolved source set. Each entry names the
+  // column; the accurate "what derives from it" answer comes from propagateColumnTaint
+  // after compile.
+  redefined: string[];
+}
+
+function sourceKey(sources: ColumnSource[]): string {
+  return dedupSources(sources).map(s => `${s.table}.${s.column}`).sort().join('|');
+}
+
+export function diffColumns(oldSql: string, newSql: string, dialect: Dialect = 'postgresql'): ColumnDiff {
+  const before = traceColumns(oldSql, dialect);
+  const after = traceColumns(newSql, dialect);
+
+  // If either side failed to parse at all, we can't say anything about column names safely.
+  if (before.fatal || after.fatal) return { added: [], removed: [], redefined: [] };
+
+  const beforeCols = new Set(Object.keys(before.columns));
+  const afterCols = new Set(Object.keys(after.columns));
+
+  const added = [...afterCols].filter(c => !beforeCols.has(c)).sort();
+  const removed = [...beforeCols].filter(c => !afterCols.has(c)).sort();
+
+  const redefined: string[] = [];
+  for (const col of afterCols) {
+    if (!beforeCols.has(col)) continue;
+    const b = before.columns[col];
+    const a = after.columns[col];
+    // Only claim "redefined" when both sides traced to concrete sources and they differ.
+    // null on either side = untraced; don't guess a change that might be a tracer gap.
+    if (b === null || a === null) continue;
+    if (sourceKey(b) !== sourceKey(a)) redefined.push(col);
+  }
+  redefined.sort();
+
+  return { added, removed, redefined };
+}
+
 // ─── Cross-model taint propagation ─────────────────────────────────────────────────
 //
 // Given a target (model, column) and a topological order of downstream models with their

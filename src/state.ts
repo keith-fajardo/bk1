@@ -74,6 +74,11 @@ function getDb(): Database {
   // can detect regressions and fixes. NULL means "never linted to a terminal
   // state" → first lint, grandfathered (no penalty even if violations).
   try { _db.run(`ALTER TABLE models ADD COLUMN prev_lint_status TEXT`); } catch {}
+  // Migration: add pending_column_changes — JSON {added,removed,redefined} recorded by
+  // write_file the moment a model's output columns change, drained by run_dbt_command
+  // after the next compile/build to run the accurate downstream column taint. NULL = none
+  // pending. incrementalSync never touches this column, so it survives a sync untouched.
+  try { _db.run(`ALTER TABLE models ADD COLUMN pending_column_changes TEXT`); } catch {}
   return _db;
 }
 
@@ -795,4 +800,54 @@ export function markModelLinted(
   if (event) emitCoinEvent(event);
 
   return `${name} → ${lintStatus} (${violationCount} violation${violationCount === 1 ? '' : 's'}).`;
+}
+
+// Pending column-change tracking for impact-aware editing. write_file records the
+// column-level diff the moment a model edit lands; run_dbt_command drains it after the
+// next compile/build to run the accurate downstream taint against fresh compiled SQL.
+// The JSON shape mirrors lineage's ColumnDiff ({added,removed,redefined}); kept as a plain
+// record here so state.ts stays decoupled from the (pure) lineage module.
+export interface PendingColumnChanges { added: string[]; removed: string[]; redefined: string[]; }
+
+// Merges into any already-pending changes for the model, so two edits before one compile
+// don't lose the first edit's removed/added columns.
+export function recordColumnChanges(modelName: string, changes: PendingColumnChanges): void {
+  if (!changes.added.length && !changes.removed.length && !changes.redefined.length) return;
+  const db = getDb();
+  const row = db.prepare<{ pending_column_changes: string | null }, [string]>(
+    `SELECT pending_column_changes FROM models WHERE name = ?`,
+  ).get(modelName);
+  if (!row) return; // model not in state yet (new, pre-sync) — nothing to attach to
+
+  const prior: PendingColumnChanges = row.pending_column_changes
+    ? JSON.parse(row.pending_column_changes)
+    : { added: [], removed: [], redefined: [] };
+  const merge = (a: string[], b: string[]) => [...new Set([...a, ...b])].sort();
+  const merged: PendingColumnChanges = {
+    added: merge(prior.added, changes.added),
+    removed: merge(prior.removed, changes.removed),
+    redefined: merge(prior.redefined, changes.redefined),
+  };
+  db.run(`UPDATE models SET pending_column_changes = ? WHERE name = ?`, [JSON.stringify(merged), modelName]);
+}
+
+// Returns and clears pending changes for the given models (those a compile/build touched).
+// Clearing is the point: once we've compiled, the taint we report is authoritative and the
+// pending record has served its purpose.
+export function drainColumnChanges(modelNames: string[]): Record<string, PendingColumnChanges> {
+  if (modelNames.length === 0) return {};
+  const db = getDb();
+  const out: Record<string, PendingColumnChanges> = {};
+  const sel = db.prepare<{ pending_column_changes: string | null }, [string]>(
+    `SELECT pending_column_changes FROM models WHERE name = ?`,
+  );
+  const clear = db.prepare(`UPDATE models SET pending_column_changes = NULL WHERE name = ?`);
+  for (const name of modelNames) {
+    const row = sel.get(name);
+    if (row?.pending_column_changes) {
+      out[name] = JSON.parse(row.pending_column_changes);
+      clear.run(name);
+    }
+  }
+  return out;
 }

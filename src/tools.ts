@@ -1,8 +1,8 @@
 import type Anthropic from '@anthropic-ai/sdk';
 import { existsSync, mkdirSync, writeFileSync, readFileSync, statSync } from 'fs';
 import { resolve, dirname } from 'path';
-import { syncManifestState, getLintQueue, getModelStatus, markModelLinted, fetchContent, resetModelState, lintRun, type Projection } from './state';
-import { propagateColumnTaint, pickDialect, type ModelTraceStatus } from './lineage';
+import { syncManifestState, getLintQueue, getModelStatus, markModelLinted, fetchContent, resetModelState, lintRun, recordColumnChanges, drainColumnChanges, type Projection, type PendingColumnChanges } from './state';
+import { propagateColumnTaint, pickDialect, diffColumns, type ModelTraceStatus } from './lineage';
 import { kimballQuery, type KimballQueryInput } from './kimball';
 import { getProjectDir } from './project-dir';
 import { homedir } from 'os';
@@ -247,8 +247,75 @@ async function runDbtCommand(command: string): Promise<string> {
     new Response(proc.stdout).text(),
     new Response(proc.stderr).text(),
   ]);
-  await proc.exited;
-  return (out + err).trim();
+  const exitCode = await proc.exited;
+  const output = (out + err).trim();
+
+  // Impact-aware editing, second trigger: a successful compile/build/run refreshes
+  // target/compiled, so any column changes write_file recorded can now be traced accurately
+  // through the descendant graph. This runs on the agent's own explicit dbt call — no hidden
+  // dbt invocation — so it respects the "agent decides when to run dbt" invariant.
+  if (exitCode === 0) {
+    const taint = postCompileColumnTaint(parts);
+    if (taint) return `${output}\n\n${taint}`;
+  }
+  return output;
+}
+
+// After a compile/build/run, drain any pending column changes and report which downstream
+// columns now derive from a removed/redefined column. Only the models the command actually
+// recompiled are drained — others keep their pending record until their turn. Returns null
+// when there's nothing pending or nothing traceable.
+function postCompileColumnTaint(parts: string[]): string | null {
+  const verb = parts[1];
+  if (verb !== 'compile' && verb !== 'build' && verb !== 'run') return null;
+
+  const manifestPath = resolve(getProjectDir(), 'target/manifest.json');
+  if (!existsSync(manifestPath)) return null;
+  let manifest: ManifestShape;
+  try { manifest = JSON.parse(readFileSync(manifestPath, 'utf-8')) as ManifestShape; }
+  catch { return null; }
+
+  // Which edited models did this command touch? With an explicit --select, restrict to those
+  // names (stripping dbt graph operators); without one, the run was project-wide so drain all.
+  const editedNames = Object.values(manifest.nodes)
+    .filter(n => n.resource_type === 'model')
+    .map(n => n.name);
+  const selectIdx = parts.findIndex(p => p === '--select' || p === '-s' || p === '--models' || p === '-m');
+  let touched = editedNames;
+  if (selectIdx !== -1) {
+    const selectors = parts.slice(selectIdx + 1).filter(p => !p.startsWith('-'));
+    const wanted = new Set(selectors.map(s => s.replace(/[+@]/g, '').split('.').pop()!));
+    touched = editedNames.filter(n => wanted.has(n));
+  }
+
+  const drained = drainColumnChanges(touched);
+  const dialect = pickDialect(detectDialect());
+  const blocks: string[] = [];
+
+  for (const [model, changes] of Object.entries(drained)) {
+    const cols = [...changes.removed, ...changes.redefined];
+    if (!cols.length) continue;
+    const impact = queryImpactData(manifest, model, 'downstream');
+    if (typeof impact === 'string' || !impact.downstream?.length) continue;
+
+    const modelsInOrder = impact.downstream.map(n => {
+      const full = resolve(getProjectDir(), n.compiled_path);
+      return { name: n.name, compiledSql: existsSync(full) ? readFileSync(full, 'utf-8') : null };
+    });
+
+    for (const col of cols) {
+      const { taint } = propagateColumnTaint({ targetModel: model, targetColumn: col, modelsInOrder, dialect });
+      const hits = Object.entries(taint)
+        .filter(([m]) => m !== model)
+        .map(([m, taintedCols]) => `${m} (${taintedCols.join(', ')})`);
+      const kind = changes.removed.includes(col) ? 'removed' : 'redefined';
+      blocks.push(hits.length
+        ? `${model}.${col} (${kind}) → downstream columns affected: ${hits.join('; ')}.`
+        : `${model}.${col} (${kind}) → no downstream columns trace to it.`);
+    }
+  }
+
+  return blocks.length ? `Column-level impact:\n${blocks.join('\n')}` : null;
 }
 
 // Large-file guard: stops the agent from accidentally slurping multi-megabyte JSON
@@ -280,9 +347,92 @@ function readFile(path: string): string {
 
 function writeFile(path: string, content: string): string {
   const full = safeResolvePath(path);
+  const isModelSql = path.startsWith('models/') && path.endsWith('.sql');
+  // Snapshot the prior content so we only run impact analysis on a real change to an
+  // existing model — a brand-new file has no downstream, and a no-op rewrite shouldn't
+  // pay for a manifest parse.
+  const prior = isModelSql && existsSync(full) ? readFileSync(full, 'utf-8') : null;
+
   mkdirSync(dirname(full), { recursive: true });
   writeFileSync(full, content, 'utf-8');
+
+  if (prior !== null && prior !== content) {
+    const modelName = path.split('/').pop()!.replace(/\.sql$/, '');
+    // Column-level diff on raw SQL — added/removed are reliable pre-compile; redefined only
+    // when both sides trace cleanly. Recorded for the post-compile cross-model taint that
+    // runDbtCommand fires; summarized inline now so a removed column is flagged immediately.
+    const colDiff = diffColumns(prior, content, pickDialect(detectDialect()));
+    recordColumnChanges(modelName, colDiff);
+
+    const parts = [blastRadiusFor(path), formatColumnDiff(colDiff)].filter(Boolean);
+    if (parts.length) return `Wrote ${path}\n\n${parts.join('\n')}`;
+  }
   return `Wrote ${path}`;
+}
+
+// One-line summary of the same-model column diff, appended to the write result. The
+// accurate "which downstream columns this taints" answer comes after the next compile.
+function formatColumnDiff(d: PendingColumnChanges): string | null {
+  const segs: string[] = [];
+  if (d.removed.length) segs.push(`removed ${d.removed.join(', ')}`);
+  if (d.redefined.length) segs.push(`redefined ${d.redefined.join(', ')}`);
+  if (d.added.length) segs.push(`added ${d.added.join(', ')}`);
+  if (!segs.length) return null;
+  const warn = d.removed.length || d.redefined.length
+    ? ' Downstream models selecting these may break — column-level taint will resolve on your next dbt compile/build.'
+    : '';
+  return `Output columns changed: ${segs.join('; ')}.${warn}`;
+}
+
+// Impact-aware editing: after a model is edited, derive its downstream blast radius
+// straight from the manifest and append it to the write result. The agent sees, on every
+// edit, exactly which models and tests are now at risk — so re-test scoping and the
+// explanation it gives the user are grounded in the DAG, not guesswork. Read-derived and
+// deterministic: the graph decides what's affected; the agent only narrates. Returns null
+// when there's nothing to warn about (no manifest, model not yet in it, or no descendants)
+// so the plain "Wrote" path is unchanged.
+function blastRadiusFor(path: string): string | null {
+  const manifestPath = resolve(getProjectDir(), 'target/manifest.json');
+  if (!existsSync(manifestPath)) return null;
+
+  let manifest: ManifestShape;
+  try {
+    manifest = JSON.parse(readFileSync(manifestPath, 'utf-8')) as ManifestShape;
+  } catch {
+    return null;
+  }
+
+  // The model's name is its filename without extension — matches how dbt names model nodes.
+  const modelName = path.split('/').pop()!.replace(/\.sql$/, '');
+  const result = queryImpactData(manifest, modelName, 'downstream');
+  if (typeof result === 'string') return null; // not in manifest yet (e.g. new model pre-compile)
+  return formatBlastRadius(result);
+}
+
+// Pure transform — formats a downstream ImpactResult into the report appended to write_file.
+// Extracted so the report shape is unit-testable without a manifest on disk. Returns null
+// when there are no descendants (nothing to warn about).
+export function formatBlastRadius(result: ImpactResult): string | null {
+  const modelName = result.model.name;
+  const downstream = result.downstream ?? [];
+  if (downstream.length === 0) return null;
+
+  const testCount = downstream.reduce((n, d) => n + d.tests.length, 0)
+    + result.model.tests.length;
+  const byLayer = Object.entries(result.by_layer)
+    .map(([layer, n]) => `${n} ${layer}`)
+    .join(', ');
+  // Direct dependents are the ones most likely to break; name them, then summarize the tail.
+  const direct = downstream.filter(d => d.depth === 1).map(d => d.name);
+  const directList = direct.slice(0, 8).join(', ') + (direct.length > 8 ? `, +${direct.length - 8} more` : '');
+
+  const lines = [
+    `Downstream impact of editing ${modelName}: ${downstream.length} models (${byLayer}), ${testCount} tests at risk.`,
+    `Directly depends on it: ${directList}.`,
+    `Re-test with: dbt build --select ${modelName}+`,
+    `For column-level blast radius (which downstream columns derive from a changed column), use query_manifest impact with column=.`,
+  ];
+  return lines.join('\n');
 }
 
 async function listFiles(pattern: string): Promise<string> {

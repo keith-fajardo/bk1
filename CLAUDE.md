@@ -107,6 +107,19 @@ Each skill's `expand(args)` returns a prompt string injected as a user message. 
 are LLM instructions, not code.** They are brittle by nature — when a skill references a
 structured field of a tool response, add a contract test (see below).
 
+### Impact-aware editing ([src/tools.ts](src/tools.ts))
+`write_file` is not a dumb writer. When it edits an *existing* model SQL file and the
+content actually changed, it derives the downstream blast radius from the manifest
+(`blastRadiusFor` → `queryImpactData`, the same pure path `query_manifest impact` uses) and
+appends a report — affected models by layer, tests at risk, the `dbt build --select model+`
+re-test selector — to the `Wrote ...` result. This is structural, not a prompt suggestion:
+the DAG decides what's affected so the agent can't skip it under pressure. Read-derived and
+deterministic; the agent only narrates. No-op rewrites and brand-new files take the plain
+path (no manifest parse). The report-formatting half is `formatBlastRadius` (pure, tested in
+[tests/impact-blast-radius.test.ts](tests/impact-blast-radius.test.ts)). Behavior rule 5 in
+[src/system-prompt.ts](src/system-prompt.ts) tells the agent to treat the report as
+authoritative and scope re-tests to it.
+
 Column-level is two-trigger because the tracer needs *compiled* SQL and `write_file` runs
 before the edit is compiled:
   1. **On write_file** — `diffColumns` (pure, [src/lineage.ts](src/lineage.ts)) compares old

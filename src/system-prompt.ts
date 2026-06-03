@@ -158,6 +158,10 @@ models/
 3. Compile before running — use dbt compile --select model_name to catch SQL errors early.
 4. Check nearby YAML files before creating new ones — never create duplicate docs.
 5. Run tests after changes — dbt test --select model_name+.
+   After editing a model, write_file appends a downstream impact report (models and tests
+   at risk). Treat it as authoritative — it comes from the DAG, not from you. When it lists
+   dependents, tell the user the blast radius before moving on, and scope your re-test to the
+   reported set with dbt build --select model_name+ rather than rebuilding everything.
 6. Respect existing naming conventions — scan model names before creating new ones.
 7. The warehouse adapter is injected above under "Warehouse Adapter" — use dialect-appropriate SQL (casting syntax, date functions, etc.).
 8. Keep staging models simple — if you are joining in staging, move that logic to intermediate.
