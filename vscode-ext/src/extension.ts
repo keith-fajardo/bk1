@@ -4,6 +4,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { ensureBk1 } from './bk1-loader';
 import { recordTerminal, forgetTerminal, reapOrphans } from './process-registry';
+import { Bk1ChatViewProvider } from './chat-view';
 
 const CONTEXT_DIR  = path.join(os.homedir(), '.bk1');
 const CONTEXT_FILE = path.join(CONTEXT_DIR, 'ide-context.json');
@@ -270,6 +271,13 @@ function timeAgo(iso: string): string {
 export function activate(context: vscode.ExtensionContext) {
   statusProvider = new StatusProvider();
   logProvider    = new LogProvider();
+
+  const chatProvider = new Bk1ChatViewProvider(context, () => bk1Terminal);
+  context.subscriptions.push(
+    vscode.window.registerWebviewViewProvider(Bk1ChatViewProvider.viewId, chatProvider, {
+      webviewOptions: { retainContextWhenHidden: true },
+    }),
+  );
 
   // Maintain a context key that's true exactly when bk1's terminal is the
   // active one. The Ctrl+T / Ctrl+L keybindings in package.json are gated on
