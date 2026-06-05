@@ -55,6 +55,19 @@ function withMessageCache(messages: Anthropic.MessageParam[]): Anthropic.Message
 const CACHED_TOOLS           = withToolCache(TOOLS);
 const CACHED_SUB_AGENT_TOOLS = withToolCache(SUB_AGENT_TOOLS);
 
+// Models that support adaptive/interleaved thinking.
+// Haiku (used by sub-agents and the router) does not — exclude it.
+const THINKING_CAPABLE_MODELS = new Set([
+  'claude-opus-4-8',
+  'claude-opus-4-7',
+  'claude-opus-4-6',
+  'claude-sonnet-4-6',
+]);
+
+function supportsThinking(model: string): boolean {
+  return THINKING_CAPABLE_MODELS.has(model);
+}
+
 const SUB_AGENT_SYSTEM = `\
 You are a focused dbt sub-agent. Execute the task using the available tools, then return your \
 findings exactly as instructed. Be precise and concise.
@@ -237,8 +250,16 @@ export interface TokenUsage {
 
 export interface AgentCallbacks {
   onText: (chunk: string) => void;
+  // Fired with each thinking block's text after a response arrives, before tools run.
+  // Only fires when the model actually chose to think (adaptive mode may skip it on
+  // simple turns). The text may be a summary when display:"summarized" is in effect.
+  onThinking?: (text: string) => void;
   onToolStart: (name: string, input: Record<string, unknown>) => void;
   onToolEnd: (name: string, result: string) => void;
+  // Step confirmation gate. When provided, tools run sequentially and each call is
+  // gated behind this callback. Return true to execute, false to skip with a
+  // "user declined" result so the model can handle it gracefully.
+  onToolConfirm?: (name: string, input: Record<string, unknown>) => Promise<boolean>;
   // model is the actual Anthropic model that produced these tokens. subAgentLabel is
   // set only when the usage came from a sub-agent (the `agent` tool); it carries the
   // sub-agent's `description` so /usage can attribute Haiku spend to specific rules.
@@ -259,6 +280,7 @@ function extractUsage(u: Anthropic.Message['usage']): TokenUsage {
 
 interface SubAgentResult { text: string; usage: TokenUsage; }
 
+// Sub-agents use Haiku, which does not support extended thinking — no thinking param here.
 async function runSubAgent(prompt: string, signal?: AbortSignal): Promise<SubAgentResult> {
   const messages: Anthropic.MessageParam[] = [{ role: 'user', content: prompt }];
   const usage: TokenUsage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
@@ -358,6 +380,36 @@ async function routeModel(
   return { model: ROUTER_FALLBACK_MODEL, classification: 'medium' };
 }
 
+// Shared helper: execute a single tool block, firing onToolStart / onToolEnd.
+// Keeps the sequential and concurrent paths DRY.
+async function executeToolBlock(
+  block: Anthropic.ToolUseBlock,
+  callbacks: AgentCallbacks,
+  signal?: AbortSignal,
+): Promise<{ type: 'tool_result'; tool_use_id: string; content: string }> {
+  const input = block.input as Record<string, unknown>;
+  const label = block.name === 'agent'
+    ? ((input.description as string | undefined) ?? 'sub-agent')
+    : block.name;
+
+  callbacks.onToolStart(label, input);
+
+  let result: string;
+  if (block.name === 'agent') {
+    const subAgentLabel = (input.description as string | undefined) ?? 'sub-agent';
+    const { text, usage } = await throttleSubAgents(() =>
+      runSubAgent(input.prompt as string, signal),
+    );
+    callbacks.onUsage?.(usage, SUB_AGENT_MODEL, subAgentLabel);
+    result = text;
+  } else {
+    result = await executeTool(block.name, input);
+  }
+
+  callbacks.onToolEnd(label, result);
+  return { type: 'tool_result', tool_use_id: block.id, content: result };
+}
+
 export async function runAgent(
   history: Anthropic.MessageParam[],
   callbacks: AgentCallbacks,
@@ -382,6 +434,12 @@ export async function runAgent(
     mode === 'auto' ? RESOLVED_SYSTEM_PROMPT + AUTO_MODE_SUFFIX :
     RESOLVED_SYSTEM_PROMPT;
 
+  // Adaptive thinking is only supported on Claude 4 Sonnet and Opus models — not Haiku.
+  // When enabled, adaptive mode automatically interleaves thinking between tool calls so
+  // the model can reason about each result before deciding the next step (matching how
+  // Claude Code behaves internally). The model decides when and how much to think.
+  const useThinking = supportsThinking(effectiveModel);
+
   while (true) {
     if (signal?.aborted) throw new AgentAbortedError();
 
@@ -392,11 +450,28 @@ export async function runAgent(
         system: cachedSystem(effectiveSystem),
         messages: withMessageCache(messages),
         tools: CACHED_TOOLS,
+        ...(useThinking ? { thinking: { type: 'adaptive' as const } } : {}),
       }, { signal });
       stream.on('text', callbacks.onText);
       return stream.finalMessage();
     });
+
     callbacks.onUsage?.(extractUsage(response.usage), effectiveModel);
+
+    // Surface thinking blocks before tools execute so the UI can show the model's
+    // reasoning alongside the tool it's about to run. Fires once per thinking block;
+    // adaptive mode may produce zero, one, or several thinking blocks per turn.
+    if (callbacks.onThinking) {
+      for (const block of response.content) {
+        if (block.type === 'thinking') {
+          callbacks.onThinking(block.thinking);
+        }
+      }
+    }
+
+    // Preserve ALL content blocks — including thinking blocks with their signatures —
+    // so the model can continue its reasoning chain across turns. Stripping thinking
+    // blocks here would break interleaved reasoning continuity.
     messages.push({ role: 'assistant', content: response.content });
 
     if (response.stop_reason !== 'tool_use') break;
@@ -406,30 +481,41 @@ export async function runAgent(
       (b): b is Anthropic.ToolUseBlock => b.type === 'tool_use',
     );
 
-    // All tool calls in a single turn run concurrently — agent calls included
-    const toolResults = await Promise.all(
-      toolBlocks.map(async (block) => {
+    let toolResults: Array<{ type: 'tool_result'; tool_use_id: string; content: string }>;
+
+    if (callbacks.onToolConfirm) {
+      // Sequential execution with per-step confirmation. Each tool call waits for the
+      // user to approve before running. Declined calls get a graceful "user declined"
+      // result so the model can acknowledge and ask how to proceed rather than looping.
+      toolResults = [];
+      for (const block of toolBlocks) {
+        if (signal?.aborted) throw new AgentAbortedError();
+
         const input = block.input as Record<string, unknown>;
         const label = block.name === 'agent'
           ? ((input.description as string | undefined) ?? 'sub-agent')
           : block.name;
 
-        callbacks.onToolStart(label, input);
-
-        let result: string;
-        if (block.name === 'agent') {
-          const subAgentLabel = (input.description as string | undefined) ?? 'sub-agent';
-          const { text, usage } = await throttleSubAgents(() => runSubAgent(input.prompt as string, signal));
-          callbacks.onUsage?.(usage, SUB_AGENT_MODEL, subAgentLabel);
-          result = text;
-        } else {
-          result = await executeTool(block.name, input);
+        const confirmed = await callbacks.onToolConfirm(label, input);
+        if (!confirmed) {
+          toolResults.push({
+            type: 'tool_result',
+            tool_use_id: block.id,
+            content: '[User declined this tool call. Acknowledge and ask how to proceed.]',
+          });
+          continue;
         }
 
-        callbacks.onToolEnd(label, result);
-        return { type: 'tool_result' as const, tool_use_id: block.id, content: result };
-      }),
-    );
+        toolResults.push(await executeToolBlock(block, callbacks, signal));
+      }
+    } else {
+      // Concurrent execution — original behaviour, unchanged.
+      // All tool calls in a single turn run in parallel; agent calls are throttled
+      // by the semaphore to stay within the 30K input-tokens/minute rate limit.
+      toolResults = await Promise.all(
+        toolBlocks.map(block => executeToolBlock(block, callbacks, signal)),
+      );
+    }
 
     messages.push({ role: 'user', content: toolResults });
   }
