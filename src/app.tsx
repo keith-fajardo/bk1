@@ -5,7 +5,7 @@ import { spawnSync } from 'node:child_process';
 import { render, Box, Text, Static, useInput, measureElement, type DOMElement } from 'ink';
 import Spinner from 'ink-spinner';
 import type Anthropic from '@anthropic-ai/sdk';
-import { runAgent, AgentAbortedError, resetAnthropicClient, rebuildSystemPrompt, type TokenUsage } from './agent';
+import { runAgent, AgentAbortedError, resetAnthropicClient, rebuildSystemPrompt, summarizePrompt, type TokenUsage } from './agent';
 import { getProjectDir, setProjectDir, isDbtProject, checkProjectAccess } from './project-dir';
 import { lintReportPath, resetDb } from './state';
 import { getRecentProjects, recordRecentProject } from './recent-projects';
@@ -16,7 +16,7 @@ import { readIdeContextBlock, readIdeContextRaw, type IdeContext } from './ide-c
 import { SKILLS, expandSkill } from './skills';
 import { getStoredKey, storeKey, clearStoredKey, isValidKeyShape, authFilePath, getStoredAdminKey, storeAdminKey } from './auth';
 import { estimateCostUsd, formatUsd } from './pricing';
-import { recordProjectUsage, loadProjectTotals, type ProjectTotals } from './project-usage';
+import { recordProjectUsage, loadProjectTotals, recordTurnCost, updateTurnSummary, loadTurnHistory, type ProjectTotals, type TurnHistoryRow } from './project-usage';
 import { createUsageState, recordUsage, buildReport, renderReport, classifyTurnLabel, getOrgUsage, getOrgUsageSeries, peekOrgUsageText, peekOrgUsageSeries, orgUsageFetchedAt, requestRefresh, type UsageState } from './usage';
 import {
   loadPet, savePet, newPet, tickPet, petFace, petFaceEating,
@@ -69,7 +69,7 @@ const WORDMARK = [
 ];
 
 interface ToolEvent { name: string; result?: string; }
-interface TokenTotals { input: number; output: number; cacheRead: number; }
+interface TokenTotals { input: number; output: number; cacheRead: number; cacheWrite: number; costUsd: number; }
 interface Message { role: 'user' | 'assistant'; content: string; tools?: ToolEvent[]; tokens?: TokenTotals; info?: boolean; }
 
 const CMD_COL_WIDTH = 16;
@@ -484,6 +484,9 @@ function TokenBadge({ tokens, dim }: { tokens: TokenTotals; dim?: boolean }) {
       <Text color={col}>tokens</Text>
       {tokens.cacheRead > 0 && (
         <><Text color={col}>·</Text><Text color={dim ? '#3D6650' : '#5A8060'}>{fmtTokens(tokens.cacheRead)} cached</Text></>
+      )}
+      {tokens.costUsd > 0 && (
+        <><Text color={col}>·</Text><Text color={valCol}>{formatUsd(tokens.costUsd)}</Text></>
       )}
     </Box>
   );
@@ -1459,6 +1462,9 @@ function UsagePanel({
   const [refreshNonce, setRefreshNonce] = useState(0);
   const [refreshNotice, setRefreshNotice] = useState<string | null>(null);
   const refreshable = tab === 'usage' || tab === 'stats';
+  // Tracks whether the ProjectsTab prompts overlay is open (and at which level)
+  // so this panel's own useInput can yield control to the overlay.
+  const [promptsView, setPromptsView] = useState<null | 'list' | 'detail'>(null);
 
   useInput((inputChar, key) => {
     if (key.escape) { onExit(); return; }
@@ -1485,7 +1491,7 @@ function UsagePanel({
       else if (inputChar === 'd') setGranularity('daily');
       else if (inputChar === 'h') setGranularity('hourly');
     }
-  });
+  }, { isActive: promptsView === null });
 
   return (
     <Box flexDirection="column" paddingX={2} paddingTop={1}>
@@ -1494,14 +1500,16 @@ function UsagePanel({
         {tab === 'status'  && <StatusTab model={model} mode={mode} terminalMode={terminalMode} adminKey={adminKey} />}
         {tab === 'usage'   && <UsageTab adminKey={adminKey} refreshNonce={refreshNonce} />}
         {tab === 'stats'    && <StatsTab adminKey={adminKey} granularity={granularity} metric={metric} refreshNonce={refreshNonce} />}
-        {tab === 'projects' && <ProjectsTab />}
+        {tab === 'projects' && <ProjectsTab onViewChange={setPromptsView} />}
         {tab === 'session'  && <SessionTab usageState={usageState} />}
       </Box>
       <Box marginTop={1} flexDirection="column">
         <Text color="#3D6650">
-          Tab next · Shift+Tab prev · Esc close
-          {refreshable && ' · r refresh'}
-          {tab === 'stats' && ' · m/d/h granularity · t/$ metric'}
+          {promptsView === 'detail'
+            ? 'Esc back to list'
+            : promptsView === 'list'
+              ? '↑↓ navigate · Enter open · Esc back'
+              : `Tab next · Shift+Tab prev · Esc close${refreshable ? ' · r refresh' : ''}${tab === 'stats' ? ' · m/d/h granularity · t/$ metric' : ''}${tab === 'projects' ? ' · p recent prompts' : ''}`}
         </Text>
         {refreshNotice && <Text color="#E0A060">{refreshNotice}</Text>}
       </Box>
@@ -1734,73 +1742,215 @@ function StatsTab({
   );
 }
 
-function ProjectsTab() {
-  // Lifetime per-dbt-project breakdown sourced from ~/.bk1/usage.db. Re-loaded
-  // on each /usage open (the panel unmounts when you Esc out, so this effect
-  // fires fresh next time). Sorted by cost desc so the heaviest projects sit
-  // at the top.
-  const [rows, setRows] = useState<ProjectTotals[] | null>(null);
+function relTime(ts: number): string {
+  const m = Math.floor((Date.now() - ts) / 60_000);
+  if (m < 1)  return 'just now';
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  const d = Math.floor(h / 24);
+  if (d < 7)  return `${d}d ago`;
+  return new Date(ts).toLocaleDateString('en', { month: 'short', day: 'numeric' });
+}
+
+function ProjectsTab({ onViewChange }: { onViewChange: (v: null | 'list' | 'detail') => void }) {
+  const [rows, setRows]       = useState<ProjectTotals[] | null>(null);
+  const [history, setHistory] = useState<TurnHistoryRow[] | null>(null);
+  const [view, setView]       = useState<null | 'list' | 'detail'>(null);
+  const [selIdx, setSelIdx]   = useState(0);
 
   useEffect(() => {
     setRows(loadProjectTotals());
+    setHistory(loadTurnHistory(30));
   }, []);
 
+  const navigate = (v: null | 'list' | 'detail') => { setView(v); onViewChange(v); };
+
+  useInput((inputChar, key) => {
+    const len = history?.length ?? 0;
+    if (view === null) {
+      if (inputChar === 'p' && len > 0) { setSelIdx(0); navigate('list'); }
+      return;
+    }
+    if (view === 'list') {
+      if (key.upArrow)   { setSelIdx(i => Math.max(0, i - 1)); return; }
+      if (key.downArrow) { setSelIdx(i => Math.min(len - 1, i + 1)); return; }
+      if (key.return)    { navigate('detail'); return; }
+      if (key.escape)    { navigate(null); return; }
+      return;
+    }
+    if (view === 'detail') {
+      if (key.escape) { navigate('list'); return; }
+    }
+  });
+
   if (rows === null) return <Text color="#5A8060">Loading…</Text>;
-  if (rows.length === 0) {
+
+  const home    = process.env.HOME ?? '';
+  const display = (p: string) => home && p.startsWith(home) ? '~' + p.slice(home.length) : p;
+
+  // ── FULL DETAIL VIEW ────────────────────────────────────────────────────────
+  if (view === 'detail') {
+    const h = history?.[selIdx];
+    if (!h) return null;
+    const model = h.primaryModel.replace(/^claude-/, '');
     return (
       <Box flexDirection="column">
-        <Text color="#5A8060">No locally tracked usage yet.</Text>
-        <Text color="#3D6650">bk1 records one row per LLM call to ~/.bk1/usage.db — come back after a session or two.</Text>
+        <Box gap={2}>
+          <Text color="#7AB890" bold>{h.turnLabel}</Text>
+          <Text color="#3D6650">·</Text>
+          <Text color="#5A8060">{model}</Text>
+          <Text color="#3D6650">·</Text>
+          <Text color="#3D6650">{relTime(h.ts)}</Text>
+        </Box>
+        <Box marginTop={1} flexDirection="column" gap={0}>
+          <Box gap={2}>
+            <Text color="#5A8060">Cost</Text>
+            <Text color="#C0FAD2">{formatUsd(h.costUsd)}</Text>
+          </Box>
+          <Box gap={2}>
+            <Text color="#5A8060">Tokens</Text>
+            <Text color="#C0FAD2">↑ {fmtTokens(h.inputTokens)}  ↓ {fmtTokens(h.outputTokens)}</Text>
+          </Box>
+        </Box>
+        {h.summary && (
+          <Box marginTop={1} flexDirection="column">
+            <Text color="#5A8060">Summary</Text>
+            <Text color="#C0FAD2">{h.summary}</Text>
+          </Box>
+        )}
+        <Box marginTop={1} flexDirection="column">
+          <Text color="#5A8060">Prompt</Text>
+          <Text color="#C0FAD2">{h.promptText}</Text>
+        </Box>
       </Box>
     );
   }
 
-  const maxCost   = Math.max(...rows.map(r => r.costUsd));
+  // ── LIST + DETAIL PANE VIEW ──────────────────────────────────────────────────
+  if (view === 'list') {
+    const cols     = process.stdout.columns ?? 80;
+    const listW    = 44;
+    const detailW  = Math.max(20, cols - listW - 7); // 7 = paddingX(2)*2 + separator(3)
+    const snippet  = (h: TurnHistoryRow) => {
+      const src = h.summary || h.promptText;
+      return src.length > 28 ? src.slice(0, 27) + '…' : src;
+    };
+    const sel = history?.[selIdx];
+    return (
+      <Box flexDirection="row" gap={1}>
+        {/* Left: list */}
+        <Box flexDirection="column" width={listW} flexShrink={0}>
+          {(history ?? []).map((h, i) => {
+            const active = i === selIdx;
+            return (
+              <Box key={i} gap={1}>
+                <Text color={active ? '#C0FAD2' : '#3D6650'}>{active ? '▶' : ' '}</Text>
+                <Box width={8} flexShrink={0}>
+                  <Text color={active ? '#7AB890' : '#3D6650'}>{relTime(h.ts)}</Text>
+                </Box>
+                <Box width={7} flexShrink={0}>
+                  <Text color={active ? '#C0FAD2' : '#5A8060'}>{formatUsd(h.costUsd)}</Text>
+                </Box>
+                <Text color={active ? '#C0FAD2' : '#5A8060'}>{snippet(h)}</Text>
+              </Box>
+            );
+          })}
+        </Box>
+        {/* Separator */}
+        <Box flexDirection="column">
+          {(history ?? []).map((_, i) => (
+            <Text key={i} color="#3D6650">│</Text>
+          ))}
+        </Box>
+        {/* Right: details of selected turn */}
+        <Box flexDirection="column" width={detailW}>
+          {sel ? (
+            <>
+              <Box gap={1} flexWrap="wrap">
+                <Text color="#7AB890">{sel.turnLabel}</Text>
+                <Text color="#3D6650">·</Text>
+                <Text color="#5A8060">{sel.primaryModel.replace(/^claude-/, '')}</Text>
+              </Box>
+              <Box marginTop={1} flexDirection="column">
+                <Box gap={1}>
+                  <Text color="#5A8060">Cost</Text>
+                  <Text color="#C0FAD2">{formatUsd(sel.costUsd)}</Text>
+                </Box>
+                <Box gap={1}>
+                  <Text color="#5A8060">↑</Text><Text color="#C0FAD2">{fmtTokens(sel.inputTokens)}</Text>
+                  <Text color="#5A8060">↓</Text><Text color="#C0FAD2">{fmtTokens(sel.outputTokens)}</Text>
+                </Box>
+              </Box>
+              {(sel.summary || sel.promptText) && (
+                <Box marginTop={1} flexDirection="column">
+                  <Text color="#5A8060">{sel.summary ? 'Summary' : 'Prompt'}</Text>
+                  <Box width={detailW}>
+                    <Text color="#C0FAD2" wrap="wrap">{sel.summary || sel.promptText}</Text>
+                  </Box>
+                </Box>
+              )}
+            </>
+          ) : null}
+        </Box>
+      </Box>
+    );
+  }
+
+  // ── NORMAL (project bars) VIEW ───────────────────────────────────────────────
+  const maxCost   = Math.max(0.000001, ...rows.map(r => r.costUsd));
   const totalUsd  = rows.reduce((s, r) => s + r.costUsd, 0);
   const totalTok  = rows.reduce((s, r) => s + r.tokens, 0);
   const totalCall = rows.reduce((s, r) => s + r.callCount, 0);
-
-  // Collapse $HOME prefix so paths read as "~/work/dbt-acme" instead of
-  // "/Users/long-name/work/dbt-acme" — keeps the column narrow.
-  const home = process.env.HOME ?? '';
-  const display = (p: string) => home && p.startsWith(home) ? '~' + p.slice(home.length) : p;
-  const pathW   = Math.max(8, ...rows.map(r => display(r.projectPath).length));
-  const barW    = 18;
+  const pathW     = Math.max(8, ...rows.map(r => display(r.projectPath).length));
+  const barW      = 18;
 
   return (
     <Box flexDirection="column">
       <Text color="#5A8060">bk1-tracked sessions only · lifetime · sorted by cost</Text>
-      <Box marginTop={1} flexDirection="column">
-        {rows.map((r, i) => {
-          const filled = Math.max(1, Math.round((r.costUsd / maxCost) * barW));
-          return (
-            <Box key={i} gap={1}>
-              <Box width={pathW} flexShrink={0}>
-                <Text color="#C0FAD2">{display(r.projectPath)}</Text>
+      {rows.length === 0 ? (
+        <Text color="#3D6650">No data yet — come back after a session or two.</Text>
+      ) : (
+        <Box marginTop={1} flexDirection="column">
+          {rows.map((r, i) => {
+            const filled = Math.max(1, Math.round((r.costUsd / maxCost) * barW));
+            return (
+              <Box key={i} gap={1}>
+                <Box width={pathW} flexShrink={0}>
+                  <Text color="#C0FAD2">{display(r.projectPath)}</Text>
+                </Box>
+                <Box width={10} flexShrink={0}>
+                  <Text color="#C0FAD2">{formatUsd(r.costUsd)}</Text>
+                </Box>
+                <Box width={12} flexShrink={0}>
+                  <Text color="#5A8060">{fmtTokens(r.tokens)} tok</Text>
+                </Box>
+                <Text backgroundColor="#6B5E8C">{' '.repeat(filled)}</Text>
+                <Text color="#3D6650">{r.callCount} call{r.callCount === 1 ? '' : 's'}</Text>
               </Box>
-              <Box width={10} flexShrink={0}>
-                <Text color="#C0FAD2">{formatUsd(r.costUsd)}</Text>
-              </Box>
-              <Box width={12} flexShrink={0}>
-                <Text color="#5A8060">{fmtTokens(r.tokens)} tok</Text>
-              </Box>
-              <Text backgroundColor="#6B5E8C">{' '.repeat(filled)}</Text>
-              <Text color="#3D6650">{r.callCount} call{r.callCount === 1 ? '' : 's'}</Text>
-            </Box>
-          );
-        })}
-      </Box>
+            );
+          })}
+        </Box>
+      )}
       <Box marginTop={1} flexDirection="column">
         <Box gap={2}>
-          <Text color="#5A8060">Total tracked:</Text>
+          <Text color="#5A8060">Total:</Text>
           <Text color="#C0FAD2">{formatUsd(totalUsd)}</Text>
           <Text color="#5A8060">·</Text>
           <Text color="#C0FAD2">{fmtTokens(totalTok)} tok</Text>
           <Text color="#5A8060">·</Text>
           <Text color="#C0FAD2">{totalCall} calls</Text>
         </Box>
-        <Text color="#3D6650">Locally tracked. Anthropic Admin totals (Usage tab) may be higher if other tools share the org.</Text>
+        <Text color="#3D6650">Locally tracked. Anthropic Admin totals may be higher if other tools share the org.</Text>
       </Box>
+      {history && history.length > 0 && (
+        <Box marginTop={1}>
+          <Text color="#5A8060">Recent Prompts </Text>
+          <Text color="#3D6650">· press </Text>
+          <Text color="#7AB890">p</Text>
+          <Text color="#3D6650"> to browse</Text>
+        </Box>
+      )}
     </Box>
   );
 }
@@ -1840,6 +1990,9 @@ function UsageBars({
   // as bars and not vertical hairlines. Cap at 4 so 6-bucket monthly views
   // don't stretch into giant blocks.
   const colW      = Math.max(2, Math.min(4, Math.floor(availW / Math.max(1, series.buckets.length))));
+  // One blank column between bars. bucketW is the full slot width per bucket;
+  // colW is the bar's own width within that slot.
+  const bucketW   = colW + 1;
 
   const bars = series.buckets.map(b => {
     const value = metric === 'cost' ? b.totalUsd : b.totalTokens;
@@ -1902,7 +2055,7 @@ function UsageBars({
   // rendered in `colW` columns; pad with a separator so they read cleanly.
   const labels = series.buckets.map(b => b.label);
   const maxLabel = Math.max(...labels.map(l => l.length));
-  const stride = Math.max(1, Math.ceil((maxLabel + 1) / colW));
+  const stride = Math.max(1, Math.ceil((maxLabel + 1) / bucketW));
 
   // Build a per-cell plan for each row. Cells are either part of a bar
   // (backgroundColor = family) or empty/text. Value labels go into empty
@@ -1912,7 +2065,9 @@ function UsageBars({
   // taller bar's column.
   type RowCell = { bg: string | null; ch: string };
   const buildRow = (row: number): RowCell[] => {
-    const totalCols = bars.length * colW;
+    // Extra 4 cells on the right so the last bar's value label can overflow
+    // without being clipped.
+    const totalCols = bars.length * bucketW + 4;
     const cells: RowCell[] = Array.from({ length: totalCols }, () => ({ bg: null, ch: ' ' }));
     // Bars
     bars.forEach((_, col) => {
@@ -1920,7 +2075,7 @@ function UsageBars({
       if (!fam) return;
       const color = USAGE_FAMILY_COLOR[fam];
       if (!color) return;
-      for (let i = 0; i < colW; i++) cells[col * colW + i] = { bg: color, ch: ' ' };
+      for (let i = 0; i < colW; i++) cells[col * bucketW + i] = { bg: color, ch: ' ' };
     });
     // Value labels — one row above each non-zero bar's tip
     bars.forEach((b, col) => {
@@ -1929,7 +2084,7 @@ function UsageBars({
       if (labelRow !== row) return;
       const label = compactVal(b.value);
       for (let i = 0; i < label.length; i++) {
-        const idx = col * colW + i;
+        const idx = col * bucketW + i;
         if (idx >= totalCols) break;
         // Don't overwrite a bar cell from a taller neighbor.
         if (cells[idx]!.bg === null) cells[idx] = { bg: null, ch: label[i]! };
@@ -1976,10 +2131,10 @@ function UsageBars({
           {bars.map((_, col) => {
             const show = col % stride === 0;
             const label = show ? labels[col]! : '';
-            const slotW = colW * stride;
+            const slotW = bucketW * stride;
             // For the last visible label, only pad up to the end of the chart
             // so we don't print stray spaces past the right edge.
-            const remaining = (bars.length - col) * colW;
+            const remaining = (bars.length - col) * bucketW;
             const width = Math.min(slotW, remaining);
             return <Text key={col}>{show ? label.padEnd(width).slice(0, width) : ''}</Text>;
           })}
@@ -2336,7 +2491,7 @@ function App({ onLogout }: { onLogout: () => void }) {
   const lintProgressRef = useRef<LintProgress | null>(null);
   const lastModelStateActionRef = useRef<string | null>(null);
   useEffect(() => { lintProgressRef.current = lintProgress; }, [lintProgress]);
-  const tokenAccRef = useRef<TokenTotals>({ input: 0, output: 0, cacheRead: 0 });
+  const tokenAccRef = useRef<TokenTotals>({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, costUsd: 0 });
 
   // Per-app-instance running USD estimate. Resets only on process restart, not per submit.
   // Tracks per-model totals separately so a Sonnet call and a Haiku sub-agent call are billed
@@ -2351,7 +2506,9 @@ function App({ onLogout }: { onLogout: () => void }) {
   // granularity, so we can answer "which process burned the most tokens" not just
   // "what was the total spend."
   const usageStateRef = useRef(createUsageState());
-  const currentTurnLabelRef = useRef<string>('chat');
+  const currentTurnLabelRef    = useRef<string>('chat');
+  const currentUserPromptRef   = useRef<string>('');
+  const currentPrimaryModelRef = useRef<string>('');
 
   // Pet — persistent Tamagotchi state at ~/.bk1/pet.json. Lazy-init on first render:
   // if no file exists, hatch a fresh egg. tickPet() runs immediately so the StatusFooter
@@ -3012,7 +3169,9 @@ function App({ onLogout }: { onLogout: () => void }) {
 
     // Label this turn for /usage attribution BEFORE any LLM call fires. Sub-agents
     // spawned during this turn will inherit it via the closure in onUsage.
-    currentTurnLabelRef.current = classifyTurnLabel(raw);
+    currentTurnLabelRef.current    = classifyTurnLabel(raw);
+    currentUserPromptRef.current   = raw;
+    currentPrimaryModelRef.current = MODELS[modelIdxRef.current]!.id;
 
     const skill = expandSkill(raw);
     const displayText = skill ? skill.display : raw;
@@ -3025,7 +3184,7 @@ function App({ onLogout }: { onLogout: () => void }) {
     setLiveExpanded(false);
     setLiveText('');
     setSemanticProgress(null);
-    tokenAccRef.current = { input: 0, output: 0, cacheRead: 0 };
+    tokenAccRef.current = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, costUsd: 0 };
     setLiveTokens(null);
 
     // If the bk1-context VS Code extension is installed and reporting fresh state,
@@ -3099,10 +3258,18 @@ function App({ onLogout }: { onLogout: () => void }) {
           },
           onUsage: (u: TokenUsage, model: string, subAgentLabel?: string) => {
             const acc = tokenAccRef.current;
+            const callCost = estimateCostUsd({
+              input:      u.inputTokens,
+              output:     u.outputTokens,
+              cacheRead:  u.cacheReadTokens,
+              cacheWrite: u.cacheWriteTokens,
+            }, model);
             const next = {
-              input:     acc.input     + u.inputTokens,
-              output:    acc.output    + u.outputTokens,
-              cacheRead: acc.cacheRead + u.cacheReadTokens,
+              input:      acc.input      + u.inputTokens,
+              output:     acc.output     + u.outputTokens,
+              cacheRead:  acc.cacheRead  + u.cacheReadTokens,
+              cacheWrite: acc.cacheWrite + u.cacheWriteTokens,
+              costUsd:    acc.costUsd    + callCost,
             };
             tokenAccRef.current = next;
             setLiveTokens({ ...next });
@@ -3189,6 +3356,26 @@ function App({ onLogout }: { onLogout: () => void }) {
       const trimmed = fullText.trim();
       const finalTokens = { ...tokenAccRef.current };
       setMessages(prev => [...prev, { role: 'assistant', content: trimmed, tools: toolLog, tokens: finalTokens }]);
+      // One row per user turn in turn_costs so the Projects tab can show per-prompt history.
+      if (finalTokens.costUsd > 0) {
+        const projectPath = getProjectDir();
+        const promptSnap  = currentUserPromptRef.current;
+        const turnTs = recordTurnCost({
+          projectPath,
+          turnLabel:    currentTurnLabelRef.current,
+          primaryModel: currentPrimaryModelRef.current,
+          promptText:   promptSnap,
+          costUsd:      finalTokens.costUsd,
+          input:        finalTokens.input,
+          output:       finalTokens.output,
+          cacheRead:    finalTokens.cacheRead,
+          cacheWrite:   finalTokens.cacheWrite,
+        });
+        // Background Haiku call — never blocks the main flow.
+        summarizePrompt(promptSnap)
+          .then(summary => { if (summary) updateTurnSummary(turnTs, projectPath, summary); })
+          .catch(() => {});
+      }
       // Detect trailing (yes / no) prompts and surface as an interactive confirm bar
       const lastLine = trimmed.split('\n').pop()?.trim() ?? '';
       if (/\(yes\s*\/\s*no\)\s*$/i.test(lastLine)) {

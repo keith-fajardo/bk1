@@ -177,6 +177,25 @@ function getClient() {
 export function resetAnthropicClient(): void {
   client = null;
 }
+
+// One-sentence Haiku summary of a user prompt — used to populate turn_costs.summary.
+// Best-effort: returns '' on any error so a failure never blocks the main flow.
+export async function summarizePrompt(text: string): Promise<string> {
+  try {
+    const msg = await getClient().messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 60,
+      messages: [{
+        role: 'user',
+        content: `Summarize the following user prompt in one sentence of 15 words or fewer. Reply with only the sentence, no preamble.\n\n${text}`,
+      }],
+    });
+    const block = msg.content[0];
+    return block?.type === 'text' ? block.text.trim() : '';
+  } catch {
+    return '';
+  }
+}
 const MODEL = process.env.ANTHROPIC_MODEL ?? 'claude-sonnet-4-6';
 // Sub-agents do simple rule-checking — Haiku is fast, cheap, and sufficient.
 // Override with ANTHROPIC_SUB_AGENT_MODEL if needed.
