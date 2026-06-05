@@ -4,7 +4,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { ensureBk1 } from './bk1-loader';
 import { recordTerminal, forgetTerminal, reapOrphans } from './process-registry';
-import { Bk1ChatViewProvider } from './chat-view';
+import { Bk1ChatViewProvider, Bk1ChatPanel } from './chat-view';
 
 const CONTEXT_DIR  = path.join(os.homedir(), '.bk1');
 const CONTEXT_FILE = path.join(CONTEXT_DIR, 'ide-context.json');
@@ -24,21 +24,26 @@ interface IdeContext {
 }
 
 // ---------------------------------------------------------------------------
-// bk1 terminal (opens as an editor tab, like Claude Code)
+// bk1 process (runs in the integrated terminal panel at the bottom)
 // ---------------------------------------------------------------------------
 
 let bk1Terminal: vscode.Terminal | undefined;
 let bk1Pid: number | undefined;
 let openingBk1 = false;
 
+// chatPanel is the primary UI — a WebviewPanel that opens beside code files.
+let chatPanel: Bk1ChatPanel | undefined;
+
 async function openBk1(ctx: vscode.ExtensionContext) {
+  // Always open/reveal the chat panel first so the user sees the UI immediately.
+  chatPanel = Bk1ChatPanel.createOrReveal(ctx, () => bk1Terminal);
+
   if (bk1Terminal) {
-    bk1Terminal.show();
+    // Process already running — just notify the panel it's live.
+    chatPanel.notifyTerminalStatus(true);
     return;
   }
-  // Guard against the user mashing the "Open bk1" button while the first-run
-  // download is still in progress — withProgress doesn't queue, so we'd kick
-  // off a second download into the same directory.
+
   if (openingBk1) return;
   openingBk1 = true;
 
@@ -54,30 +59,27 @@ async function openBk1(ctx: vscode.ExtensionContext) {
 
   const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || os.homedir();
 
-  // viewColumn: Beside opens bk1 in a new editor group to the side of the
-  // currently active one (Claude Code-style split layout). Without this,
-  // TerminalLocation.Editor alone would put bk1 as a tab in the active group,
-  // forcing files and bk1 to share the same column.
+  // Run bk1 in the integrated terminal panel at the bottom (no `location:
+  // viewColumn`) so it doesn't compete with the chat WebviewPanel for editor
+  // space. The user can expand/collapse the terminal panel to see bk1's output.
   bk1Terminal = vscode.window.createTerminal({
     name: 'bk1',
     shellPath,
     cwd,
     iconPath: vscode.Uri.joinPath(ctx.extensionUri, 'media', 'icon.svg'),
-    location: { viewColumn: vscode.ViewColumn.Beside },
   });
 
   openingBk1 = false;
   const term = bk1Terminal;
-  term.show();
 
-  // Track the real child PID so we can guarantee it dies even if dispose()
-  // doesn't — and so a future host can reap it if this one crashes. processId
-  // resolves once the pty's shell (bk1) has spawned. Pin to `term`: if it was
-  // stopped/replaced before the promise resolved, don't record a stale PID.
+  // Show the terminal panel (preservesFocus=true keeps focus on the chat panel).
+  term.show(true);
+
   void term.processId.then((pid) => {
     if (pid !== undefined && bk1Terminal === term) {
       bk1Pid = pid;
       recordTerminal(pid);
+      chatPanel?.notifyTerminalStatus(true);
     }
   });
 }
@@ -301,11 +303,10 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('bk1.stop', () => stopBk1()),
     vscode.window.onDidCloseTerminal(t => {
       if (t === bk1Terminal) {
-        // The tab was closed (bk1 already exited via its pty closing) — just
-        // drop our bookkeeping so the reaper never chases a dead PID.
         if (bk1Pid !== undefined) { forgetTerminal(bk1Pid); bk1Pid = undefined; }
         bk1Terminal = undefined;
         setFocusContext(false);
+        chatPanel?.notifyTerminalStatus(false);
       }
     }),
     vscode.window.onDidChangeActiveTerminal(t => {
