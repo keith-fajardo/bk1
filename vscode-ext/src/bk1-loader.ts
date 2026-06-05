@@ -30,7 +30,7 @@ import { pipeline } from 'stream/promises';
 // Bumped in lockstep with extension releases. Each value here must correspond
 // to a published GitHub release tag `v<BK1_VERSION>` with the per-platform
 // tarballs attached.
-export const BK1_VERSION = '0.4.21';
+export const BK1_VERSION = '0.4.22';
 
 const REPO = 'keith-fajardo/bk1';
 
