@@ -430,9 +430,10 @@ const CELL_W = ${cellPx}, CELL_H = ${cellPx};
 const EYE = '#000000', BLINK_COL = '#FCD34D';
 
 // ── State ──────────────────────────────────────────────────
-let pendingFiles = [];
-let responding   = false;
-let termOpen     = false;
+let pendingFiles  = [];
+let responding    = false;
+let termOpen      = false;
+let turnStarted   = false;  // true after doSubmit() calls startTurn() immediately
 
 // Conversation rendering state
 let activeTurn     = null;   // current .turn element being built
@@ -540,6 +541,10 @@ function doSubmit() {
 
   hideSug();
   removeEmpty();
+
+  // Show user bubble immediately — don't wait for chatEvent.user from bk1.
+  startTurn(text);
+  turnStarted = true;
 
   vscode.postMessage({
     type: 'submit', text,
@@ -664,7 +669,9 @@ window.addEventListener('message', (ev) => {
       const e = msg.event;
       switch (e.type) {
         case 'user':
-          startTurn(e.text);
+          // doSubmit() already called startTurn() immediately — skip duplicate.
+          if (turnStarted) { turnStarted = false; }
+          else { startTurn(e.text); }
           break;
         case 'text':
           appendText(e.chunk);
@@ -968,63 +975,3 @@ export class Bk1ChatPanel {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Sidebar view (small companion — same HTML, sidebar sizing)
-// ---------------------------------------------------------------------------
-
-export class Bk1ChatViewProvider implements vscode.WebviewViewProvider {
-  static readonly viewId = 'bk1.chat';
-
-  private view?: vscode.WebviewView;
-  private petTimer?: NodeJS.Timeout;
-
-  constructor(
-    private readonly ctx: vscode.ExtensionContext,
-    private readonly getTerminal: () => vscode.Terminal | undefined,
-  ) {}
-
-  resolveWebviewView(view: vscode.WebviewView) {
-    this.view = view;
-    view.webview.options = { enableScripts: true, localResourceRoots: [this.ctx.extensionUri] };
-    view.webview.html = buildHtml(view.webview, 'sidebar');
-    view.webview.onDidReceiveMessage(msg => this.handle(msg));
-    this.pushPet();
-    this.petTimer = setInterval(() => this.pushPet(), 2000);
-    view.onDidDispose(() => { if (this.petTimer) { clearInterval(this.petTimer); this.petTimer = undefined; } });
-  }
-
-  private pushPet() {
-    if (!this.view) return;
-    const pet = readPetState();
-    if (!pet) return;
-    const now = new Date();
-    void this.view.webview.postMessage({
-      type: 'petState', color: petColorHex(pet), mood: petMood(pet, now),
-      isSleeping: petMood(pet, now) === 'sleeping',
-      isEating: !!pet.eating_until && new Date(pet.eating_until) > now,
-    });
-  }
-
-  private handle(msg: { type: string; [k: string]: unknown }) {
-    const t = this.getTerminal();
-    switch (msg.type) {
-      case 'submit': {
-        const text  = (msg.text  as string) ?? '';
-        const files = (msg.files as { name: string; content: string; fileType: string }[]) ?? [];
-        if (!t) { void this.view?.webview.postMessage({ type: 'error', message: 'bk1 terminal not open.' }); return; }
-        const parts: string[] = [];
-        for (const f of files) parts.push(f.fileType.startsWith('image/') ? `[Image: ${f.name}]` : `[File: ${f.name}]\n${f.content}`);
-        if (text.trim()) parts.push(text.trim());
-        const full = parts.join('\n\n');
-        if (full) { t.sendText(full, true); t.show(true); }
-        break;
-      }
-      case 'cancel':
-        t?.sendText('\x03', false);
-        break;
-      case 'openTerminal':
-        void vscode.commands.executeCommand('bk1.open');
-        break;
-    }
-  }
-}

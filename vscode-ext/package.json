@@ -2,7 +2,7 @@
   "name": "bk1-context",
   "displayName": "bk1 - dbt coding agent",
   "description": "Coding agent for dbt projects — reviews modeling against Kimball and lints folders against dbt best practices",
-  "version": "0.4.34",
+  "version": "0.4.35",
   "publisher": "keithfajardo",
   "private": true,
   "icon": "media/icon.png",
@@ -28,12 +28,6 @@
     },
     "views": {
       "bk1": [
-        {
-          "id": "bk1.chat",
-          "name": "Chat",
-          "type": "webview",
-          "visibility": "visible"
-        },
         {
           "id": "bk1.status",
           "name": "Status"

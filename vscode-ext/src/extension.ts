@@ -4,7 +4,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { ensureBk1 } from './bk1-loader';
 import { recordTerminal, forgetTerminal, reapOrphans } from './process-registry';
-import { Bk1ChatViewProvider, Bk1ChatPanel } from './chat-view';
+import { Bk1ChatPanel } from './chat-view';
 
 const CONTEXT_DIR        = path.join(os.homedir(), '.bk1');
 const CONTEXT_FILE       = path.join(CONTEXT_DIR, 'ide-context.json');
@@ -22,10 +22,14 @@ let chatEventsWatcher: fs.FSWatcher | undefined;
 function startChatEventsWatcher() {
   if (chatEventsWatcher) return;
   try {
-    chatEventsWatcher = fs.watch(CHAT_EVENTS_FILE, () => flushChatEvents());
+    // Watch the directory rather than the file so setup succeeds even before
+    // bk1 creates chat-events.jsonl (fs.watch on a missing file throws).
+    fs.mkdirSync(CONTEXT_DIR, { recursive: true });
+    chatEventsWatcher = fs.watch(CONTEXT_DIR, (_event, filename) => {
+      if (filename === 'chat-events.jsonl') flushChatEvents();
+    });
   } catch {
-    // File may not exist yet; bk1 creates it on first session start.
-    // The watcher is retried each time openBk1 is called.
+    // CONTEXT_DIR inaccessible — events won't forward but won't crash.
   }
 }
 
@@ -77,7 +81,6 @@ let chatPanel: Bk1ChatPanel | undefined;
 async function openBk1(ctx: vscode.ExtensionContext) {
   // Always open/reveal the chat panel first so the user sees the UI immediately.
   chatPanel = Bk1ChatPanel.createOrReveal(ctx, () => bk1Terminal);
-  startChatEventsWatcher();
 
   if (bk1Terminal) {
     // Process already running — just notify the panel it's live.
@@ -113,8 +116,8 @@ async function openBk1(ctx: vscode.ExtensionContext) {
   openingBk1 = false;
   const term = bk1Terminal;
 
-  // Show the terminal panel (preservesFocus=true keeps focus on the chat panel).
-  term.show(true);
+  // Run bk1 silently in the background — don't steal the panel away from the chat view.
+  // The user interacts via the chat WebviewPanel; they can open the terminal manually if needed.
 
   void term.processId.then((pid) => {
     if (pid !== undefined && bk1Terminal === term) {
@@ -315,12 +318,8 @@ export function activate(context: vscode.ExtensionContext) {
   statusProvider = new StatusProvider();
   logProvider    = new LogProvider();
 
-  const chatProvider = new Bk1ChatViewProvider(context, () => bk1Terminal);
-  context.subscriptions.push(
-    vscode.window.registerWebviewViewProvider(Bk1ChatViewProvider.viewId, chatProvider, {
-      webviewOptions: { retainContextWhenHidden: true },
-    }),
-  );
+  // Start the chat-events watcher early so it's ready before the first bk1 session.
+  startChatEventsWatcher();
 
   // Maintain a context key that's true exactly when bk1's terminal is the
   // active one. The Ctrl+T / Ctrl+L keybindings in package.json are gated on
