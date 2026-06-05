@@ -6,10 +6,50 @@ import { ensureBk1 } from './bk1-loader';
 import { recordTerminal, forgetTerminal, reapOrphans } from './process-registry';
 import { Bk1ChatViewProvider, Bk1ChatPanel } from './chat-view';
 
-const CONTEXT_DIR  = path.join(os.homedir(), '.bk1');
-const CONTEXT_FILE = path.join(CONTEXT_DIR, 'ide-context.json');
-const DEBOUNCE_MS  = 200;
+const CONTEXT_DIR        = path.join(os.homedir(), '.bk1');
+const CONTEXT_FILE       = path.join(CONTEXT_DIR, 'ide-context.json');
+const CHAT_EVENTS_FILE   = path.join(CONTEXT_DIR, 'chat-events.jsonl');
+const DEBOUNCE_MS        = 200;
 const MAX_SELECTION_BYTES = 8_000;
+
+// ---------------------------------------------------------------------------
+// Chat event file watcher — reads new lines from chat-events.jsonl and
+// forwards them to the chat panel webview.
+// ---------------------------------------------------------------------------
+let chatEventsReadPos = 0;
+let chatEventsWatcher: fs.FSWatcher | undefined;
+
+function startChatEventsWatcher() {
+  if (chatEventsWatcher) return;
+  try {
+    chatEventsWatcher = fs.watch(CHAT_EVENTS_FILE, () => flushChatEvents());
+  } catch {
+    // File may not exist yet; bk1 creates it on first session start.
+    // The watcher is retried each time openBk1 is called.
+  }
+}
+
+function flushChatEvents() {
+  try {
+    const stat = fs.statSync(CHAT_EVENTS_FILE);
+    if (stat.size < chatEventsReadPos) chatEventsReadPos = 0; // file was truncated (new session)
+    if (stat.size === chatEventsReadPos) return;
+
+    const buf = Buffer.alloc(stat.size - chatEventsReadPos);
+    const fd  = fs.openSync(CHAT_EVENTS_FILE, 'r');
+    fs.readSync(fd, buf, 0, buf.length, chatEventsReadPos);
+    fs.closeSync(fd);
+    chatEventsReadPos = stat.size;
+
+    const lines = buf.toString('utf8').split('\n').filter(Boolean);
+    for (const line of lines) {
+      try {
+        const event = JSON.parse(line) as Record<string, unknown>;
+        Bk1ChatPanel.currentPanel?.sendEvent(event);
+      } catch { /* malformed line */ }
+    }
+  } catch { /* file gone or unreadable */ }
+}
 const MAX_LOG_ENTRIES = 50;
 
 interface IdeContext {
@@ -37,6 +77,7 @@ let chatPanel: Bk1ChatPanel | undefined;
 async function openBk1(ctx: vscode.ExtensionContext) {
   // Always open/reveal the chat panel first so the user sees the UI immediately.
   chatPanel = Bk1ChatPanel.createOrReveal(ctx, () => bk1Terminal);
+  startChatEventsWatcher();
 
   if (bk1Terminal) {
     // Process already running — just notify the panel it's live.
@@ -330,4 +371,6 @@ export function deactivate() {
   if (writeTimer) clearTimeout(writeTimer);
   writeNow();
   stopBk1();
+  chatEventsWatcher?.close();
+  chatEventsWatcher = undefined;
 }

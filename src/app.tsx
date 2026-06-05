@@ -1,5 +1,5 @@
 import { useState, useRef, useCallback, useMemo, useEffect } from 'react';
-import { existsSync, mkdirSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, writeFileSync, appendFileSync } from 'fs';
 import { homedir } from 'os';
 import { spawnSync } from 'node:child_process';
 import { render, Box, Text, Static, useInput, measureElement, type DOMElement } from 'ink';
@@ -9,7 +9,7 @@ import { runAgent, AgentAbortedError, resetAnthropicClient, rebuildSystemPrompt,
 import { getProjectDir, setProjectDir, isDbtProject, checkProjectAccess } from './project-dir';
 import { lintReportPath, resetDb } from './state';
 import { getRecentProjects, recordRecentProject } from './recent-projects';
-import { bk1AssetsDir } from './bk1-home';
+import { bk1AssetsDir, BK1_HOME } from './bk1-home';
 import { BK1_VERSION } from './version';
 import { createSession, saveSessionMessages, loadSessionMessages, searchSessions, formatSessionLine, type SessionSearchHit, type StoredMessage } from './sessions';
 import { readIdeContextBlock, readIdeContextRaw, type IdeContext } from './ide-context';
@@ -47,6 +47,16 @@ const MULTIPLAYER_GAME_IDS = new Set<string>(MULTIPLAYER_GAMES.map(g => g.id));
 import { registerCoinEventHandler, emitCoinEvent, COIN_REWARDS, type CoinEvent } from './coin-events';
 import { PlayroomLobby, type LobbyMode } from './playroom/room';
 import { PetSpriteLine, PET_SPRITE_SENTINEL } from './playroom/pet-sprite-line';
+
+// ---------------------------------------------------------------------------
+// Chat event stream — written to ~/.bk1/chat-events.jsonl so the VS Code
+// extension's webview panel can render a live conversation view.
+// ---------------------------------------------------------------------------
+const CHAT_EVENTS_FILE = `${BK1_HOME}/chat-events.jsonl`;
+
+function emitChatEvent(event: Record<string, unknown>): void {
+  try { appendFileSync(CHAT_EVENTS_FILE, JSON.stringify(event) + '\n'); } catch {}
+}
 
 const MODELS = [
   { id: 'claude-haiku-4-5-20251001', label: 'Haiku 4.5' },
@@ -1544,6 +1554,11 @@ function StatusTab({
   // we fall back to "—" rather than surfacing an error here.
   const [branch, setBranch] = useState<string>('…');
   useEffect(() => {
+    // Truncate chat events file so the VS Code webview panel starts fresh each session.
+    try { writeFileSync(CHAT_EVENTS_FILE, ''); } catch {}
+  }, []);
+
+  useEffect(() => {
     try {
       const res = spawnSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: getProjectDir(), encoding: 'utf-8' });
       setBranch(res.status === 0 ? (res.stdout?.trim() || '—') : '—');
@@ -1761,7 +1776,29 @@ function ProjectsTab({ onViewChange }: { onViewChange: (v: null | 'list' | 'deta
 
   useEffect(() => {
     setRows(loadProjectTotals());
-    setHistory(loadTurnHistory(30));
+    const hist = loadTurnHistory(30);
+    setHistory(hist);
+
+    const unsummarized = hist.filter(h => !h.summary && h.promptText);
+    if (unsummarized.length === 0) return;
+
+    let cancelled = false;
+    (async () => {
+      for (const row of unsummarized) {
+        if (cancelled) break;
+        const summary = await summarizePrompt(row.promptText);
+        if (cancelled || !summary) continue;
+        updateTurnSummary(row.ts, row.projectPath, summary);
+        setHistory(prev => prev
+          ? prev.map(h => h.ts === row.ts && h.projectPath === row.projectPath
+              ? { ...h, summary }
+              : h)
+          : prev,
+        );
+      }
+    })();
+
+    return () => { cancelled = true; };
   }, []);
 
   const navigate = (v: null | 'list' | 'detail') => { setView(v); onViewChange(v); };
@@ -3197,6 +3234,7 @@ function App({ onLogout }: { onLogout: () => void }) {
 
     setMessages(prev => [...prev, { role: 'user', content: displayText }]);
     historyRef.current.push({ role: 'user', content: promptForLLM });
+    emitChatEvent({ type: 'user', text: displayText, ts: Date.now() });
 
     const controller = new AbortController();
     abortRef.current = controller;
@@ -3208,10 +3246,15 @@ function App({ onLogout }: { onLogout: () => void }) {
       const updated = await runAgent(
         historyRef.current,
         {
-          onText: (chunk) => { fullText += chunk; setLiveText(fullText); },
+          onText: (chunk) => {
+            fullText += chunk;
+            setLiveText(fullText);
+            emitChatEvent({ type: 'text', chunk, ts: Date.now() });
+          },
           onToolStart: (name, input) => {
             setActiveTool(name);
             toolLog.push({ name });
+            emitChatEvent({ type: 'tool_start', name, ts: Date.now() });
 
             if (name.startsWith('Semantic:')) {
               const label = name.slice('Semantic: '.length);
@@ -3356,25 +3399,20 @@ function App({ onLogout }: { onLogout: () => void }) {
       const trimmed = fullText.trim();
       const finalTokens = { ...tokenAccRef.current };
       setMessages(prev => [...prev, { role: 'assistant', content: trimmed, tools: toolLog, tokens: finalTokens }]);
+      emitChatEvent({ type: 'done', ts: Date.now() });
       // One row per user turn in turn_costs so the Projects tab can show per-prompt history.
       if (finalTokens.costUsd > 0) {
-        const projectPath = getProjectDir();
-        const promptSnap  = currentUserPromptRef.current;
-        const turnTs = recordTurnCost({
-          projectPath,
+        recordTurnCost({
+          projectPath:  getProjectDir(),
           turnLabel:    currentTurnLabelRef.current,
           primaryModel: currentPrimaryModelRef.current,
-          promptText:   promptSnap,
+          promptText:   currentUserPromptRef.current,
           costUsd:      finalTokens.costUsd,
           input:        finalTokens.input,
           output:       finalTokens.output,
           cacheRead:    finalTokens.cacheRead,
           cacheWrite:   finalTokens.cacheWrite,
         });
-        // Background Haiku call — never blocks the main flow.
-        summarizePrompt(promptSnap)
-          .then(summary => { if (summary) updateTurnSummary(turnTs, projectPath, summary); })
-          .catch(() => {});
       }
       // Detect trailing (yes / no) prompts and surface as an interactive confirm bar
       const lastLine = trimmed.split('\n').pop()?.trim() ?? '';
@@ -3391,11 +3429,13 @@ function App({ onLogout }: { onLogout: () => void }) {
           tools: toolLog,
           tokens: { ...tokenAccRef.current },
         }]);
+        emitChatEvent({ type: 'done', cancelled: true, ts: Date.now() });
       } else {
         setMessages(prev => [...prev, {
           role: 'assistant',
           content: `Error: ${err instanceof Error ? err.message : String(err)}`,
         }]);
+        emitChatEvent({ type: 'done', error: err instanceof Error ? err.message : String(err), ts: Date.now() });
       }
     } finally {
       abortRef.current = null;

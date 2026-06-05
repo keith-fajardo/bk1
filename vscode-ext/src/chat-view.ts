@@ -20,55 +20,61 @@ interface PetState {
 }
 
 function readPetState(): PetState | null {
-  try {
-    return JSON.parse(fs.readFileSync(PET_FILE, 'utf8')) as PetState;
-  } catch {
-    return null;
-  }
+  try { return JSON.parse(fs.readFileSync(PET_FILE, 'utf8')) as PetState; }
+  catch { return null; }
 }
 
 function petColorHex(pet: PetState): string {
-  const palette: Record<string, string> = {
+  const p: Record<string, string> = {
     green: '#9FE749', pink: '#FF8FB1', blue: '#6FCFFF',
     yellow: '#FFD93D', purple: '#C77DFF', orange: '#FF9A3C',
   };
-  return palette[pet.color ?? 'green'] ?? '#9FE749';
+  return p[pet.color ?? 'green'] ?? '#9FE749';
 }
 
 function petMood(pet: PetState, now: Date): string {
   if (pet.sleeping_until && new Date(pet.sleeping_until) > now) return 'sleeping';
-  if (pet.hunger >= 80) return 'hungry';
+  if (pet.hunger >= 80)   return 'hungry';
   if (pet.happiness <= 30) return 'sad';
-  if (pet.energy <= 30) return 'sleepy';
+  if (pet.energy <= 30)   return 'sleepy';
   return 'happy';
 }
 
-function makeNonce(): string {
-  return crypto.randomBytes(16).toString('hex');
-}
+function makeNonce(): string { return crypto.randomBytes(16).toString('hex'); }
 
 // ---------------------------------------------------------------------------
-// Shared HTML generator (used by both the editor panel and the sidebar view)
+// Shared HTML
 // ---------------------------------------------------------------------------
 
-function buildHtml(
-  webview: vscode.Webview,
-  mode: 'panel' | 'sidebar',
-): string {
-  const n = makeNonce();
-  const csp = [
+function buildHtml(webview: vscode.Webview, mode: 'panel' | 'sidebar'): string {
+  const n      = makeNonce();
+  const csp    = [
     `default-src 'none'`,
     `style-src 'unsafe-inline'`,
     `script-src 'nonce-${n}'`,
     `img-src data:`,
   ].join('; ');
 
-  // In panel (editor) mode the sprite and layout can breathe a bit more.
   const cellPx  = mode === 'panel' ? 10 : 8;
-  const canvasW  = 9 * cellPx;   // 9 cols
-  const canvasH  = 3 * cellPx;   // 3 rows
-  const msgPad   = mode === 'panel' ? '12px 14px 8px' : '10px 10px 6px';
-  const inputPad = mode === 'panel' ? '10px' : '8px';
+  const canvasW = 9 * cellPx;
+  const canvasH = 3 * cellPx;
+
+  // Slash commands shown in autocomplete
+  const SLASH_CMDS = [
+    ['/lint',     'Run the mechanical linter'],
+    ['/kimball',  'Kimball dimensional modeling review'],
+    ['/review',   'Review a specific model'],
+    ['/usage',    'Show usage and cost stats'],
+    ['/pet',      'Interact with Motchi'],
+    ['/adaptive', 'Toggle adaptive (extended) thinking'],
+    ['/model',    'Switch active model'],
+    ['/new',      'Start a fresh conversation'],
+    ['/clear',    'Clear conversation history'],
+    ['/sessions', 'Browse past sessions'],
+    ['/project',  'Switch dbt project'],
+    ['/term',     'Toggle terminal mode'],
+    ['/help',     'Show all available commands'],
+  ];
 
   return /* html */`<!DOCTYPE html>
 <html lang="en">
@@ -77,10 +83,9 @@ function buildHtml(
 <meta http-equiv="Content-Security-Policy" content="${csp}">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <style>
-  *, *::before, *::after { box-sizing: border-box; }
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
   body {
-    margin: 0; padding: 0;
     height: 100vh;
     display: flex;
     flex-direction: column;
@@ -91,61 +96,24 @@ function buildHtml(
     overflow: hidden;
   }
 
-  /* ── Message list ────────────────────────────────────────── */
-  #messages {
+  /* ── Conversation area ─────────────────────────────── */
+  #conv {
     flex: 1;
     overflow-y: auto;
-    padding: ${msgPad};
+    padding: 12px 14px 4px;
     display: flex;
     flex-direction: column;
-    gap: 8px;
+    gap: 0;
     scroll-behavior: smooth;
   }
-
-  #messages::-webkit-scrollbar { width: 4px; }
-  #messages::-webkit-scrollbar-track { background: transparent; }
-  #messages::-webkit-scrollbar-thumb {
+  #conv::-webkit-scrollbar { width: 4px; }
+  #conv::-webkit-scrollbar-thumb {
     background: var(--vscode-scrollbarSlider-background, #424242);
     border-radius: 2px;
   }
 
-  .msg {
-    max-width: 82%;
-    padding: 8px 13px;
-    border-radius: 12px;
-    line-height: 1.5;
-    word-break: break-word;
-    white-space: pre-wrap;
-    font-size: 13px;
-  }
-
-  .msg-user {
-    align-self: flex-end;
-    background: var(--vscode-button-background, #0e639c);
-    color: var(--vscode-button-foreground, #ffffff);
-    border-bottom-right-radius: 3px;
-  }
-
-  .msg-system {
-    align-self: flex-start;
-    background: var(--vscode-editorWidget-background, #252526);
-    color: var(--vscode-descriptionForeground, #9d9d9d);
-    border-bottom-left-radius: 3px;
-    font-size: 12px;
-    font-style: italic;
-  }
-
-  .msg-error {
-    align-self: center;
-    background: var(--vscode-inputValidation-errorBackground, #5a1d1d);
-    color: var(--vscode-inputValidation-errorForeground, #f48771);
-    border-radius: 8px;
-    font-size: 12px;
-    text-align: center;
-    padding: 6px 12px;
-  }
-
-  .empty-state {
+  /* Empty state */
+  #empty {
     flex: 1;
     display: flex;
     flex-direction: column;
@@ -157,514 +125,728 @@ function buildHtml(
     padding: 32px 20px;
     user-select: none;
   }
+  #empty .icon { font-size: 28px; }
+  #empty .title { font-size: 14px; font-weight: 500; opacity: 0.7; }
+  #empty .hint  { font-size: 11.5px; opacity: 0.45; line-height: 1.5; }
 
-  .empty-icon { font-size: 32px; margin-bottom: 2px; }
-  .empty-title { font-size: 14px; font-weight: 500; }
-  .empty-hint { font-size: 12px; opacity: 0.65; line-height: 1.5; }
+  /* Turn: wrapper groups user msg + assistant response */
+  .turn { display: flex; flex-direction: column; gap: 0; margin-bottom: 12px; }
 
-  /* ── Floating input area ─────────────────────────────────── */
-  #input-area {
-    padding: ${inputPad};
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-    /* Floating card style */
-    margin: 0 ${mode === 'panel' ? '10px' : '6px'} ${mode === 'panel' ? '10px' : '6px'};
-    background: var(--vscode-input-background, #2d2d2d);
-    border: 1px solid var(--vscode-input-border, #3c3c3c);
-    border-radius: 12px;
-    box-shadow: 0 2px 12px rgba(0,0,0,0.35);
+  /* User message */
+  .msg-user {
+    align-self: flex-end;
+    max-width: 80%;
+    background: var(--vscode-button-background, #0e639c);
+    color: var(--vscode-button-foreground, #fff);
+    padding: 8px 12px;
+    border-radius: 12px 12px 3px 12px;
+    font-size: 13px;
+    line-height: 1.45;
+    white-space: pre-wrap;
+    word-break: break-word;
+    margin-bottom: 8px;
   }
 
-  /* Sprite + textarea row */
+  /* Assistant response block */
+  .msg-assistant {
+    align-self: flex-start;
+    max-width: 96%;
+    font-size: 13px;
+    line-height: 1.6;
+    color: var(--vscode-foreground, #cccccc);
+    white-space: pre-wrap;
+    word-break: break-word;
+    padding: 0 2px;
+  }
+
+  /* Tool call pill */
+  .tool-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    background: var(--vscode-editorWidget-background, #252526);
+    border: 1px solid var(--vscode-panel-border, #2d2d2d);
+    border-radius: 6px;
+    padding: 3px 8px;
+    font-size: 11.5px;
+    color: var(--vscode-descriptionForeground, #888);
+    margin: 3px 0;
+    cursor: default;
+  }
+  .tool-pill.running { color: var(--vscode-textLink-foreground, #3794ff); }
+  .tool-pill.done    { color: #3cb371; }
+
+  /* Live streaming text indicator */
+  .cursor-blink {
+    display: inline-block;
+    width: 2px; height: 1em;
+    background: var(--vscode-foreground, #ccc);
+    margin-left: 1px;
+    vertical-align: text-bottom;
+    animation: blink 1s step-end infinite;
+  }
+  @keyframes blink { 50% { opacity: 0; } }
+
+  /* ── Terminal hint ─────────────────────────────────── */
+  #term-hint {
+    text-align: center;
+    font-size: 11px;
+    color: var(--vscode-descriptionForeground, #555);
+    padding: 3px 10px;
+    user-select: none;
+  }
+  #term-hint a {
+    color: var(--vscode-textLink-foreground, #3794ff);
+    cursor: pointer;
+    text-decoration: none;
+  }
+  #term-hint a:hover { text-decoration: underline; }
+
+  /* ── Slash-command suggestions ─────────────────────── */
+  #suggestions {
+    margin: 0 8px;
+    border: 1px solid var(--vscode-panel-border, #2d2d2d);
+    border-radius: 8px 8px 0 0;
+    border-bottom: none;
+    background: var(--vscode-editorWidget-background, #252526);
+    overflow: hidden;
+    display: none;
+    max-height: 180px;
+    overflow-y: auto;
+  }
+  #suggestions.visible { display: block; }
+  .sug-item {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    padding: 5px 10px;
+    cursor: pointer;
+    font-size: 12px;
+  }
+  .sug-item:hover, .sug-item.active {
+    background: var(--vscode-list-activeSelectionBackground, #094771);
+    color: var(--vscode-list-activeSelectionForeground, #fff);
+  }
+  .sug-cmd  { font-weight: 600; color: var(--vscode-textLink-foreground, #3794ff); }
+  .sug-item:hover .sug-cmd,
+  .sug-item.active .sug-cmd { color: inherit; }
+  .sug-desc { opacity: 0.7; font-size: 11px; }
+
+  /* ── Floating input card ───────────────────────────── */
+  #input-card {
+    margin: 0 8px 8px;
+    background: var(--vscode-input-background, #2d2d2d);
+    border: 1px solid var(--vscode-input-border, #3c3c3c);
+    border-radius: 0 0 12px 12px;
+    box-shadow: 0 2px 12px rgba(0,0,0,.35);
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+    transition: border-color .15s;
+  }
+  #input-card.no-suggestions { border-radius: 12px; }
+  #input-card:focus-within   { border-color: var(--vscode-focusBorder, #007acc); }
+
   #input-row {
     display: flex;
     align-items: flex-end;
+    padding: 8px 8px 4px;
     gap: 8px;
   }
 
-  #pet-wrap {
-    flex-shrink: 0;
-    padding-bottom: 1px;
-  }
-
+  /* Pet canvas — fixed pixel dimensions to avoid flex squish */
   #pet-canvas {
     display: block;
+    width: ${canvasW}px;
+    height: ${canvasH}px;
+    flex: 0 0 ${canvasW}px;
     image-rendering: pixelated;
     image-rendering: crisp-edges;
+    cursor: pointer;
+    align-self: flex-end;
   }
 
   #input {
     flex: 1;
-    min-height: 38px;
-    max-height: 200px;
-    padding: 9px 36px 9px 0;
+    min-height: 36px;
+    max-height: 180px;
+    padding: 7px 0;
     background: transparent;
-    color: var(--vscode-input-foreground, #cccccc);
+    color: var(--vscode-input-foreground, #ccc);
     border: none;
     outline: none;
     resize: none;
     font-family: inherit;
     font-size: 13px;
-    line-height: 1.5;
+    line-height: 1.45;
     overflow-y: auto;
-    display: block;
   }
-
   #input::placeholder { color: var(--vscode-input-placeholderForeground, #555); }
   #input::-webkit-scrollbar { width: 3px; }
-  #input::-webkit-scrollbar-thumb {
-    background: var(--vscode-scrollbarSlider-background, #424242);
-    border-radius: 2px;
-  }
+  #input::-webkit-scrollbar-thumb { background: #424242; border-radius: 2px; }
 
-  /* Attach button floated to the right of textarea */
-  .input-right {
-    flex-shrink: 0;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: flex-end;
-    gap: 4px;
-    padding-bottom: 2px;
-  }
-
-  #attach-btn, #submit-btn {
+  .btn-icon {
     background: none;
     border: none;
     cursor: pointer;
-    padding: 4px 6px;
-    border-radius: 6px;
-    line-height: 1;
-    transition: background 0.12s;
-  }
-
-  #attach-btn {
+    padding: 4px 5px;
+    border-radius: 5px;
     font-size: 15px;
-    opacity: 0.5;
+    line-height: 1;
+    opacity: .55;
     color: var(--vscode-foreground, #ccc);
+    flex-shrink: 0;
+    align-self: flex-end;
+    transition: opacity .12s, background .12s;
   }
-  #attach-btn:hover { opacity: 1; background: var(--vscode-toolbar-hoverBackground, rgba(255,255,255,0.07)); }
+  .btn-icon:hover { opacity: 1; background: rgba(255,255,255,.07); }
 
   #submit-btn {
-    font-size: 15px;
-    opacity: 0.8;
-    color: var(--vscode-button-foreground, #fff);
     background: var(--vscode-button-background, #0e639c);
+    color: var(--vscode-button-foreground, #fff);
+    opacity: 1;
   }
-  #submit-btn:hover { opacity: 1; filter: brightness(1.1); }
-  #submit-btn:disabled { opacity: 0.3; cursor: not-allowed; filter: none; }
+  #submit-btn:hover { filter: brightness(1.1); background: var(--vscode-button-background, #0e639c); }
+  #submit-btn:disabled { opacity: .3; cursor: not-allowed; filter: none; }
+  #submit-btn.stop {
+    background: var(--vscode-inputValidation-errorBackground, #5a1d1d);
+    color: #f48771;
+  }
 
   #file-input { display: none; }
 
-  /* Toolbar row */
+  /* Toolbar */
   #toolbar {
     display: flex;
     align-items: center;
     gap: 6px;
-    padding-top: 2px;
-    border-top: 1px solid var(--vscode-panel-border, rgba(255,255,255,0.06));
+    padding: 4px 10px 8px;
+    border-top: 1px solid rgba(255,255,255,.05);
+    flex-wrap: wrap;
   }
-
   #model-select {
     background: transparent;
     color: var(--vscode-descriptionForeground, #888);
-    border: none;
-    outline: none;
-    font-size: 11.5px;
-    font-family: inherit;
+    border: none; outline: none;
+    font-size: 11.5px; font-family: inherit;
     cursor: pointer;
-    padding: 2px 2px;
-    -webkit-appearance: none;
-    appearance: none;
+    -webkit-appearance: none; appearance: none;
   }
   #model-select:hover { color: var(--vscode-foreground, #ccc); }
 
   #thinking-label {
-    display: flex;
-    align-items: center;
-    gap: 4px;
+    display: flex; align-items: center; gap: 4px;
     font-size: 11.5px;
     color: var(--vscode-descriptionForeground, #888);
-    cursor: pointer;
-    user-select: none;
+    cursor: pointer; user-select: none;
   }
   #thinking-label:hover { color: var(--vscode-foreground, #ccc); }
-  #thinking-label input { cursor: pointer; margin: 0; }
+  #thinking-label input { cursor: pointer; }
 
-  #attached-list {
-    flex: 1;
-    display: flex;
-    flex-wrap: wrap;
-    gap: 4px;
-    min-width: 0;
+  #chip-list {
+    flex: 1; display: flex; flex-wrap: wrap; gap: 4px; min-width: 0;
   }
-
-  .file-chip {
-    display: inline-flex;
-    align-items: center;
-    gap: 3px;
-    background: var(--vscode-badge-background, rgba(255,255,255,0.1));
-    color: var(--vscode-badge-foreground, #cccccc);
-    border-radius: 8px;
-    padding: 1px 8px;
-    font-size: 11px;
-    max-width: 120px;
+  .chip {
+    display: inline-flex; align-items: center; gap: 3px;
+    background: rgba(255,255,255,.1);
+    border-radius: 8px; padding: 1px 8px;
+    font-size: 10.5px; max-width: 120px;
   }
-  .file-chip span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .file-chip button {
-    background: none; border: none; cursor: pointer; color: inherit;
-    font-size: 11px; padding: 0 0 0 2px; opacity: 0.6; line-height: 1;
+  .chip span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .chip button {
+    background: none; border: none; cursor: pointer;
+    color: inherit; font-size: 11px; padding: 0 0 0 2px; opacity: .65;
   }
-  .file-chip button:hover { opacity: 1; }
-
-  /* dots animation for the "responding" message */
-  .dots::after {
-    content: '';
-    animation: dotanim 1.2s steps(4, end) infinite;
-  }
-  @keyframes dotanim {
-    0%  { content: ''; }
-    25% { content: '.'; }
-    50% { content: '..'; }
-    75% { content: '...'; }
-  }
-
-  /* terminal hint banner */
-  #terminal-hint {
-    text-align: center;
-    font-size: 11px;
-    color: var(--vscode-descriptionForeground, #555);
-    padding: 4px 8px 0;
-    user-select: none;
-  }
-  #terminal-hint a {
-    color: var(--vscode-textLink-foreground, #3794ff);
-    cursor: pointer;
-    text-decoration: none;
-  }
-  #terminal-hint a:hover { text-decoration: underline; }
+  .chip button:hover { opacity: 1; }
 </style>
 </head>
 <body>
 
-<div id="messages">
-  <div class="empty-state" id="empty">
-    <div class="empty-icon">🌿</div>
-    <div class="empty-title">Chat with bk1</div>
-    <div class="empty-hint">Open a dbt project, then type below.<br>Responses appear in the bk1 terminal.</div>
+<div id="conv">
+  <div id="empty">
+    <div class="icon">🌿</div>
+    <div class="title">bk1 · dbt agent</div>
+    <div class="hint">Type a message below to start.<br>Responses stream in here live.</div>
   </div>
 </div>
 
-<div id="terminal-hint">
-  bk1 terminal not open — <a id="open-terminal-link">click to open</a>
+<div id="term-hint" style="display:none">
+  bk1 terminal not running — <a id="open-link">open it</a>
 </div>
 
-<div id="input-area">
+<div id="suggestions"></div>
+
+<div id="input-card" class="no-suggestions">
   <div id="input-row">
-    <div id="pet-wrap">
-      <canvas id="pet-canvas"
-        width="${canvasW}" height="${canvasH}"
-        title="Motchi"></canvas>
-    </div>
+    <canvas id="pet-canvas"
+      width="${canvasW}" height="${canvasH}"
+      title="Click to check on Motchi"></canvas>
 
     <textarea id="input"
-      placeholder="Message bk1… (Enter to send · Shift+Enter for newline)"
-      rows="1"
-      spellcheck="false"
-    ></textarea>
+      placeholder="Message bk1… (Enter · Shift+Enter for newline)"
+      rows="1" spellcheck="false"></textarea>
 
-    <div class="input-right">
-      <button id="attach-btn" title="Attach file or image">📎</button>
-      <button id="submit-btn" title="Send (Enter)">↑</button>
-    </div>
+    <button class="btn-icon" id="attach-btn" title="Attach file or image">📎</button>
+    <button class="btn-icon" id="submit-btn" title="Send (Enter)">↑</button>
     <input type="file" id="file-input" multiple
       accept=".sql,.yml,.yaml,.md,.txt,.json,.py,.csv,.png,.jpg,.jpeg,.gif,.webp">
   </div>
 
   <div id="toolbar">
-    <select id="model-select" title="Model">
+    <select id="model-select" title="Active model">
       <option value="claude-haiku-4-5-20251001">Haiku 4.5</option>
       <option value="claude-sonnet-4-6" selected>Sonnet 4.6</option>
       <option value="claude-opus-4-8">Opus 4.8</option>
     </select>
-    <label id="thinking-label" title="Extended thinking (/adaptive in bk1)">
-      <input type="checkbox" id="thinking-toggle"> thinking
+    <label id="thinking-label">
+      <input type="checkbox" id="thinking-chk"> thinking
     </label>
-    <div id="attached-list"></div>
+    <div id="chip-list"></div>
   </div>
 </div>
 
 <script nonce="${n}">
 (function () {
-  'use strict';
+'use strict';
 
-  const vscode    = acquireVsCodeApi();
-  const messages  = document.getElementById('messages');
-  const empty     = document.getElementById('empty');
-  const inputEl   = document.getElementById('input');
-  const submitBtn = document.getElementById('submit-btn');
-  const fileInput = document.getElementById('file-input');
-  const attachBtn = document.getElementById('attach-btn');
-  const modelSel  = document.getElementById('model-select');
-  const thinkChk  = document.getElementById('thinking-toggle');
-  const chipList  = document.getElementById('attached-list');
-  const canvas    = document.getElementById('pet-canvas');
-  const termHint  = document.getElementById('terminal-hint');
-  const openLink  = document.getElementById('open-terminal-link');
-  const ctx2d     = canvas.getContext('2d');
+const vscode      = acquireVsCodeApi();
+const convEl      = document.getElementById('conv');
+const emptyEl     = document.getElementById('empty');
+const termHint    = document.getElementById('term-hint');
+const openLink    = document.getElementById('open-link');
+const sugEl       = document.getElementById('suggestions');
+const inputCard   = document.getElementById('input-card');
+const inputEl     = document.getElementById('input');
+const submitBtn   = document.getElementById('submit-btn');
+const attachBtn   = document.getElementById('attach-btn');
+const fileInput   = document.getElementById('file-input');
+const modelSel    = document.getElementById('model-select');
+const thinkChk    = document.getElementById('thinking-chk');
+const chipList    = document.getElementById('chip-list');
+const canvas      = document.getElementById('pet-canvas');
+const ctx2d       = canvas.getContext('2d');
 
-  const CELL_W = ${cellPx}, CELL_H = ${cellPx};
-  const EYE = '#000000', BLINK = '#FCD34D';
+const CELL_W = ${cellPx}, CELL_H = ${cellPx};
+const EYE = '#000000', BLINK_COL = '#FCD34D';
 
-  let pendingFiles  = [];
-  let responding    = false;
-  let terminalOpen  = false;
+// ── State ──────────────────────────────────────────────────
+let pendingFiles = [];
+let responding   = false;
+let termOpen     = false;
 
-  // ── Terminal hint visibility ──────────────────────────────────
-  function setTerminalOpen(open) {
-    terminalOpen = open;
-    termHint.style.display = open ? 'none' : 'block';
+// Conversation rendering state
+let activeTurn     = null;   // current .turn element being built
+let assistantEl    = null;   // current .msg-assistant element
+let assistantText  = '';     // accumulated assistant text for current turn
+let activeToolPill = null;   // currently-running .tool-pill
+
+// Slash suggestions
+const CMDS = ${JSON.stringify(SLASH_CMDS)};
+let sugItems      = [];
+let sugActive     = -1;
+
+// ── Terminal hint ───────────────────────────────────────────
+function setTermOpen(open) {
+  termOpen = open;
+  termHint.style.display = open ? 'none' : '';
+}
+setTermOpen(false);
+openLink.addEventListener('click', () => vscode.postMessage({ type: 'openTerminal' }));
+
+// ── Input resize ────────────────────────────────────────────
+function resizeInput() {
+  inputEl.style.height = 'auto';
+  inputEl.style.height = Math.min(inputEl.scrollHeight, 180) + 'px';
+}
+inputEl.addEventListener('input', () => { resizeInput(); updateSuggestions(); });
+
+// ── Slash-command suggestions ────────────────────────────────
+function updateSuggestions() {
+  const val = inputEl.value;
+  if (!val.startsWith('/') || val.includes(' ') || val.includes('\n')) {
+    hideSug(); return;
   }
-  setTerminalOpen(false);
+  const filt = CMDS.filter(([cmd]) => cmd.startsWith(val));
+  if (!filt.length) { hideSug(); return; }
 
-  openLink.addEventListener('click', () => {
-    vscode.postMessage({ type: 'openTerminal' });
+  sugEl.innerHTML = '';
+  sugActive = -1;
+  sugItems  = filt.map(([cmd, desc], i) => {
+    const d = document.createElement('div');
+    d.className = 'sug-item';
+    d.innerHTML = '<span class="sug-cmd">' + cmd + '</span><span class="sug-desc">' + desc + '</span>';
+    d.addEventListener('mousedown', (e) => { e.preventDefault(); applySug(cmd); });
+    sugEl.appendChild(d);
+    return d;
   });
+  sugEl.classList.add('visible');
+  inputCard.classList.remove('no-suggestions');
+}
 
-  // ── Auto-resize textarea ──────────────────────────────────────
-  function resizeInput() {
-    inputEl.style.height = 'auto';
-    inputEl.style.height = Math.min(inputEl.scrollHeight, 200) + 'px';
+function hideSug() {
+  sugEl.classList.remove('visible');
+  inputCard.classList.add('no-suggestions');
+  sugItems  = [];
+  sugActive = -1;
+}
+
+function applySug(cmd) {
+  inputEl.value = cmd + ' ';
+  resizeInput();
+  hideSug();
+  inputEl.focus();
+}
+
+// ── Keys ─────────────────────────────────────────────────────
+inputEl.addEventListener('keydown', (e) => {
+  if (sugItems.length) {
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      sugActive = Math.min(sugActive + 1, sugItems.length - 1);
+      refreshSugActive(); return;
+    }
+    if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      sugActive = Math.max(sugActive - 1, -1);
+      refreshSugActive(); return;
+    }
+    if ((e.key === 'Tab' || e.key === 'Enter') && sugActive >= 0) {
+      e.preventDefault();
+      applySug(CMDS[sugActive][0]); return;
+    }
+    if (e.key === 'Escape') { hideSug(); return; }
   }
-  inputEl.addEventListener('input', resizeInput);
+  if (e.key === 'Enter' && !e.shiftKey)  { e.preventDefault(); doSubmit(); }
+  if (e.key === 'Escape' && responding)  { e.preventDefault(); doCancel(); }
+});
 
-  // ── Key handling ──────────────────────────────────────────────
-  inputEl.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); doSubmit(); }
-    if (e.key === 'Escape' && responding)  { e.preventDefault(); doCancel(); }
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && responding && document.activeElement !== inputEl) {
+    e.preventDefault(); doCancel();
+  }
+});
+
+function refreshSugActive() {
+  sugItems.forEach((el, i) => el.classList.toggle('active', i === sugActive));
+}
+
+// ── Submit ────────────────────────────────────────────────────
+submitBtn.addEventListener('click', () => { if (responding) doCancel(); else doSubmit(); });
+
+function doSubmit() {
+  const text = inputEl.value;
+  if (!text.trim() && !pendingFiles.length) return;
+  if (responding) return;
+
+  hideSug();
+  removeEmpty();
+
+  vscode.postMessage({
+    type: 'submit', text,
+    model: modelSel.value, thinking: thinkChk.checked,
+    files: pendingFiles.slice(),
   });
 
-  // ESC anywhere in the panel cancels while responding
-  document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape' && responding) { e.preventDefault(); doCancel(); }
-  });
+  inputEl.value = '';
+  resizeInput();
+  clearFiles();
+  setResponding(true);
+}
 
-  submitBtn.addEventListener('click', () => {
-    if (responding) doCancel();
-    else doSubmit();
-  });
+function doCancel() {
+  vscode.postMessage({ type: 'cancel' });
+  setResponding(false);
+  if (assistantEl) {
+    const cursor = assistantEl.querySelector('.cursor-blink');
+    if (cursor) cursor.remove();
+  }
+  finishTurn();
+}
 
-  // ── Submit ────────────────────────────────────────────────────
-  function doSubmit() {
-    const text = inputEl.value;
-    if (!text.trim() && pendingFiles.length === 0) return;
-    if (responding) return;
-
-    removeEmpty();
-    addMessage('user', text.trim() || '[files attached]');
-
-    vscode.postMessage({
-      type:     'submit',
-      text,
-      model:    modelSel.value,
-      thinking: thinkChk.checked,
-      files:    pendingFiles.slice(),
-    });
-
-    inputEl.value = '';
-    resizeInput();
-    clearFiles();
-    responding = true;
-    submitBtn.disabled = false;
+function setResponding(on) {
+  responding = on;
+  submitBtn.disabled = false;
+  if (on) {
     submitBtn.textContent = '■';
     submitBtn.title = 'Cancel (Esc)';
-    submitBtn.style.background = 'var(--vscode-inputValidation-errorBackground, #5a1d1d)';
-  }
-
-  // ── Cancel ────────────────────────────────────────────────────
-  function doCancel() {
-    if (!responding) return;
-    vscode.postMessage({ type: 'cancel' });
-    responding = false;
+    submitBtn.classList.add('stop');
+  } else {
     submitBtn.textContent = '↑';
     submitBtn.title = 'Send (Enter)';
-    submitBtn.style.background = '';
-    addMessage('system', 'cancelled');
+    submitBtn.classList.remove('stop');
   }
+}
 
-  // ── Message helpers ───────────────────────────────────────────
-  function removeEmpty() {
-    if (empty && empty.parentNode) empty.remove();
+// ── Conversation rendering ───────────────────────────────────
+function removeEmpty() {
+  if (emptyEl && emptyEl.parentNode) emptyEl.remove();
+}
+
+function startTurn(userText) {
+  activeTurn   = document.createElement('div');
+  activeTurn.className = 'turn';
+
+  const userDiv = document.createElement('div');
+  userDiv.className = 'msg-user';
+  userDiv.textContent = userText || '…';
+  activeTurn.appendChild(userDiv);
+
+  convEl.appendChild(activeTurn);
+  scroll();
+
+  assistantEl   = null;
+  assistantText = '';
+  activeToolPill = null;
+}
+
+function ensureAssistantEl() {
+  if (!assistantEl) {
+    assistantEl = document.createElement('div');
+    assistantEl.className = 'msg-assistant';
+    // Blinking cursor shown while streaming
+    const cur = document.createElement('span');
+    cur.className = 'cursor-blink';
+    assistantEl.appendChild(cur);
+    if (activeTurn) activeTurn.appendChild(assistantEl);
+    else convEl.appendChild(assistantEl);
   }
+}
 
-  function addMessage(cls, text, spinner) {
-    const d = document.createElement('div');
-    d.className = 'msg msg-' + cls;
-    d.textContent = text;
-    if (spinner) d.classList.add('dots');
-    messages.appendChild(d);
-    messages.scrollTop = messages.scrollHeight;
-    return d;
+function appendText(chunk) {
+  ensureAssistantEl();
+  assistantText += chunk;
+  // Render: remove cursor, set text, re-add cursor
+  const cur = assistantEl.querySelector('.cursor-blink');
+  if (cur) cur.remove();
+  assistantEl.textContent = assistantText;
+  const newCur = document.createElement('span');
+  newCur.className = 'cursor-blink';
+  assistantEl.appendChild(newCur);
+  scroll();
+}
+
+function addToolPill(name, running) {
+  ensureAssistantEl();
+  // End previous tool pill
+  if (activeToolPill) { activeToolPill.classList.remove('running'); activeToolPill.classList.add('done'); }
+
+  const pill = document.createElement('div');
+  pill.className = 'tool-pill' + (running ? ' running' : ' done');
+  const icon = running ? '⟳' : '✓';
+  const label = name.replace(/^Semantic:\s*/i, '');
+  pill.textContent = icon + ' ' + label;
+  if (activeTurn) activeTurn.appendChild(pill);
+  else convEl.appendChild(pill);
+  activeToolPill = running ? pill : null;
+  scroll();
+}
+
+function finishTurn() {
+  if (assistantEl) {
+    const cur = assistantEl.querySelector('.cursor-blink');
+    if (cur) cur.remove();
   }
+  if (activeToolPill) { activeToolPill.classList.remove('running'); activeToolPill.classList.add('done'); }
+  activeTurn    = null;
+  assistantEl   = null;
+  assistantText = '';
+  activeToolPill = null;
+}
 
-  // ── Messages from extension ───────────────────────────────────
-  window.addEventListener('message', (ev) => {
-    const msg = ev.data;
-    switch (msg.type) {
-      case 'done':
-        responding = false;
-        submitBtn.textContent = '↑';
-        submitBtn.title = 'Send (Enter)';
-        submitBtn.style.background = '';
-        break;
-      case 'error':
-        addMessage('error', msg.message);
-        responding = false;
-        submitBtn.textContent = '↑';
-        submitBtn.title = 'Send (Enter)';
-        submitBtn.style.background = '';
-        break;
-      case 'petState':
-        drawPet(msg);
-        break;
-      case 'terminalStatus':
-        setTerminalOpen(msg.open);
-        break;
-    }
-  });
+function scroll() { convEl.scrollTop = convEl.scrollHeight; }
 
-  // ── File attachment ───────────────────────────────────────────
-  attachBtn.addEventListener('click', () => fileInput.click());
-  fileInput.addEventListener('change', async () => {
-    for (const f of Array.from(fileInput.files || [])) {
-      const content = await readFile(f);
-      pendingFiles.push({ name: f.name, content, fileType: f.type });
-    }
-    fileInput.value = '';
-    renderChips();
-  });
-
-  function readFile(f) {
-    return new Promise(resolve => {
-      const r = new FileReader();
-      if (f.type.startsWith('image/')) {
-        r.onload = e => resolve(e.target.result);
-        r.readAsDataURL(f);
-      } else {
-        r.onload = e => resolve(e.target.result);
-        r.readAsText(f);
+// ── Messages from extension ──────────────────────────────────
+window.addEventListener('message', (ev) => {
+  const msg = ev.data;
+  switch (msg.type) {
+    // --- streaming chat events from bk1 ---
+    case 'chatEvent': {
+      const e = msg.event;
+      switch (e.type) {
+        case 'user':
+          startTurn(e.text);
+          break;
+        case 'text':
+          appendText(e.chunk);
+          break;
+        case 'tool_start':
+          addToolPill(e.name, true);
+          break;
+        case 'done':
+          finishTurn();
+          setResponding(false);
+          break;
       }
-    });
-  }
-
-  function renderChips() {
-    chipList.innerHTML = '';
-    pendingFiles.forEach((f, i) => {
-      const chip = document.createElement('div');
-      chip.className = 'file-chip';
-      chip.innerHTML = '<span>' + f.name + '</span>';
-      const btn = document.createElement('button');
-      btn.textContent = '×';
-      btn.addEventListener('click', () => { pendingFiles.splice(i, 1); renderChips(); });
-      chip.appendChild(btn);
-      chipList.appendChild(chip);
-    });
-  }
-
-  function clearFiles() { pendingFiles = []; renderChips(); }
-
-  // ── Model / thinking ─────────────────────────────────────────
-  modelSel.addEventListener('change', () => {
-    vscode.postMessage({ type: 'modelChange', model: modelSel.value });
-  });
-  thinkChk.addEventListener('change', () => {
-    vscode.postMessage({ type: 'thinkingToggle', enabled: thinkChk.checked });
-  });
-
-  // ── Pet sprite ────────────────────────────────────────────────
-  function cellColors(ch, body) {
-    switch (ch) {
-      case 'B': return { top: body,  bot: body  };
-      case 'V': return { top: EYE,   bot: body  };
-      case 'M': return { top: body,  bot: EYE   };
-      case 'Y': return { top: BLINK, bot: body  };
-      case 'H': return { top: body,  bot: body,  line: true };
-      case 'L': return { top: null,  bot: body  };
-      case 'U': return { top: body,  bot: null  };
-      case ' ': return { top: null,  bot: null  };
-      default:  return { top: body,  bot: body  };
+      break;
     }
+    case 'done':
+      finishTurn();
+      setResponding(false);
+      break;
+    case 'error':
+      finishTurn();
+      setResponding(false);
+      {
+        const d = document.createElement('div');
+        d.className = 'tool-pill';
+        d.style.color = '#f48771';
+        d.textContent = '✕ ' + msg.message;
+        convEl.appendChild(d);
+        scroll();
+      }
+      break;
+    case 'petState':
+      drawPet(msg);
+      break;
+    case 'terminalStatus':
+      setTermOpen(msg.open);
+      break;
   }
+});
 
-  function drawFrame(rows, body) {
-    ctx2d.clearRect(0, 0, canvas.width, canvas.height);
-    const half = CELL_H / 2;
-    rows.forEach((row, ri) => {
-      [...row].forEach((ch, ci) => {
-        const x = ci * CELL_W, y = ri * CELL_H;
-        const c = cellColors(ch, body);
-        if (c.top)  { ctx2d.fillStyle = c.top;  ctx2d.fillRect(x, y, CELL_W, half); }
-        if (c.bot)  { ctx2d.fillStyle = c.bot;  ctx2d.fillRect(x, y + half, CELL_W, half); }
-        if (c.line) { ctx2d.fillStyle = EYE;    ctx2d.fillRect(x, y + half - 1, CELL_W, 2); }
-      });
-    });
+// ── File attachment ──────────────────────────────────────────
+attachBtn.addEventListener('click', () => fileInput.click());
+fileInput.addEventListener('change', async () => {
+  for (const f of Array.from(fileInput.files || [])) {
+    const content = await readFile(f);
+    pendingFiles.push({ name: f.name, content, fileType: f.type });
   }
-
-  const NORMAL = ['BBBBBBBBB', 'BBVBBBVBB', 'BBBBBBBBB'];
-  const SLEEP  = ['BBBBBBBBB', 'BHHBBBHHB', 'BBBBBBBBB'];
-  const EAT_A  = ['BBBBBBBBB', 'BBVBBBVBB', 'BBB)WBBBB'];
-  const EAT_B  = ['BBBBBBBBB', 'BBVBBBVBB', 'BBB)TBBBB'];
-  const LOOK_L = ['BBBBBBBBB', 'BVBBBVBBB', 'BBBBBBBBB'];
-  const LOOK_R = ['BBBBBBBBB', 'BBBVBBBVB', 'BBBBBBBBB'];
-  const LOOK_U = ['BBMBBBMBB', 'BBBBBBBBB', 'BBBBBBBBB'];
-  const LOOK_D = ['BBBBBBBBB', 'BBMBBBMBB', 'BBBBBBBBB'];
-
-  let currentBody  = '#9FE749';
-  let currentMood  = 'happy';
-  let currentEat   = false;
-  let eatFrame     = 0;
-  let eatTimer     = null;
-  let eyeDir       = 'normal';
-
-  canvas.addEventListener('mousemove', (e) => {
-    const r  = canvas.getBoundingClientRect();
-    const dx = e.clientX - r.left  - r.width  / 2;
-    const dy = e.clientY - r.top   - r.height / 2;
-    const ax = Math.abs(dx), ay = Math.abs(dy);
-    if (ax < 3 && ay < 3)     eyeDir = 'normal';
-    else if (ay > ax * 1.5)   eyeDir = dy < 0 ? 'up'   : 'down';
-    else if (ax > ay * 1.5)   eyeDir = dx < 0 ? 'left' : 'right';
-    else                      eyeDir = dy < 0 ? 'up'   : 'down';
-    refresh();
+  fileInput.value = '';
+  renderChips();
+});
+function readFile(f) {
+  return new Promise(r => {
+    const fr = new FileReader();
+    if (f.type.startsWith('image/')) { fr.onload = e => r(e.target.result); fr.readAsDataURL(f); }
+    else                             { fr.onload = e => r(e.target.result); fr.readAsText(f); }
   });
-  canvas.addEventListener('mouseleave', () => { eyeDir = 'normal'; refresh(); });
+}
+function renderChips() {
+  chipList.innerHTML = '';
+  pendingFiles.forEach((f, i) => {
+    const c = document.createElement('div'); c.className = 'chip';
+    const s = document.createElement('span'); s.textContent = f.name;
+    const b = document.createElement('button'); b.textContent = '×';
+    b.addEventListener('click', () => { pendingFiles.splice(i, 1); renderChips(); });
+    c.appendChild(s); c.appendChild(b); chipList.appendChild(c);
+  });
+}
+function clearFiles() { pendingFiles = []; renderChips(); }
 
-  function frameFor(mood, eating) {
-    if (mood === 'sleeping') return SLEEP;
-    if (eating) return eatFrame % 2 === 0 ? EAT_A : EAT_B;
-    switch (eyeDir) {
-      case 'left':  return LOOK_L;
-      case 'right': return LOOK_R;
-      case 'up':    return LOOK_U;
-      case 'down':  return LOOK_D;
-      default:      return NORMAL;
+modelSel.addEventListener('change', () => vscode.postMessage({ type: 'modelChange', model: modelSel.value }));
+
+// ── Pet sprite ────────────────────────────────────────────────
+function cellColors(ch, body) {
+  switch (ch) {
+    case 'B': return { t: body,  b: body,  line: false };
+    case 'V': return { t: EYE,   b: body,  line: false };
+    case 'M': return { t: body,  b: EYE,   line: false };
+    case 'Y': return { t: BLINK_COL, b: body, line: false };
+    case 'H': return { t: body,  b: body,  line: true  };
+    case 'L': return { t: null,  b: body,  line: false };
+    case 'U': return { t: body,  b: null,  line: false };
+    case ' ': return { t: null,  b: null,  line: false };
+    default:  return { t: body,  b: body,  line: false };
+  }
+}
+function drawFrame(rows, body) {
+  ctx2d.clearRect(0, 0, canvas.width, canvas.height);
+  const h2 = CELL_H / 2;
+  rows.forEach((row, ri) => {
+    [...row].forEach((ch, ci) => {
+      const x = ci * CELL_W, y = ri * CELL_H;
+      const c = cellColors(ch, body);
+      if (c.t)    { ctx2d.fillStyle = c.t; ctx2d.fillRect(x, y,      CELL_W, h2); }
+      if (c.b)    { ctx2d.fillStyle = c.b; ctx2d.fillRect(x, y + h2, CELL_W, h2); }
+      if (c.line) { ctx2d.fillStyle = EYE; ctx2d.fillRect(x, y + h2 - 1, CELL_W, 2); }
+    });
+  });
+}
+
+const FRAMES = {
+  normal: ['BBBBBBBBB', 'BBVBBBVBB', 'BBBBBBBBB'],
+  blink:  ['BBBBBBBBB', 'BBBBBBBBB', 'BBBBBBBBB'],
+  sleep:  ['BBBBBBBBB', 'BHHBBBHHB', 'BBBBBBBBB'],
+  eat_a:  ['BBBBBBBBB', 'BBVBBBVBB', 'BBB)WBBBB'],
+  eat_b:  ['BBBBBBBBB', 'BBVBBBVBB', 'BBB)TBBBB'],
+  left:   ['BBBBBBBBB', 'BVBBBVBBB', 'BBBBBBBBB'],
+  right:  ['BBBBBBBBB', 'BBBVBBBVB', 'BBBBBBBBB'],
+  up:     ['BBMBBBMBB', 'BBBBBBBBB', 'BBBBBBBBB'],
+  down:   ['BBBBBBBBB', 'BBMBBBMBB', 'BBBBBBBBB'],
+};
+
+let body      = '#9FE749';
+let mood      = 'happy';
+let eating    = false;
+let eatFrame  = 0;
+let eatTimer  = null;
+let eyeDir    = 'normal';
+let blinking  = false;
+
+function currentFrame() {
+  if (mood === 'sleeping') return FRAMES.sleep;
+  if (eating) return eatFrame % 2 === 0 ? FRAMES.eat_a : FRAMES.eat_b;
+  if (blinking) return FRAMES.blink;
+  return FRAMES[eyeDir] || FRAMES.normal;
+}
+function refresh() { drawFrame(currentFrame(), body); }
+
+// Eye tracking
+canvas.addEventListener('mousemove', (e) => {
+  const r = canvas.getBoundingClientRect();
+  const dx = e.clientX - r.left - r.width / 2;
+  const dy = e.clientY - r.top  - r.height / 2;
+  const ax = Math.abs(dx), ay = Math.abs(dy);
+  if (ax < 3 && ay < 3)    eyeDir = 'normal';
+  else if (ay > ax * 1.5)  eyeDir = dy < 0 ? 'up'   : 'down';
+  else if (ax > ay * 1.5)  eyeDir = dx < 0 ? 'left' : 'right';
+  else                     eyeDir = dy < 0 ? 'up'   : 'down';
+  refresh();
+});
+canvas.addEventListener('mouseleave', () => { eyeDir = 'normal'; refresh(); });
+
+// Click to check on Motchi
+canvas.addEventListener('click', () => {
+  vscode.postMessage({ type: 'submit', text: '/pet', model: modelSel.value, thinking: false, files: [] });
+});
+
+// Blink animation (random interval 3–8s)
+function scheduleBlink() {
+  const delay = 3000 + Math.random() * 5000;
+  setTimeout(() => {
+    blinking = true; refresh();
+    setTimeout(() => { blinking = false; refresh(); scheduleBlink(); }, 150);
+  }, delay);
+}
+scheduleBlink();
+
+// Idle look-around (random interval 6–14s)
+function scheduleIdle() {
+  const delay = 6000 + Math.random() * 8000;
+  setTimeout(() => {
+    if (eyeDir === 'normal') {
+      const dirs = ['left', 'right', 'up', 'down'];
+      eyeDir = dirs[Math.floor(Math.random() * dirs.length)];
+      refresh();
+      setTimeout(() => { eyeDir = 'normal'; refresh(); scheduleIdle(); }, 800);
+    } else {
+      scheduleIdle();
     }
-  }
+  }, delay);
+}
+scheduleIdle();
 
-  function refresh() { drawFrame(frameFor(currentMood, currentEat), currentBody); }
+function drawPet(msg) {
+  body  = msg.color || '#9FE749';
+  mood  = msg.mood  || 'happy';
+  eating = !!msg.isEating;
+  if (eatTimer) { clearInterval(eatTimer); eatTimer = null; }
+  if (eating) eatTimer = setInterval(() => { eatFrame++; refresh(); }, 300);
+  refresh();
+}
 
-  function drawPet(msg) {
-    currentBody = msg.color || '#9FE749';
-    currentMood = msg.mood  || 'happy';
-    currentEat  = !!msg.isEating;
-    if (eatTimer) { clearInterval(eatTimer); eatTimer = null; }
-    if (currentEat) eatTimer = setInterval(() => { eatFrame++; refresh(); }, 300);
-    refresh();
-  }
-
-  drawFrame(NORMAL, '#9FE749');
-  inputEl.focus();
+drawFrame(FRAMES.normal, '#9FE749');
+inputEl.focus();
 })();
 </script>
 </body>
@@ -672,7 +854,7 @@ function buildHtml(
 }
 
 // ---------------------------------------------------------------------------
-// Editor panel — opens as a tab with ViewColumn.Beside (Claude Code style)
+// Editor panel (WebviewPanel — opens beside code files, Claude Code style)
 // ---------------------------------------------------------------------------
 
 export class Bk1ChatPanel {
@@ -680,7 +862,7 @@ export class Bk1ChatPanel {
   static currentPanel?: Bk1ChatPanel;
 
   private readonly panel: vscode.WebviewPanel;
-  private pollTimer?: NodeJS.Timeout;
+  private petTimer?: NodeJS.Timeout;
   private readonly getTerminal: () => vscode.Terminal | undefined;
 
   static createOrReveal(
@@ -696,11 +878,7 @@ export class Bk1ChatPanel {
       Bk1ChatPanel.viewType,
       'bk1',
       { viewColumn: vscode.ViewColumn.Beside, preserveFocus: true },
-      {
-        enableScripts: true,
-        retainContextWhenHidden: true,
-        localResourceRoots: [ctx.extensionUri],
-      },
+      { enableScripts: true, retainContextWhenHidden: true, localResourceRoots: [ctx.extensionUri] },
     );
     panel.iconPath = iconUri;
     const instance = new Bk1ChatPanel(panel, ctx, getTerminal);
@@ -715,145 +893,39 @@ export class Bk1ChatPanel {
   ) {
     this.panel       = panel;
     this.getTerminal = getTerminal;
-
     panel.webview.html = buildHtml(panel.webview, 'panel');
-    panel.webview.onDidReceiveMessage(msg => this.handleMessage(msg));
+    panel.webview.onDidReceiveMessage(msg => this.handle(msg));
     panel.onDidDispose(() => {
-      if (this.pollTimer) clearInterval(this.pollTimer);
+      if (this.petTimer) clearInterval(this.petTimer);
       Bk1ChatPanel.currentPanel = undefined;
     });
-
-    this.sendPetState();
-    this.pollTimer = setInterval(() => this.sendPetState(), 2000);
+    this.pushPet();
+    this.petTimer = setInterval(() => this.pushPet(), 2000);
   }
 
-  private sendPetState() {
-    const pet = readPetState();
-    if (!pet) return;
-    const now   = new Date();
-    const color = petColorHex(pet);
-    const mood  = petMood(pet, now);
-    void this.panel.webview.postMessage({
-      type: 'petState',
-      color, mood,
-      isSleeping: mood === 'sleeping',
-      isEating: !!pet.eating_until && new Date(pet.eating_until) > now,
-    });
+  /** Forward a parsed chat event line from the events file to the webview. */
+  sendEvent(event: Record<string, unknown>) {
+    void this.panel.webview.postMessage({ type: 'chatEvent', event });
   }
 
-  /** Notify the webview whether the bk1 terminal is currently running. */
   notifyTerminalStatus(open: boolean) {
     void this.panel.webview.postMessage({ type: 'terminalStatus', open });
   }
 
-  private handleMessage(msg: { type: string; [k: string]: unknown }) {
-    switch (msg.type) {
-      case 'submit': {
-        const text    = (msg.text    as string) ?? '';
-        const files   = (msg.files   as { name: string; content: string; fileType: string }[]) ?? [];
-        this.submit(text, files);
-        break;
-      }
-      case 'cancel':
-        // Send Ctrl+C to bk1 to interrupt the running agent loop.
-        this.getTerminal()?.sendText('\x03', false);
-        break;
-      case 'openTerminal':
-        void vscode.commands.executeCommand('bk1.open');
-        break;
-    }
-  }
-
-  private submit(
-    text: string,
-    files: { name: string; content: string; fileType: string }[],
-  ) {
-    const terminal = this.getTerminal();
-    if (!terminal) {
-      void this.panel.webview.postMessage({
-        type: 'error',
-        message: 'bk1 terminal is not running — click the link above to open it.',
-      });
-      return;
-    }
-
-    const parts: string[] = [];
-    for (const f of files) {
-      if (f.fileType.startsWith('image/')) {
-        try {
-          const tmpPath = path.join(os.tmpdir(), `bk1-${Date.now()}-${f.name}`);
-          const b64 = f.content.replace(/^data:[^,]+,/, '');
-          fs.writeFileSync(tmpPath, Buffer.from(b64, 'base64'));
-          parts.push(`[Attached image: ${tmpPath}]`);
-        } catch {
-          parts.push(`[Image attachment failed: ${f.name}]`);
-        }
-      } else {
-        parts.push(`[Attached file: ${f.name}]\n${f.content}`);
-      }
-    }
-    if (text.trim()) parts.push(text.trim());
-    const full = parts.join('\n\n');
-    if (!full) return;
-
-    terminal.sendText(full, true);
-    // show terminal briefly so user sees the response, but don't steal focus
-    terminal.show(true);
-    // signal done immediately — we can't detect when bk1 finishes yet
-    void this.panel.webview.postMessage({ type: 'done' });
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Sidebar view — small preview in the activity-bar panel
-// ---------------------------------------------------------------------------
-
-export class Bk1ChatViewProvider implements vscode.WebviewViewProvider {
-  static readonly viewId = 'bk1.chat';
-
-  private view?: vscode.WebviewView;
-  private pollTimer?: NodeJS.Timeout;
-
-  constructor(
-    private readonly ctx: vscode.ExtensionContext,
-    private readonly getTerminal: () => vscode.Terminal | undefined,
-  ) {}
-
-  resolveWebviewView(
-    webviewView: vscode.WebviewView,
-    _context: vscode.WebviewViewResolveContext,
-    _token: vscode.CancellationToken,
-  ) {
-    this.view = webviewView;
-    webviewView.webview.options = {
-      enableScripts: true,
-      localResourceRoots: [this.ctx.extensionUri],
-    };
-    webviewView.webview.html = buildHtml(webviewView.webview, 'sidebar');
-    webviewView.webview.onDidReceiveMessage(msg => this.handleMessage(msg));
-
-    this.sendPetState();
-    this.pollTimer = setInterval(() => this.sendPetState(), 2000);
-    webviewView.onDidDispose(() => {
-      if (this.pollTimer) { clearInterval(this.pollTimer); this.pollTimer = undefined; }
-    });
-  }
-
-  private sendPetState() {
-    if (!this.view) return;
+  private pushPet() {
     const pet = readPetState();
     if (!pet) return;
-    const now   = new Date();
-    const color = petColorHex(pet);
-    const mood  = petMood(pet, now);
-    void this.view.webview.postMessage({
-      type: 'petState', color, mood,
-      isSleeping: mood === 'sleeping',
+    const now = new Date();
+    void this.panel.webview.postMessage({
+      type: 'petState',
+      color: petColorHex(pet),
+      mood: petMood(pet, now),
+      isSleeping: petMood(pet, now) === 'sleeping',
       isEating: !!pet.eating_until && new Date(pet.eating_until) > now,
     });
   }
 
-  private handleMessage(msg: { type: string; [k: string]: unknown }) {
+  private handle(msg: { type: string; [k: string]: unknown }) {
     switch (msg.type) {
       case 'submit': {
         const text  = (msg.text  as string) ?? '';
@@ -873,15 +945,19 @@ export class Bk1ChatViewProvider implements vscode.WebviewViewProvider {
   private submit(text: string, files: { name: string; content: string; fileType: string }[]) {
     const terminal = this.getTerminal();
     if (!terminal) {
-      void this.view?.webview.postMessage({ type: 'error', message: 'bk1 terminal is not open.' });
+      void this.panel.webview.postMessage({ type: 'error', message: 'bk1 terminal not running — click the link above.' });
       return;
     }
     const parts: string[] = [];
     for (const f of files) {
       if (f.fileType.startsWith('image/')) {
-        parts.push(`[Image: ${f.name}]`);
+        try {
+          const tmp = path.join(os.tmpdir(), `bk1-${Date.now()}-${f.name}`);
+          fs.writeFileSync(tmp, Buffer.from(f.content.replace(/^data:[^,]+,/, ''), 'base64'));
+          parts.push(`[Attached image: ${tmp}]`);
+        } catch { parts.push(`[Image failed: ${f.name}]`); }
       } else {
-        parts.push(`[File: ${f.name}]\n${f.content}`);
+        parts.push(`[Attached file: ${f.name}]\n${f.content}`);
       }
     }
     if (text.trim()) parts.push(text.trim());
@@ -889,6 +965,66 @@ export class Bk1ChatViewProvider implements vscode.WebviewViewProvider {
     if (!full) return;
     terminal.sendText(full, true);
     terminal.show(true);
-    void this.view?.webview.postMessage({ type: 'done' });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Sidebar view (small companion — same HTML, sidebar sizing)
+// ---------------------------------------------------------------------------
+
+export class Bk1ChatViewProvider implements vscode.WebviewViewProvider {
+  static readonly viewId = 'bk1.chat';
+
+  private view?: vscode.WebviewView;
+  private petTimer?: NodeJS.Timeout;
+
+  constructor(
+    private readonly ctx: vscode.ExtensionContext,
+    private readonly getTerminal: () => vscode.Terminal | undefined,
+  ) {}
+
+  resolveWebviewView(view: vscode.WebviewView) {
+    this.view = view;
+    view.webview.options = { enableScripts: true, localResourceRoots: [this.ctx.extensionUri] };
+    view.webview.html = buildHtml(view.webview, 'sidebar');
+    view.webview.onDidReceiveMessage(msg => this.handle(msg));
+    this.pushPet();
+    this.petTimer = setInterval(() => this.pushPet(), 2000);
+    view.onDidDispose(() => { if (this.petTimer) { clearInterval(this.petTimer); this.petTimer = undefined; } });
+  }
+
+  private pushPet() {
+    if (!this.view) return;
+    const pet = readPetState();
+    if (!pet) return;
+    const now = new Date();
+    void this.view.webview.postMessage({
+      type: 'petState', color: petColorHex(pet), mood: petMood(pet, now),
+      isSleeping: petMood(pet, now) === 'sleeping',
+      isEating: !!pet.eating_until && new Date(pet.eating_until) > now,
+    });
+  }
+
+  private handle(msg: { type: string; [k: string]: unknown }) {
+    const t = this.getTerminal();
+    switch (msg.type) {
+      case 'submit': {
+        const text  = (msg.text  as string) ?? '';
+        const files = (msg.files as { name: string; content: string; fileType: string }[]) ?? [];
+        if (!t) { void this.view?.webview.postMessage({ type: 'error', message: 'bk1 terminal not open.' }); return; }
+        const parts: string[] = [];
+        for (const f of files) parts.push(f.fileType.startsWith('image/') ? `[Image: ${f.name}]` : `[File: ${f.name}]\n${f.content}`);
+        if (text.trim()) parts.push(text.trim());
+        const full = parts.join('\n\n');
+        if (full) { t.sendText(full, true); t.show(true); }
+        break;
+      }
+      case 'cancel':
+        t?.sendText('\x03', false);
+        break;
+      case 'openTerminal':
+        void vscode.commands.executeCommand('bk1.open');
+        break;
+    }
   }
 }
