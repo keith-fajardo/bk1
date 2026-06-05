@@ -970,7 +970,14 @@ export class Bk1ChatPanel {
     if (text.trim()) parts.push(text.trim());
     const full = parts.join('\n\n');
     if (!full) return;
-    terminal.sendText(full, true);
+    // Two writes, not sendText(full, true). bk1's Ink input only submits on a
+    // LONE carriage return — parseKeypress classifies a multi-char chunk ending
+    // in \r as printable text (name:''), so "<text>\r" in one write lands in the
+    // input box unsubmitted. The text first, then a separate lone \r that Ink
+    // reads as key.return. \r (0x0D), not \n — a lone \n parses as 'enter', which
+    // bk1 also doesn't treat as submit.
+    terminal.sendText(full, false);
+    setTimeout(() => terminal.sendText('\r', false), 30);
   }
 }
 
