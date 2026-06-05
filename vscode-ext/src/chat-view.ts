@@ -46,7 +46,7 @@ function makeNonce(): string { return crypto.randomBytes(16).toString('hex'); }
 // Shared HTML
 // ---------------------------------------------------------------------------
 
-function buildHtml(webview: vscode.Webview, mode: 'panel' | 'sidebar'): string {
+function buildHtml(webview: vscode.Webview, mode: 'panel' | 'sidebar', version: string): string {
   const n      = makeNonce();
   const csp    = [
     `default-src 'none'`,
@@ -128,6 +128,7 @@ function buildHtml(webview: vscode.Webview, mode: 'panel' | 'sidebar'): string {
   #empty .icon { font-size: 28px; }
   #empty .title { font-size: 14px; font-weight: 500; opacity: 0.7; }
   #empty .hint  { font-size: 11.5px; opacity: 0.45; line-height: 1.5; }
+  #empty .ver   { font-size: 10.5px; opacity: 0.35; margin-top: 4px; font-variant-numeric: tabular-nums; }
 
   /* Turn: wrapper groups user msg + assistant response */
   .turn { display: flex; flex-direction: column; gap: 0; margin-bottom: 12px; }
@@ -367,6 +368,7 @@ function buildHtml(webview: vscode.Webview, mode: 'panel' | 'sidebar'): string {
     <div class="icon">🌿</div>
     <div class="title">bk1 · dbt agent</div>
     <div class="hint">Type a message below to start.<br>Responses stream in here live.</div>
+    <div class="ver">v${version}</div>
   </div>
 </div>
 
@@ -900,7 +902,8 @@ export class Bk1ChatPanel {
   ) {
     this.panel       = panel;
     this.getTerminal = getTerminal;
-    panel.webview.html = buildHtml(panel.webview, 'panel');
+    const version = (ctx.extension.packageJSON as { version?: string }).version ?? '?';
+    panel.webview.html = buildHtml(panel.webview, 'panel', version);
     panel.webview.onDidReceiveMessage(msg => this.handle(msg));
     panel.onDidDispose(() => {
       if (this.petTimer) clearInterval(this.petTimer);
