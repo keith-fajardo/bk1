@@ -209,8 +209,15 @@ Read the artifact FIRST, then evaluate. Do not ask clarifying questions before r
    - CRITICAL — violates fundamental Kimball; numbers will be wrong or unmaintainable. Examples: mixed grain in one fact, fact joined to fact, missing FK to existing conformed dim, semi-additive fact summed across time, no declared grain, SCD1 used where history is required.
    - MODERATE — sub-optimal; works today but creates friction. Examples: snowflaked dim that should be flat, missing surrogate key, no junk dim for low-cardinality flags, role-playing dim not aliased, outrigger that should be denormalized, missing relationships test.
    - MINOR — convention/polish. Examples: missing fct_/dim_ prefix, missing yml description, missing unique test on grain key.
-8. Output per finding: "[Severity] Short label" + what's wrong (point at specific column/line) + Kimball rule violated (+ citation if library installed) + suggested fix in dbt terms (table below).
-9. Overall verdict: PASS / PASS WITH CHANGES / REDESIGN NEEDED. If >3 findings, name the 1–2 highest-leverage fixes.
+8. Verify each MODERATE or CRITICAL finding before reporting it. For every such finding, go back to the SQL and YAML you already read and check whether a compensating control already handles the concern:
+   - Upstream coalesce(x, sentinel) that makes a NULL guard redundant or changes FK semantics — if an FK is always coalesced to a sentinel, a "missing relationships test" or "null FK" finding is a different problem than it first appears.
+   - Sentinel rows documented or tested in the referenced dim (e.g. a where: "sk != -1" guard on the dim's unique test, or an explicit -1 row in the dim SQL) — if the sentinel exists in the dim, a relationships test that lets sentinel values through is not broken.
+   - Guarded tests (where: clauses) that already compensate for the apparent deviation — dead guards (filters that never exclude rows) are a style issue, not a structural violation.
+   - YAML descriptions that document an intentional design choice explaining the deviation.
+   If a compensating control fully addresses the structural concern: downgrade the finding one level (CRITICAL→MODERATE, MODERATE→MINOR) or drop it if the design is correct and only the documentation is wrong. Do NOT drop a finding silently — if you downgrade, say why.
+   Separate what you verified (you read the code and confirmed it) from what you inferred (you did not check all compensating controls). Label each finding: Verified or Inferred. If Inferred, name what you didn't check.
+9. Output per finding: "[Severity][Verified|Inferred] Short label" + what's wrong (point at specific column/line) + Kimball rule violated (+ citation if library installed) + suggested fix in dbt terms (table below).
+10. Overall verdict: PASS / PASS WITH CHANGES / REDESIGN NEEDED. If >3 findings, name the 1–2 highest-leverage fixes.
 
 ### Sub-mode: Classify shape
 When the user asks "is <model> a fact / dimension / <Kimball object>?" — answer with shape classification, not a full review. Output:
