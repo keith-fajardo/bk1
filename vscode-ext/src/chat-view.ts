@@ -873,10 +873,12 @@ export class Bk1ChatPanel {
   private readonly panel: vscode.WebviewPanel;
   private petTimer?: NodeJS.Timeout;
   private readonly getTerminal: () => vscode.Terminal | undefined;
+  private readonly deliverPrompt: (line: string) => void | Promise<void>;
 
   static createOrReveal(
     ctx: vscode.ExtensionContext,
     getTerminal: () => vscode.Terminal | undefined,
+    deliverPrompt: (line: string) => void | Promise<void>,
   ): Bk1ChatPanel {
     if (Bk1ChatPanel.currentPanel) {
       Bk1ChatPanel.currentPanel.panel.reveal(vscode.ViewColumn.Beside, true);
@@ -890,7 +892,7 @@ export class Bk1ChatPanel {
       { enableScripts: true, retainContextWhenHidden: true, localResourceRoots: [ctx.extensionUri] },
     );
     panel.iconPath = iconUri;
-    const instance = new Bk1ChatPanel(panel, ctx, getTerminal);
+    const instance = new Bk1ChatPanel(panel, ctx, getTerminal, deliverPrompt);
     Bk1ChatPanel.currentPanel = instance;
     return instance;
   }
@@ -899,9 +901,11 @@ export class Bk1ChatPanel {
     panel: vscode.WebviewPanel,
     ctx: vscode.ExtensionContext,
     getTerminal: () => vscode.Terminal | undefined,
+    deliverPrompt: (line: string) => void | Promise<void>,
   ) {
-    this.panel       = panel;
-    this.getTerminal = getTerminal;
+    this.panel         = panel;
+    this.getTerminal   = getTerminal;
+    this.deliverPrompt = deliverPrompt;
     const version = (ctx.extension.packageJSON as { version?: string }).version ?? '?';
     panel.webview.html = buildHtml(panel.webview, 'panel', version);
     panel.webview.onDidReceiveMessage(msg => this.handle(msg));
@@ -938,26 +942,30 @@ export class Bk1ChatPanel {
   private handle(msg: { type: string; [k: string]: unknown }) {
     switch (msg.type) {
       case 'submit': {
-        const text  = (msg.text  as string) ?? '';
-        const files = (msg.files as { name: string; content: string; fileType: string }[]) ?? [];
-        this.submit(text, files);
+        const text     = (msg.text  as string) ?? '';
+        const files    = (msg.files as { name: string; content: string; fileType: string }[]) ?? [];
+        const model    = typeof msg.model === 'string' ? msg.model : undefined;
+        const thinking = msg.thinking === true;
+        this.submit(text, files, model, thinking);
         break;
       }
-      case 'cancel':
-        this.getTerminal()?.sendText('\x03', false);
+      case 'cancel': {
+        // Interrupt the running turn by sending Ctrl+C to the bk1 TUI — but only
+        // if its process is live. sendText to a dead terminal would relaunch it.
+        const t = this.getTerminal();
+        if (t && t.exitStatus === undefined) t.sendText('\x03', false);
+        else void this.panel.webview.postMessage({ type: 'done' });
         break;
+      }
       case 'openTerminal':
         void vscode.commands.executeCommand('bk1.open');
         break;
     }
   }
 
-  private submit(text: string, files: { name: string; content: string; fileType: string }[]) {
-    const terminal = this.getTerminal();
-    if (!terminal) {
-      void this.panel.webview.postMessage({ type: 'error', message: 'bk1 terminal not running — click the link above.' });
-      return;
-    }
+  private submit(text: string, files: { name: string; content: string; fileType: string }[], model?: string, thinking?: boolean) {
+    // Inline attachments into the prompt text (images written to a tmp file and
+    // referenced by path) — same composition as before; bk1 receives one string.
     const parts: string[] = [];
     for (const f of files) {
       if (f.fileType.startsWith('image/')) {
@@ -973,14 +981,13 @@ export class Bk1ChatPanel {
     if (text.trim()) parts.push(text.trim());
     const full = parts.join('\n\n');
     if (!full) return;
-    // Two writes, not sendText(full, true). bk1's Ink input only submits on a
-    // LONE carriage return — parseKeypress classifies a multi-char chunk ending
-    // in \r as printable text (name:''), so "<text>\r" in one write lands in the
-    // input box unsubmitted. The text first, then a separate lone \r that Ink
-    // reads as key.return. \r (0x0D), not \n — a lone \n parses as 'enter', which
-    // bk1 also doesn't treat as submit.
-    terminal.sendText(full, false);
-    setTimeout(() => terminal.sendText('\r', false), 30);
+    // Deliver via the append-only prompt-input channel — NOT terminal keystroke
+    // injection (which silently dropped the prompt whenever the hosting terminal's
+    // process had exited). The extension writes this line and guarantees bk1 is
+    // running; bk1's fs.watch drains it straight into its agent loop. ts lets bk1
+    // gate stale-replay on a relaunch (PROMPT_INPUT_FRESH_MS in app.tsx).
+    const line = JSON.stringify({ text: full, model, thinking: !!thinking, files: [], ts: Date.now() });
+    void this.deliverPrompt(line);
   }
 }
 

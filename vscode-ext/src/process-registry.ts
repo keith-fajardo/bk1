@@ -97,7 +97,7 @@ function hostStart(): string {
 
 // Signal 0 probes existence without delivering anything. EPERM means the
 // process exists but is owned by someone else (still "alive" for our purposes).
-function isAlive(pid: number): boolean {
+export function isAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
     return true;

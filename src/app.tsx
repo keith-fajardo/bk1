@@ -1,5 +1,5 @@
 import { useState, useRef, useCallback, useMemo, useEffect } from 'react';
-import { existsSync, mkdirSync, writeFileSync, appendFileSync } from 'fs';
+import { existsSync, mkdirSync, writeFileSync, appendFileSync, statSync, openSync, readSync, closeSync, watch } from 'fs';
 import { homedir } from 'os';
 import { spawnSync } from 'node:child_process';
 import { render, Box, Text, Static, useInput, measureElement, type DOMElement } from 'ink';
@@ -56,6 +56,27 @@ const CHAT_EVENTS_FILE = `${BK1_HOME}/chat-events.jsonl`;
 
 function emitChatEvent(event: Record<string, unknown>): void {
   try { appendFileSync(CHAT_EVENTS_FILE, JSON.stringify(event) + '\n'); } catch {}
+}
+
+// ---------------------------------------------------------------------------
+// Prompt input stream — the VS Code extension APPENDS one JSON line per prompt
+// to ~/.bk1/prompt-input.jsonl; bk1 watches the dir and feeds each into submit().
+// This is the inbound mirror of chat-events.jsonl, deliberately replacing the
+// old terminal.sendText keystroke injection (which silently dropped prompts the
+// moment the hosting terminal's process had exited). The extension owns the
+// file (append-only); bk1 only ever reads + advances its own offset.
+// ---------------------------------------------------------------------------
+const PROMPT_INPUT_FILE = `${BK1_HOME}/prompt-input.jsonl`;
+// On a fresh mount, ignore prompt lines older than this — a relaunch must pick
+// up the prompt that triggered it (written ~ms earlier) but not replay stale
+// lines left by a prior session that exited without consuming them.
+const PROMPT_INPUT_FRESH_MS = 10_000;
+
+interface PromptInputPayload {
+  text?: string;
+  model?: string;
+  thinking?: boolean;
+  ts?: number;
 }
 
 const MODELS = [
@@ -2838,6 +2859,14 @@ function App({ onLogout }: { onLogout: () => void }) {
     return null;
   }, []);
 
+  // Prompt-input channel (see PROMPT_INPUT_FILE). promptReadPosRef tracks how far
+  // we've consumed the append-only file; pendingPromptsRef holds prompts that
+  // arrived while a turn was running; runPromptRef breaks the submit ⇄ runPrompt
+  // cycle so submit's finally can launch the next queued prompt.
+  const promptReadPosRef = useRef(0);
+  const pendingPromptsRef = useRef<PromptInputPayload[]>([]);
+  const runPromptRef = useRef<(p: PromptInputPayload) => void>(() => {});
+
   const submit = useCallback(async () => {
     // Normalize line breaks before anything reads the buffer: a stray \r (from
     // Opt+Enter's \x1b\r) renders as a cursor-return in the history bubble,
@@ -3444,8 +3473,72 @@ function App({ onLogout }: { onLogout: () => void }) {
       setIsRunning(false);
       setLintProgress(null);
       isRunningRef.current = false;
+      // Drain one prompt that arrived (via the prompt-input channel) mid-turn,
+      // preserving order. queueMicrotask so this turn's state settles first.
+      const queued = pendingPromptsRef.current.shift();
+      if (queued) queueMicrotask(() => runPromptRef.current(queued));
     }
   }, []);
+
+  // Prompt-input channel: apply one payload — switch model if requested, then
+  // route the text through the normal submit() path. If a turn is already
+  // running, queue it (drained in submit's finally, preserving order).
+  const runPromptPayload = useCallback((payload: PromptInputPayload) => {
+    if (isRunningRef.current) { pendingPromptsRef.current.push(payload); return; }
+    if (typeof payload.model === 'string') {
+      const idx = MODELS.findIndex(m => m.id === payload.model);
+      if (idx >= 0) { modelIdxRef.current = idx; setModelIdx(idx); }
+    }
+    const text = (payload.text ?? '').replace(/\r\n?/g, '\n');
+    if (!text.trim()) return;
+    setInputAndCursor(text);
+    void submit();
+  }, [submit, setInputAndCursor]);
+  useEffect(() => { runPromptRef.current = runPromptPayload; }, [runPromptPayload]);
+
+  // Read newly-appended prompt lines and run them. Mirrors the extension's
+  // flushChatEvents (offset-tracked, truncation-safe). On the first drain
+  // (mount) stale lines are skipped via PROMPT_INPUT_FRESH_MS but still consumed
+  // so the offset advances past them.
+  const drainPromptInput = useCallback((firstDrain: boolean) => {
+    let size: number;
+    try { size = statSync(PROMPT_INPUT_FILE).size; } catch { return; }
+    let pos = promptReadPosRef.current;
+    if (size < pos) pos = 0;            // file shrank / rotated
+    if (size === pos) return;
+    const buf = Buffer.alloc(size - pos);
+    let fd: number | undefined;
+    try {
+      fd = openSync(PROMPT_INPUT_FILE, 'r');
+      readSync(fd, buf, 0, buf.length, pos);
+    } catch { return; }
+    finally { if (fd !== undefined) { try { closeSync(fd); } catch {} } }
+    const chunk = buf.toString('utf8');
+    const lastNl = chunk.lastIndexOf('\n');
+    if (lastNl === -1) return;          // no complete line yet — keep offset, wait for more
+    const complete = chunk.slice(0, lastNl);
+    promptReadPosRef.current = pos + Buffer.byteLength(complete, 'utf8') + 1;  // +1 for the \n
+    const now = Date.now();
+    for (const line of complete.split('\n')) {
+      if (!line.trim()) continue;
+      let payload: PromptInputPayload;
+      try { payload = JSON.parse(line) as PromptInputPayload; } catch { continue; }
+      if (firstDrain && typeof payload.ts === 'number' && now - payload.ts > PROMPT_INPUT_FRESH_MS) continue;
+      runPromptRef.current(payload);
+    }
+  }, []);
+
+  // Watch BK1_HOME (the dir, so it works before the file exists) for prompt lines
+  // from the VS Code extension. Drain the tail on mount to catch a prompt written
+  // just before a relaunch (the extension writes first, then relaunches bk1).
+  useEffect(() => {
+    drainPromptInput(true);
+    let w: ReturnType<typeof watch> | undefined;
+    try {
+      w = watch(BK1_HOME, (_e, name) => { if (name === 'prompt-input.jsonl') drainPromptInput(false); });
+    } catch { /* dir unwatchable — extension prompts won't arrive, but no crash */ }
+    return () => { try { w?.close(); } catch {} };
+  }, [drainPromptInput]);
 
   // Inline shell runner — for `!cmd` escapes and terminal-mode lines. Streams
   // stdout+stderr through the live indicator block (so the user sees output

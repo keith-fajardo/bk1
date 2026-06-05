@@ -3,12 +3,13 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { ensureBk1 } from './bk1-loader';
-import { recordTerminal, forgetTerminal, reapOrphans } from './process-registry';
+import { recordTerminal, forgetTerminal, reapOrphans, isAlive } from './process-registry';
 import { Bk1ChatPanel } from './chat-view';
 
 const CONTEXT_DIR        = path.join(os.homedir(), '.bk1');
 const CONTEXT_FILE       = path.join(CONTEXT_DIR, 'ide-context.json');
 const CHAT_EVENTS_FILE   = path.join(CONTEXT_DIR, 'chat-events.jsonl');
+const PROMPT_INPUT_FILE  = path.join(CONTEXT_DIR, 'prompt-input.jsonl');
 const DEBOUNCE_MS        = 200;
 const MAX_SELECTION_BYTES = 8_000;
 
@@ -78,15 +79,56 @@ let openingBk1 = false;
 // chatPanel is the primary UI — a WebviewPanel that opens beside code files.
 let chatPanel: Bk1ChatPanel | undefined;
 
+// True only when the bk1 child PROCESS is actually alive. onDidCloseTerminal
+// fires on tab disposal, NOT on process exit, so a crashed/exited bk1 leaves
+// bk1Terminal as a live-looking but DEAD handle — the root of the "prompt does
+// nothing / spawns a terminal session" bug (sendText to a dead shellPath
+// terminal relaunches it). exitStatus flips when the process exits even with the
+// tab still open; the PID probe is a belt-and-suspenders check.
+function bk1Alive(): boolean {
+  if (!bk1Terminal) return false;
+  if (bk1Terminal.exitStatus !== undefined) return false;
+  if (bk1Pid !== undefined && !isAlive(bk1Pid)) return false;
+  return true;
+}
+
+// Clear a dead terminal handle (and its tab) so the next openBk1 launches fresh.
+function disposeDeadTerminal() {
+  if (bk1Pid !== undefined) { forgetTerminal(bk1Pid); bk1Pid = undefined; }
+  bk1Terminal?.dispose();
+  bk1Terminal = undefined;
+}
+
+// Deliver a prompt to bk1 via the append-only prompt-input channel — NOT keystroke
+// injection. Write first (so the prompt is durable), then ensure bk1 is running: a
+// live bk1's fs.watch drains it; a dead/absent bk1 is relaunched and drains the
+// just-written tail on mount (PROMPT_INPUT_FRESH_MS in app.tsx covers the race).
+async function deliverPrompt(ctx: vscode.ExtensionContext, line: string) {
+  try {
+    fs.mkdirSync(CONTEXT_DIR, { recursive: true });
+    fs.appendFileSync(PROMPT_INPUT_FILE, line + '\n');
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    void vscode.window.showErrorMessage(`bk1: failed to write prompt — ${msg}`);
+    return;
+  }
+  if (bk1Alive()) return;
+  if (bk1Terminal) disposeDeadTerminal();
+  await openBk1(ctx);
+}
+
 async function openBk1(ctx: vscode.ExtensionContext) {
   // Always open/reveal the chat panel first so the user sees the UI immediately.
-  chatPanel = Bk1ChatPanel.createOrReveal(ctx, () => bk1Terminal);
+  chatPanel = Bk1ChatPanel.createOrReveal(ctx, () => bk1Terminal, (line) => deliverPrompt(ctx, line));
 
-  if (bk1Terminal) {
+  if (bk1Alive()) {
     // Process already running — just notify the panel it's live.
     chatPanel.notifyTerminalStatus(true);
     return;
   }
+  // A lingering dead terminal (process exited, tab not closed) must be cleared
+  // before relaunch, or we'd stack a zombie tab and keep a dead handle.
+  if (bk1Terminal) disposeDeadTerminal();
 
   if (openingBk1) return;
   openingBk1 = true;
