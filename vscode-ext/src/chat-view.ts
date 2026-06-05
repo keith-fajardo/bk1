@@ -442,8 +442,18 @@ function buildHtml(
   // ── Key handling ──────────────────────────────────────────────
   inputEl.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); doSubmit(); }
+    if (e.key === 'Escape' && responding)  { e.preventDefault(); doCancel(); }
   });
-  submitBtn.addEventListener('click', doSubmit);
+
+  // ESC anywhere in the panel cancels while responding
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && responding) { e.preventDefault(); doCancel(); }
+  });
+
+  submitBtn.addEventListener('click', () => {
+    if (responding) doCancel();
+    else doSubmit();
+  });
 
   // ── Submit ────────────────────────────────────────────────────
   function doSubmit() {
@@ -466,7 +476,21 @@ function buildHtml(
     resizeInput();
     clearFiles();
     responding = true;
-    submitBtn.disabled = true;
+    submitBtn.disabled = false;
+    submitBtn.textContent = '■';
+    submitBtn.title = 'Cancel (Esc)';
+    submitBtn.style.background = 'var(--vscode-inputValidation-errorBackground, #5a1d1d)';
+  }
+
+  // ── Cancel ────────────────────────────────────────────────────
+  function doCancel() {
+    if (!responding) return;
+    vscode.postMessage({ type: 'cancel' });
+    responding = false;
+    submitBtn.textContent = '↑';
+    submitBtn.title = 'Send (Enter)';
+    submitBtn.style.background = '';
+    addMessage('system', 'cancelled');
   }
 
   // ── Message helpers ───────────────────────────────────────────
@@ -490,12 +514,16 @@ function buildHtml(
     switch (msg.type) {
       case 'done':
         responding = false;
-        submitBtn.disabled = false;
+        submitBtn.textContent = '↑';
+        submitBtn.title = 'Send (Enter)';
+        submitBtn.style.background = '';
         break;
       case 'error':
         addMessage('error', msg.message);
         responding = false;
-        submitBtn.disabled = false;
+        submitBtn.textContent = '↑';
+        submitBtn.title = 'Send (Enter)';
+        submitBtn.style.background = '';
         break;
       case 'petState':
         drawPet(msg);
@@ -726,6 +754,10 @@ export class Bk1ChatPanel {
         this.submit(text, files);
         break;
       }
+      case 'cancel':
+        // Send Ctrl+C to bk1 to interrupt the running agent loop.
+        this.getTerminal()?.sendText('\x03', false);
+        break;
       case 'openTerminal':
         void vscode.commands.executeCommand('bk1.open');
         break;
@@ -829,6 +861,9 @@ export class Bk1ChatViewProvider implements vscode.WebviewViewProvider {
         this.submit(text, files);
         break;
       }
+      case 'cancel':
+        this.getTerminal()?.sendText('\x03', false);
+        break;
       case 'openTerminal':
         void vscode.commands.executeCommand('bk1.open');
         break;
