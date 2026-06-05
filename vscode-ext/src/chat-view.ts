@@ -971,7 +971,6 @@ export class Bk1ChatPanel {
     const full = parts.join('\n\n');
     if (!full) return;
     terminal.sendText(full, true);
-    terminal.show(true);
   }
 }
 
