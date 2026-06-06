@@ -4,7 +4,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { ensureBk1 } from './bk1-loader';
 import { recordTerminal, forgetTerminal, reapOrphans, isAlive } from './process-registry';
-import { Bk1ChatPanel } from './chat-view';
+import { Bk1ChatViewProvider } from './chat-view';
 
 const CONTEXT_DIR        = path.join(os.homedir(), '.bk1');
 const CONTEXT_FILE       = path.join(CONTEXT_DIR, 'ide-context.json');
@@ -50,7 +50,7 @@ function flushChatEvents() {
     for (const line of lines) {
       try {
         const event = JSON.parse(line) as Record<string, unknown>;
-        Bk1ChatPanel.currentPanel?.sendEvent(event);
+        chatProvider.sendEvent(event);
       } catch { /* malformed line */ }
     }
   } catch { /* file gone or unreadable */ }
@@ -76,8 +76,10 @@ let bk1Terminal: vscode.Terminal | undefined;
 let bk1Pid: number | undefined;
 let openingBk1 = false;
 
-// chatPanel is the primary UI — a WebviewPanel that opens beside code files.
-let chatPanel: Bk1ChatPanel | undefined;
+// chatProvider is the primary UI — a webview view in the bk1 sidebar.
+// Constructed in activate() before any watcher fires, so never undefined
+// when sendEvent/notifyTerminalStatus are reached.
+let chatProvider: Bk1ChatViewProvider;
 
 // True only when the bk1 child PROCESS is actually alive. onDidCloseTerminal
 // fires on tab disposal, NOT on process exit, so a crashed/exited bk1 leaves
@@ -118,12 +120,12 @@ async function deliverPrompt(ctx: vscode.ExtensionContext, line: string) {
 }
 
 async function openBk1(ctx: vscode.ExtensionContext) {
-  // Always open/reveal the chat panel first so the user sees the UI immediately.
-  chatPanel = Bk1ChatPanel.createOrReveal(ctx, () => bk1Terminal, (line) => deliverPrompt(ctx, line));
+  // Always reveal the sidebar chat view first so the user sees the UI immediately.
+  void vscode.commands.executeCommand('bk1.chat.focus');
 
   if (bk1Alive()) {
-    // Process already running — just notify the panel it's live.
-    chatPanel.notifyTerminalStatus(true);
+    // Process already running — just notify the view it's live.
+    chatProvider.notifyTerminalStatus(true);
     return;
   }
   // A lingering dead terminal (process exited, tab not closed) must be cleared
@@ -165,7 +167,7 @@ async function openBk1(ctx: vscode.ExtensionContext) {
     if (pid !== undefined && bk1Terminal === term) {
       bk1Pid = pid;
       recordTerminal(pid);
-      chatPanel?.notifyTerminalStatus(true);
+      chatProvider.notifyTerminalStatus(true);
     }
   });
 }
@@ -360,6 +362,10 @@ export function activate(context: vscode.ExtensionContext) {
   statusProvider = new StatusProvider();
   logProvider    = new LogProvider();
 
+  // Construct the chat provider before the events watcher so a fast first
+  // event always has somewhere to land (it buffers until the view resolves).
+  chatProvider = new Bk1ChatViewProvider(context, () => bk1Terminal, (line) => deliverPrompt(context, line));
+
   // Start the chat-events watcher early so it's ready before the first bk1 session.
   startChatEventsWatcher();
 
@@ -379,6 +385,11 @@ export function activate(context: vscode.ExtensionContext) {
   void reapOrphans();
 
   context.subscriptions.push(
+    vscode.window.registerWebviewViewProvider(Bk1ChatViewProvider.viewType, chatProvider, {
+      // Keep the webview's DOM alive when the sidebar is hidden — otherwise
+      // collapsing the view would wipe the conversation.
+      webviewOptions: { retainContextWhenHidden: true },
+    }),
     vscode.window.registerTreeDataProvider('bk1.status', statusProvider),
     vscode.window.registerTreeDataProvider('bk1.log', logProvider),
     vscode.commands.registerCommand('bk1.open', () => openBk1(context)),
@@ -388,7 +399,7 @@ export function activate(context: vscode.ExtensionContext) {
         if (bk1Pid !== undefined) { forgetTerminal(bk1Pid); bk1Pid = undefined; }
         bk1Terminal = undefined;
         setFocusContext(false);
-        chatPanel?.notifyTerminalStatus(false);
+        chatProvider.notifyTerminalStatus(false);
       }
     }),
     vscode.window.onDidChangeActiveTerminal(t => {
