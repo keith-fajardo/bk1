@@ -50,6 +50,22 @@
   let responding   = false;
   let turnStarted  = false; // doSubmit() rendered the user card; skip bk1's echo
   let lastPet      = null;  // last petState payload — colors new mini canvases
+  let ackTimer     = null;  // fires if bk1 never acknowledges a submitted prompt
+
+  // Safety net for the multi-process handshake (extension writes prompt-input.jsonl,
+  // bk1 must mount + drain + emit chat-events.jsonl). If bk1 sends NO event within
+  // the window, the prompt was lost (bk1 not running / slow mount) — surface it
+  // instead of leaving a silent spinner. The first chatEvent of any kind disarms it.
+  const ACK_TIMEOUT_MS = 20000;
+  function armAck() {
+    clearAck();
+    ackTimer = setTimeout(() => {
+      ackTimer = null;
+      addSystemNote('bk1 didn’t pick up your message. It may still be starting up, or the bk1 process isn’t running — reopen the bk1 sidebar to relaunch it.');
+      if (responding) { setResponding(false); finishTurn(); }
+    }, ACK_TIMEOUT_MS);
+  }
+  function clearAck() { if (ackTimer) { clearTimeout(ackTimer); ackTimer = null; } }
 
   // Conversation rendering state for the in-flight turn
   let assistantBody = null; // .assistant-body container of the streaming card
@@ -325,6 +341,7 @@
     resizeInput();
     clearFiles();
     setResponding(true);
+    armAck();
   }
 
   // Pet actions and sprite clicks: no optimistic card — bk1's echoed
@@ -333,6 +350,7 @@
     if (responding) return;
     vscode.postMessage({ type: 'submit', text: cmd, model: modelSel.value, thinking: false, files: [] });
     showTab('chat');
+    armAck();
   }
 
   function doCancel() {
@@ -458,6 +476,16 @@
     scroll();
   }
 
+  // Standalone note in the history (not tied to an assistant card) — used by the
+  // ack watchdog when bk1 produced no output at all for a turn.
+  function addSystemNote(text) {
+    const d = document.createElement('div');
+    d.className = 'system-note';
+    d.textContent = text;
+    chatHistory.appendChild(d);
+    scroll();
+  }
+
   function finishTurn() {
     if (textEl) {
       const cur = textEl.querySelector('.cursor-blink');
@@ -472,6 +500,7 @@
     // terminal death) must not leave the dedup armed — it would swallow the
     // next turn's user card.
     turnStarted = false;
+    clearAck();
   }
 
   function scroll() { chatHistory.scrollTop = chatHistory.scrollHeight; }
@@ -481,6 +510,8 @@
     const msg = ev.data;
     switch (msg.type) {
       case 'chatEvent': {
+        // Any event from bk1 proves it picked up the turn — disarm the watchdog.
+        clearAck();
         const e = msg.event;
         switch (e.type) {
           case 'user':

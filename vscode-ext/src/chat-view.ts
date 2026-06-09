@@ -77,6 +77,7 @@ export class Bk1ChatViewProvider implements vscode.WebviewViewProvider {
     private readonly ctx: vscode.ExtensionContext,
     private readonly getTerminal: () => vscode.Terminal | undefined,
     private readonly deliverPrompt: (line: string) => void | Promise<void>,
+    private readonly ensureRunning: () => void,
   ) {}
 
   resolveWebviewView(view: vscode.WebviewView): void {
@@ -101,6 +102,13 @@ export class Bk1ChatViewProvider implements vscode.WebviewViewProvider {
     this.pushPet();
     if (this.petTimer) clearInterval(this.petTimer);
     this.petTimer = setInterval(() => this.pushPet(), 2000);
+
+    // Pre-warm bk1 so it's mounted and watching prompt-input.jsonl before the
+    // user submits — the prompt then drains via fs.watch (no first-drain
+    // freshness gate). Also re-ensure on re-show in case bk1 died while hidden.
+    // ensureRunning() is idempotent (no-ops when bk1 is already alive).
+    this.ensureRunning();
+    view.onDidChangeVisibility(() => { if (view.visible) this.ensureRunning(); });
   }
 
   /** Forward a parsed chat event line from the events file to the webview. */

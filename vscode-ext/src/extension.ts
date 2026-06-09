@@ -55,7 +55,6 @@ function flushChatEvents() {
     }
   } catch { /* file gone or unreadable */ }
 }
-const MAX_LOG_ENTRIES = 50;
 
 interface IdeContext {
   file_path:            string | null;
@@ -185,90 +184,10 @@ function stopBk1() {
 }
 
 // ---------------------------------------------------------------------------
-// Status tree view
-// ---------------------------------------------------------------------------
-
-class StatusItem extends vscode.TreeItem {
-  constructor(label: string, description: string, icon?: string) {
-    super(label, vscode.TreeItemCollapsibleState.None);
-    this.description = description;
-    if (icon) this.iconPath = new vscode.ThemeIcon(icon);
-  }
-}
-
-class StatusProvider implements vscode.TreeDataProvider<StatusItem> {
-  private _onChange = new vscode.EventEmitter<void>();
-  readonly onDidChangeTreeData = this._onChange.event;
-  private ctx: IdeContext | null = null;
-
-  update(ctx: IdeContext) { this.ctx = ctx; this._onChange.fire(); }
-  getTreeItem(el: StatusItem) { return el; }
-
-  getChildren(): StatusItem[] {
-    if (!this.ctx) return [];
-    const items: StatusItem[] = [];
-    const fp = this.ctx.file_path;
-    if (fp) {
-      const ws = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-      const rel = ws ? path.relative(ws, fp) : path.basename(fp);
-      const f = new StatusItem('File', rel, 'file');
-      f.tooltip = fp;
-      items.push(f);
-      if (this.ctx.language) items.push(new StatusItem('Language', this.ctx.language, 'symbol-keyword'));
-    } else {
-      items.push(new StatusItem('File', 'none', 'file'));
-    }
-    if (this.ctx.has_selection && this.ctx.selection_start_line && this.ctx.selection_end_line) {
-      const r = `L${this.ctx.selection_start_line}–${this.ctx.selection_end_line}`;
-      items.push(new StatusItem('Selection', r + (this.ctx.selection_truncated ? ' (truncated)' : ''), 'selection'));
-    }
-    items.push(new StatusItem('Updated', timeAgo(this.ctx.updated_at), 'clock'));
-    return items;
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Activity log tree view
-// ---------------------------------------------------------------------------
-
-interface LogEntry { time: Date; event: string; detail: string }
-
-class LogItem extends vscode.TreeItem {
-  constructor(entry: LogEntry) {
-    super(`${entry.time.toLocaleTimeString()}  ${entry.event}`, vscode.TreeItemCollapsibleState.None);
-    this.description = entry.detail;
-    this.iconPath = new vscode.ThemeIcon(
-      entry.event === 'file opened' ? 'file' :
-      entry.event === 'selection'   ? 'selection' :
-      entry.event === 'file closed' ? 'close' : 'circle-outline'
-    );
-  }
-}
-
-class LogProvider implements vscode.TreeDataProvider<LogItem> {
-  private _onChange = new vscode.EventEmitter<void>();
-  readonly onDidChangeTreeData = this._onChange.event;
-  private entries: LogEntry[] = [];
-
-  push(event: string, detail: string) {
-    this.entries.unshift({ time: new Date(), event, detail });
-    if (this.entries.length > MAX_LOG_ENTRIES) this.entries.length = MAX_LOG_ENTRIES;
-    this._onChange.fire();
-  }
-
-  getTreeItem(el: LogItem) { return el; }
-  getChildren(): LogItem[] { return this.entries.map(e => new LogItem(e)); }
-}
-
-// ---------------------------------------------------------------------------
 // IDE context writer (streams to ~/.bk1/ide-context.json)
 // ---------------------------------------------------------------------------
 
 let writeTimer: NodeJS.Timeout | undefined;
-let statusProvider: StatusProvider;
-let logProvider: LogProvider;
-let lastFilePath: string | null | undefined;
-let lastSelKey: string | undefined;
 // Tracks the most recent active editor so we can fall back to it when focus
 // moves to a non-editor surface (terminal, panel, webview). Without this,
 // clicking into the bk1 terminal makes activeTextEditor undefined and the
@@ -312,25 +231,12 @@ function snapshot(): IdeContext {
   };
 }
 
+// Stream the active file + selection to ~/.bk1/ide-context.json — bk1 reads
+// this each turn and injects it as a <system-reminder> (mirrors Claude Code's
+// <ide_opened_file>). The chat lives in the webview now; this file is the only
+// surface that consumes the snapshot.
 function writeNow() {
   const ctx = snapshot();
-  statusProvider.update(ctx);
-
-  const fp = ctx.file_path;
-  if (fp !== lastFilePath) {
-    if (fp) logProvider.push('file opened', path.basename(fp));
-    else if (lastFilePath) logProvider.push('file closed', path.basename(lastFilePath));
-    lastFilePath = fp;
-    lastSelKey = undefined;
-  }
-  if (ctx.has_selection && ctx.selection_start_line && ctx.selection_end_line) {
-    const sk = `${ctx.selection_start_line}-${ctx.selection_end_line}`;
-    if (sk !== lastSelKey) {
-      logProvider.push('selection', `L${ctx.selection_start_line}–${ctx.selection_end_line}`);
-      lastSelKey = sk;
-    }
-  }
-
   try {
     fs.mkdirSync(CONTEXT_DIR, { recursive: true });
     const tmp = `${CONTEXT_FILE}.${process.pid}.tmp`;
@@ -346,25 +252,23 @@ function scheduleWrite() {
   writeTimer = setTimeout(writeNow, DEBOUNCE_MS);
 }
 
-function timeAgo(iso: string): string {
-  const d = Date.now() - new Date(iso).getTime();
-  if (d < 1000)      return 'just now';
-  if (d < 60_000)    return `${Math.floor(d / 1000)}s ago`;
-  if (d < 3_600_000) return `${Math.floor(d / 60_000)}m ago`;
-  return `${Math.floor(d / 3_600_000)}h ago`;
-}
-
 // ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------
 
 export function activate(context: vscode.ExtensionContext) {
-  statusProvider = new StatusProvider();
-  logProvider    = new LogProvider();
-
   // Construct the chat provider before the events watcher so a fast first
   // event always has somewhere to land (it buffers until the view resolves).
-  chatProvider = new Bk1ChatViewProvider(context, () => bk1Terminal, (line) => deliverPrompt(context, line));
+  // The 4th arg pre-warms bk1: the provider calls it when the sidebar resolves
+  // (and on re-show) so bk1 is already mounted and watching prompt-input.jsonl
+  // before the user submits — sidesteps the lazy-launch / freshness-gate race
+  // that left a prompt undrained and the webview stuck on a silent spinner.
+  chatProvider = new Bk1ChatViewProvider(
+    context,
+    () => bk1Terminal,
+    (line) => deliverPrompt(context, line),
+    () => { void openBk1(context); },
+  );
 
   // Start the chat-events watcher early so it's ready before the first bk1 session.
   startChatEventsWatcher();
@@ -390,8 +294,6 @@ export function activate(context: vscode.ExtensionContext) {
       // collapsing the view would wipe the conversation.
       webviewOptions: { retainContextWhenHidden: true },
     }),
-    vscode.window.registerTreeDataProvider('bk1.status', statusProvider),
-    vscode.window.registerTreeDataProvider('bk1.log', logProvider),
     vscode.commands.registerCommand('bk1.open', () => openBk1(context)),
     vscode.commands.registerCommand('bk1.stop', () => stopBk1()),
     vscode.window.onDidCloseTerminal(t => {
