@@ -120,18 +120,45 @@ jobs:
           shasum -a 256 "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256"
           echo "STAGE=$STAGE" >> "$GITHUB_ENV"
 
-      - name: Upload to release
-        # tag_name + target_commitish create the v<version> tag at this commit
-        # the first time a matrix leg uploads; later legs append their tarballs
-        # to the same Release. The tag is created HERE (not in the gate) so a
-        # failed build never leaves an orphan tag that blocks a later re-release.
+      - name: Upload build artifact
+        # Each leg uploads its tarball + checksum as a workflow artifact — NOT
+        # straight to the Release. The single `release` job below collects all
+        # three and creates the Release in one atomic action-gh-release call.
+        # This fixes the race where parallel legs all called action-gh-release
+        # on the same tag and 422'd ("already_exists") on concurrent finalize.
+        uses: actions/upload-artifact@v4
+        with:
+          name: bk1-${{ matrix.platform }}
+          path: |
+            ${{ env.STAGE }}.tar.gz
+            ${{ env.STAGE }}.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 1
+
+  # Create the GitHub Release ONCE, attaching all three platform tarballs in a
+  # single action-gh-release call. Pulling release creation out of the build
+  # matrix eliminates the concurrent-finalize race (see the build artifact step).
+  # `needs: build` means every leg must succeed first, so the v<version> tag is
+  # created only after all builds pass — a failed build leaves no orphan tag,
+  # preserving the property the old inline-create was chosen for.
+  release:
+    needs: [gate, build]
+    if: needs.gate.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Collect all platform tarballs
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: bk1-*
+          merge-multiple: true
+
+      - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ needs.gate.outputs.version }}
           target_commitish: ${{ github.sha }}
-          files: |
-            ${{ env.STAGE }}.tar.gz
-            ${{ env.STAGE }}.tar.gz.sha256
+          files: dist/*
           generate_release_notes: true
 
   # Renders dist/homebrew/bk1.rb.tmpl with this release's version + per-platform
@@ -141,7 +168,7 @@ jobs:
   # read access to this repo's releases. Skipped automatically if the secret
   # isn't set, so releases still succeed before the tap is wired up.
   homebrew:
-    needs: [gate, build]
+    needs: [gate, release]
     if: needs.gate.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -194,17 +221,19 @@ jobs:
   # if the secret isn't set, and idempotent — a `vsce show` check no-ops the job
   # when this version is already published, so ordinary pushes don't re-publish.
   #
-  # `needs: build` so a co-released bk1 v<BK1_VERSION> exists before the new
+  # `needs: release` so a co-released bk1 v<BK1_VERSION> exists before the new
   # extension (which downloads that binary on first activation) goes live. The
-  # `always()` guard lets it run on extension-only bumps too (build is skipped),
-  # but the build-result check refuses to publish if a co-running bk1 build FAILED
-  # (the extension would point at a release that never got created).
+  # `always()` guard lets it run on extension-only bumps too (build + release are
+  # skipped), but the result checks refuse to publish if a co-running bk1 build
+  # or the release FAILED (the extension would point at a release that never got
+  # created). success-or-skipped on both = "didn't fail", which is what we want.
   extension:
-    needs: [gate, build]
+    needs: [gate, build, release]
     if: >-
       always() &&
       needs.gate.result == 'success' &&
-      (needs.build.result == 'success' || needs.build.result == 'skipped')
+      (needs.build.result == 'success' || needs.build.result == 'skipped') &&
+      (needs.release.result == 'success' || needs.release.result == 'skipped')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
