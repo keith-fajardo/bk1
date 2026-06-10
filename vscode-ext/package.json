@@ -29,12 +29,17 @@
     "views": {
       "bk1": [
         {
-          "id": "bk1.chat",
-          "name": "Chat",
-          "type": "webview"
+          "id": "bk1.home",
+          "name": "bk1"
         }
       ]
     },
+    "viewsWelcome": [
+      {
+        "view": "bk1.home",
+        "contents": "bk1 opens as a full editor panel — chat, pet, and play room all live there.\n\n[Open bk1](command:bk1.open)"
+      }
+    ],
     "commands": [
       {
         "command": "bk1.open",
@@ -46,12 +51,24 @@
         "command": "bk1.stop",
         "title": "Stop bk1",
         "category": "bk1"
+      },
+      {
+        "command": "bk1.show",
+        "title": "Show bk1 Terminal (debug)",
+        "category": "bk1"
       }
     ],
     "menus": {
       "editor/title": [
         {
           "command": "bk1.open",
+          "group": "navigation"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "bk1.open",
+          "when": "view == bk1.home",
           "group": "navigation"
         }
       ]

@@ -4,7 +4,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { ensureBk1 } from './bk1-loader';
 import { recordTerminal, forgetTerminal, reapOrphans, isAlive } from './process-registry';
-import { Bk1ChatViewProvider } from './chat-view';
+import { Bk1ChatPanel } from './chat-view';
 
 const CONTEXT_DIR        = path.join(os.homedir(), '.bk1');
 const CONTEXT_FILE       = path.join(CONTEXT_DIR, 'ide-context.json');
@@ -50,7 +50,7 @@ function flushChatEvents() {
     for (const line of lines) {
       try {
         const event = JSON.parse(line) as Record<string, unknown>;
-        chatProvider.sendEvent(event);
+        chatPanel.sendEvent(event);
       } catch { /* malformed line */ }
     }
   } catch { /* file gone or unreadable */ }
@@ -75,10 +75,10 @@ let bk1Terminal: vscode.Terminal | undefined;
 let bk1Pid: number | undefined;
 let openingBk1 = false;
 
-// chatProvider is the primary UI — a webview view in the bk1 sidebar.
+// chatPanel is the primary UI — a wide WebviewPanel (editor tab).
 // Constructed in activate() before any watcher fires, so never undefined
 // when sendEvent/notifyTerminalStatus are reached.
-let chatProvider: Bk1ChatViewProvider;
+let chatPanel: Bk1ChatPanel;
 
 // True only when the bk1 child PROCESS is actually alive. onDidCloseTerminal
 // fires on tab disposal, NOT on process exit, so a crashed/exited bk1 leaves
@@ -115,16 +115,23 @@ async function deliverPrompt(ctx: vscode.ExtensionContext, line: string) {
   }
   if (bk1Alive()) return;
   if (bk1Terminal) disposeDeadTerminal();
-  await openBk1(ctx);
+  await ensureBk1Running(ctx);
 }
 
-async function openBk1(ctx: vscode.ExtensionContext) {
-  // Always reveal the sidebar chat view first so the user sees the UI immediately.
-  void vscode.commands.executeCommand('bk1.chat.focus');
+// Open the wide chat panel (editor tab) and ensure the engine is running.
+function revealBk1(ctx: vscode.ExtensionContext) {
+  chatPanel.reveal();          // create/reveal the panel; its pre-warm hook also calls ensureBk1Running
+  void ensureBk1Running(ctx);
+}
 
+// Ensure the bk1 child PROCESS is alive. bk1 is a PTY/TUI app, so it still needs
+// a terminal to run — but we create it with hideFromUser, so there's NO visible
+// tab or dropdown entry. The webview panel is the only UI; `bk1.show` reveals
+// the terminal on demand for debugging. This is UI-free (no panel reveal) so the
+// panel's pre-warm hook can call it without looping back into revealBk1.
+async function ensureBk1Running(ctx: vscode.ExtensionContext) {
   if (bk1Alive()) {
-    // Process already running — just notify the view it's live.
-    chatProvider.notifyTerminalStatus(true);
+    chatPanel.notifyTerminalStatus(true);
     return;
   }
   // A lingering dead terminal (process exited, tab not closed) must be cleared
@@ -146,29 +153,32 @@ async function openBk1(ctx: vscode.ExtensionContext) {
 
   const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || os.homedir();
 
-  // Run bk1 in the integrated terminal panel at the bottom (no `location:
-  // viewColumn`) so it doesn't compete with the chat WebviewPanel for editor
-  // space. The user can expand/collapse the terminal panel to see bk1's output.
+  // hideFromUser keeps the engine fully in the background — no terminal tab, no
+  // dropdown entry. The user interacts only with the webview panel.
   bk1Terminal = vscode.window.createTerminal({
     name: 'bk1',
     shellPath,
     cwd,
+    hideFromUser: true,
     iconPath: vscode.Uri.joinPath(ctx.extensionUri, 'media', 'icon.svg'),
   });
 
   openingBk1 = false;
   const term = bk1Terminal;
 
-  // Run bk1 silently in the background — don't steal the panel away from the chat view.
-  // The user interacts via the chat WebviewPanel; they can open the terminal manually if needed.
-
   void term.processId.then((pid) => {
     if (pid !== undefined && bk1Terminal === term) {
       bk1Pid = pid;
       recordTerminal(pid);
-      chatProvider.notifyTerminalStatus(true);
+      chatPanel.notifyTerminalStatus(true);
     }
   });
+}
+
+// Debug aid: reveal the hidden bk1 terminal so the user can see raw engine output.
+function showBk1Terminal() {
+  if (bk1Terminal) bk1Terminal.show();
+  else void vscode.window.showInformationMessage('bk1 is not running — open bk1 first.');
 }
 
 function stopBk1() {
@@ -257,17 +267,18 @@ function scheduleWrite() {
 // ---------------------------------------------------------------------------
 
 export function activate(context: vscode.ExtensionContext) {
-  // Construct the chat provider before the events watcher so a fast first
-  // event always has somewhere to land (it buffers until the view resolves).
-  // The 4th arg pre-warms bk1: the provider calls it when the sidebar resolves
-  // (and on re-show) so bk1 is already mounted and watching prompt-input.jsonl
-  // before the user submits — sidesteps the lazy-launch / freshness-gate race
-  // that left a prompt undrained and the webview stuck on a silent spinner.
-  chatProvider = new Bk1ChatViewProvider(
+  // Construct the chat panel before the events watcher so a fast first event
+  // always has somewhere to land (it buffers until the panel is created).
+  // The 4th arg pre-warms bk1: the panel calls it on reveal so bk1 is already
+  // mounted and watching prompt-input.jsonl before the user submits — sidesteps
+  // the lazy-launch / freshness-gate race that left a prompt undrained and the
+  // webview stuck on a silent spinner. It's the UI-free ensureBk1Running (not
+  // revealBk1) so the pre-warm hook doesn't loop back into opening the panel.
+  chatPanel = new Bk1ChatPanel(
     context,
     () => bk1Terminal,
     (line) => deliverPrompt(context, line),
-    () => { void openBk1(context); },
+    () => { void ensureBk1Running(context); },
   );
 
   // Start the chat-events watcher early so it's ready before the first bk1 session.
@@ -288,20 +299,27 @@ export function activate(context: vscode.ExtensionContext) {
   // (dead, or its PID reused) are reaped (see process-registry.ts).
   void reapOrphans();
 
+  // The activity-bar icon needs a view to attach to. bk1.home is an empty tree
+  // (its viewsWelcome shows an "Open bk1" button); when it becomes visible we
+  // open the wide editor panel — so clicking the icon lands you straight in bk1.
+  const homeProvider: vscode.TreeDataProvider<never> = {
+    getTreeItem: el => el,
+    getChildren: () => [],
+  };
+  const homeView = vscode.window.createTreeView('bk1.home', { treeDataProvider: homeProvider });
+
   context.subscriptions.push(
-    vscode.window.registerWebviewViewProvider(Bk1ChatViewProvider.viewType, chatProvider, {
-      // Keep the webview's DOM alive when the sidebar is hidden — otherwise
-      // collapsing the view would wipe the conversation.
-      webviewOptions: { retainContextWhenHidden: true },
-    }),
-    vscode.commands.registerCommand('bk1.open', () => openBk1(context)),
+    homeView,
+    homeView.onDidChangeVisibility(e => { if (e.visible) revealBk1(context); }),
+    vscode.commands.registerCommand('bk1.open', () => revealBk1(context)),
     vscode.commands.registerCommand('bk1.stop', () => stopBk1()),
+    vscode.commands.registerCommand('bk1.show', () => showBk1Terminal()),
     vscode.window.onDidCloseTerminal(t => {
       if (t === bk1Terminal) {
         if (bk1Pid !== undefined) { forgetTerminal(bk1Pid); bk1Pid = undefined; }
         bk1Terminal = undefined;
         setFocusContext(false);
-        chatProvider.notifyTerminalStatus(false);
+        chatPanel.notifyTerminalStatus(false);
       }
     }),
     vscode.window.onDidChangeActiveTerminal(t => {

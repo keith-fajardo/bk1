@@ -57,19 +57,19 @@ function levelInfo(xp: number): { level: number; into: number; span: number } {
 function makeNonce(): string { return crypto.randomBytes(16).toString('hex'); }
 
 // ---------------------------------------------------------------------------
-// Sidebar chat view (WebviewView in the bk1 activity-bar container).
+// Wide chat panel (a singleton WebviewPanel hosted as an editor tab).
 // Design comes from the dbt-agent-ui scaffold: media/main.css + media/main.js
 // carry the UI; this class is the thin host shell — HTML scaffold, pet.json
 // polling, and the postMessage <-> file-channel bridge.
 // ---------------------------------------------------------------------------
 
-export class Bk1ChatViewProvider implements vscode.WebviewViewProvider {
-  static readonly viewType = 'bk1.chat';
+export class Bk1ChatPanel {
+  static readonly viewType = 'bk1.chatPanel';
 
-  private view?: vscode.WebviewView;
+  private panel?: vscode.WebviewPanel;
   private petTimer?: NodeJS.Timeout;
-  // Chat events can arrive before VS Code lazily resolves the view (it only
-  // resolves once the sidebar is first shown). Buffer and flush on resolve.
+  // Chat events can arrive before the panel exists (an event lands before the
+  // user opens bk1). Buffer and flush when the panel is created.
   private pendingEvents: Record<string, unknown>[] = [];
   private lastTerminalOpen = false;
 
@@ -80,21 +80,37 @@ export class Bk1ChatViewProvider implements vscode.WebviewViewProvider {
     private readonly ensureRunning: () => void,
   ) {}
 
-  resolveWebviewView(view: vscode.WebviewView): void {
-    this.view = view;
-    view.webview.options = {
-      enableScripts: true,
-      localResourceRoots: [vscode.Uri.joinPath(this.ctx.extensionUri, 'media')],
-    };
-    view.webview.html = this.getHtml(view.webview);
-    view.webview.onDidReceiveMessage(msg => this.handle(msg));
-    view.onDidDispose(() => {
+  // Create the editor panel if needed, else reveal the existing one. bk1 runs as
+  // ONE wide WebviewPanel (an editor tab), not a sidebar view.
+  reveal(column: vscode.ViewColumn = vscode.ViewColumn.Active): void {
+    if (this.panel) {
+      this.panel.reveal(column);
+      this.ensureRunning();
+      return;
+    }
+    const panel = vscode.window.createWebviewPanel(
+      Bk1ChatPanel.viewType,
+      'bk1',
+      column,
+      {
+        enableScripts: true,
+        // Keep the DOM alive when the tab is backgrounded — otherwise switching
+        // editors would wipe the conversation.
+        retainContextWhenHidden: true,
+        localResourceRoots: [vscode.Uri.joinPath(this.ctx.extensionUri, 'media')],
+      },
+    );
+    this.panel = panel;
+    panel.iconPath = vscode.Uri.joinPath(this.ctx.extensionUri, 'media', 'icon.svg');
+    panel.webview.html = this.getHtml(panel.webview);
+    panel.webview.onDidReceiveMessage(msg => this.handle(msg));
+    panel.onDidDispose(() => {
       if (this.petTimer) { clearInterval(this.petTimer); this.petTimer = undefined; }
-      this.view = undefined;
+      this.panel = undefined;
     });
 
     for (const e of this.pendingEvents) {
-      void view.webview.postMessage({ type: 'chatEvent', event: e });
+      void panel.webview.postMessage({ type: 'chatEvent', event: e });
     }
     this.pendingEvents = [];
     this.notifyTerminalStatus(this.lastTerminalOpen);
@@ -104,17 +120,16 @@ export class Bk1ChatViewProvider implements vscode.WebviewViewProvider {
     this.petTimer = setInterval(() => this.pushPet(), 2000);
 
     // Pre-warm bk1 so it's mounted and watching prompt-input.jsonl before the
-    // user submits — the prompt then drains via fs.watch (no first-drain
-    // freshness gate). Also re-ensure on re-show in case bk1 died while hidden.
-    // ensureRunning() is idempotent (no-ops when bk1 is already alive).
+    // user submits. ensureRunning() is idempotent (no-ops when bk1 is alive).
     this.ensureRunning();
-    view.onDidChangeVisibility(() => { if (view.visible) this.ensureRunning(); });
   }
+
+  get isOpen(): boolean { return this.panel !== undefined; }
 
   /** Forward a parsed chat event line from the events file to the webview. */
   sendEvent(event: Record<string, unknown>) {
-    if (this.view) {
-      void this.view.webview.postMessage({ type: 'chatEvent', event });
+    if (this.panel) {
+      void this.panel.webview.postMessage({ type: 'chatEvent', event });
     } else {
       this.pendingEvents.push(event);
       if (this.pendingEvents.length > 200) this.pendingEvents.shift();
@@ -123,16 +138,16 @@ export class Bk1ChatViewProvider implements vscode.WebviewViewProvider {
 
   notifyTerminalStatus(open: boolean) {
     this.lastTerminalOpen = open;
-    void this.view?.webview.postMessage({ type: 'terminalStatus', open });
+    void this.panel?.webview.postMessage({ type: 'terminalStatus', open });
   }
 
   private pushPet() {
-    if (!this.view) return;
+    if (!this.panel) return;
     const pet = readPetState();
     if (!pet) return;
     const now = new Date();
     const lvl = levelInfo(pet.xp ?? 0);
-    void this.view.webview.postMessage({
+    void this.panel.webview.postMessage({
       type: 'petState',
       // sprite
       color: petColorHex(pet),
@@ -167,7 +182,7 @@ export class Bk1ChatViewProvider implements vscode.WebviewViewProvider {
         // if its process is live. sendText to a dead terminal would relaunch it.
         const t = this.getTerminal();
         if (t && t.exitStatus === undefined) t.sendText('\x03', false);
-        else void this.view?.webview.postMessage({ type: 'done' });
+        else void this.panel?.webview.postMessage({ type: 'done' });
         break;
       }
       case 'openTerminal':
