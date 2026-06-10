@@ -5,6 +5,13 @@ import { homedir } from 'os';
 import { SYSTEM_PROMPT } from './system-prompt';
 import { TOOLS, executeTool } from './tools';
 import { getProjectDir } from './project-dir';
+import {
+  planToolBatches,
+  isRetriableError,
+  isContextOverflow,
+  planCompaction,
+  renderForSummary,
+} from './agent-loop';
 
 // Sub-agents don't get the agent tool — prevents accidental recursion
 const SUB_AGENT_TOOLS = TOOLS.filter(t => t.name !== 'agent');
@@ -211,6 +218,18 @@ const COMPLEXITY_MODEL: Record<string, string> = {
   complex: 'claude-opus-4-8',
 };
 
+// Loop-hardening knobs. The model the loop drops to when the primary keeps failing transient
+// errors; a turn backstop against a runaway tool loop; how many times we resume a response
+// cut off at the output-token cap; and the context-token threshold that triggers proactive
+// compaction (with a BK1_COMPACT=0 escape hatch, mirroring BK1_ALT_SCREEN=0).
+const FALLBACK_MODEL = 'claude-sonnet-4-6';
+const DEFAULT_MAX_TURNS = Number(process.env.BK1_MAX_TURNS ?? 200);
+const MAX_TRUNCATION_RETRIES = 3;
+const COMPACT_THRESHOLD = Number(process.env.BK1_COMPACT_THRESHOLD ?? 140_000);
+const COMPACT_ENABLED = process.env.BK1_COMPACT !== '0';
+
+const COMPACTION_SYSTEM = `You compress the running history of a dbt coding agent. Summarize the conversation excerpt into a dense factual brief that lets the agent continue WITHOUT re-reading it: what the user asked for, which files/models were read or edited, decisions and findings, the current state, and any pending next step. Preserve identifiers — model names, file paths, column names, error text — verbatim. Reply with only the summary, no preamble.`;
+
 // Limits concurrent sub-agent API calls to avoid 30K input tokens/minute rate limit.
 // Regular tool calls (read_file, bash, etc.) are unaffected — only `agent` tool is throttled.
 function makeSemaphore(limit: number) {
@@ -225,18 +244,19 @@ function makeSemaphore(limit: number) {
 }
 const throttleSubAgents = makeSemaphore(2);
 
-// Retries on 429 rate-limit errors with linear back-off: 15s → 30s → 60s.
-// 429s from Anthropic are always pre-generation (no tokens emitted yet), so retrying is safe.
-// User-abort errors are surfaced immediately as AgentAbortedError so the UI can react cleanly.
-async function retryOn429<T>(fn: () => Promise<T>): Promise<T> {
+// Retries transient API failures (rate limits, overload, 5xx, request timeouts, dropped
+// connections — see isRetriableError) with linear back-off: 15s → 30s → 60s. These are all
+// pre-generation or network-level, so retrying is safe — no tokens were emitted. Context
+// overflow is NOT retried here (it needs compaction); user aborts surface immediately as
+// AgentAbortedError so the UI can react cleanly.
+async function retryTransient<T>(fn: () => Promise<T>): Promise<T> {
   const delays = [15_000, 30_000, 60_000];
   for (let i = 0; i <= delays.length; i++) {
     try {
       return await fn();
     } catch (err) {
       if (err instanceof Anthropic.APIUserAbortError) throw new AgentAbortedError();
-      const msg = err instanceof Error ? err.message : String(err);
-      if (!msg.includes('429') || i === delays.length) throw err;
+      if (!isRetriableError(err) || i === delays.length) throw err;
       await new Promise(r => setTimeout(r, delays[i]!));
     }
   }
@@ -249,6 +269,10 @@ export interface RunAgentOptions {
   model?: string;
   mode?: AgentMode;
   signal?: AbortSignal;
+  // Backstop against a runaway tool loop. Defaults to DEFAULT_MAX_TURNS.
+  maxTurns?: number;
+  // Optional cumulative input+output token budget for a single request. Opt-in (no default).
+  maxTokens?: number;
 }
 
 // Sentinel error thrown when the user interrupts a run via ESC. The UI catches
@@ -306,7 +330,7 @@ async function runSubAgent(prompt: string, signal?: AbortSignal): Promise<SubAge
 
   while (true) {
     if (signal?.aborted) throw new AgentAbortedError();
-    const response = await retryOn429(() => getClient().messages.create({
+    const response = await retryTransient(() => getClient().messages.create({
       model: SUB_AGENT_MODEL,
       max_tokens: 4096,
       system: cachedSystem(SUB_AGENT_SYSTEM),
@@ -375,7 +399,7 @@ async function routeModel(
   if (!task.trim()) return { model: ROUTER_FALLBACK_MODEL, classification: 'medium' };
 
   try {
-    const response = await retryOn429(() => getClient().messages.create({
+    const response = await retryTransient(() => getClient().messages.create({
       model: ROUTER_MODEL,
       max_tokens: 8,
       system: ROUTER_SYSTEM,
@@ -429,6 +453,62 @@ async function executeToolBlock(
   return { type: 'tool_result', tool_use_id: block.id, content: result };
 }
 
+// Runs a turn's tool blocks under the concurrency-safety policy (planToolBatches): a run of
+// consecutive read-only tools (and sub-agents) executes together; a mutating tool executes
+// alone so two mutations in one turn can't race. Input order is preserved in the results.
+async function runToolBatch(
+  blocks: Anthropic.ToolUseBlock[],
+  callbacks: AgentCallbacks,
+  signal?: AbortSignal,
+): Promise<Array<{ type: 'tool_result'; tool_use_id: string; content: string }>> {
+  const results: Array<{ type: 'tool_result'; tool_use_id: string; content: string }> = [];
+  for (const group of planToolBatches(blocks)) {
+    if (signal?.aborted) throw new AgentAbortedError();
+    const groupResults = await Promise.all(
+      group.map(block => executeToolBlock(block, callbacks, signal)),
+    );
+    results.push(...groupResults);
+  }
+  return results;
+}
+
+// Best-effort context compaction: summarize the middle of the conversation via Haiku and
+// rebuild messages as head + a synthetic summary exchange + tail. Returns null (caller keeps
+// the original messages) when there isn't enough to compact or the summary call fails —
+// compaction must never block a turn.
+async function compactMessages(
+  messages: Anthropic.MessageParam[],
+  callbacks: AgentCallbacks,
+  signal?: AbortSignal,
+): Promise<Anthropic.MessageParam[] | null> {
+  const plan = planCompaction(messages);
+  if (!plan) return null;
+
+  let summary = '';
+  try {
+    const msg = await retryTransient(() => getClient().messages.create({
+      model: SUB_AGENT_MODEL,
+      max_tokens: 2048,
+      system: COMPACTION_SYSTEM,
+      messages: [{ role: 'user', content: renderForSummary(plan.middle) }],
+    }, { signal }));
+    callbacks.onUsage?.(extractUsage(msg.usage), SUB_AGENT_MODEL, 'compaction');
+    const block = msg.content.find((b): b is Anthropic.TextBlock => b.type === 'text');
+    summary = block?.text.trim() ?? '';
+  } catch (err) {
+    if (err instanceof AgentAbortedError) throw err;
+    return null;
+  }
+  if (!summary) return null;
+
+  return [
+    ...plan.head,
+    { role: 'user', content: `[Earlier conversation was compacted to save context. Summary of the omitted portion follows.]\n\n${summary}` },
+    { role: 'assistant', content: 'Understood — I will continue from the summary above.' },
+    ...plan.tail,
+  ];
+}
+
 export async function runAgent(
   history: Anthropic.MessageParam[],
   callbacks: AgentCallbacks,
@@ -453,33 +533,94 @@ export async function runAgent(
     mode === 'auto' ? RESOLVED_SYSTEM_PROMPT + AUTO_MODE_SUFFIX :
     RESOLVED_SYSTEM_PROMPT;
 
-  // Adaptive thinking is only supported on Claude 4 Sonnet and Opus models — not Haiku.
-  // When enabled, adaptive mode automatically interleaves thinking between tool calls so
-  // the model can reason about each result before deciding the next step (matching how
-  // Claude Code behaves internally). The model decides when and how much to think.
-  const useThinking = supportsThinking(effectiveModel);
+  // Adaptive thinking (interleaved reasoning between tool calls) is only supported on Claude 4
+  // Sonnet and Opus — not Haiku — so it's decided per-call from the active model below.
+  const maxTurns = options?.maxTurns ?? DEFAULT_MAX_TURNS;
+  const maxTokens = options?.maxTokens;
+  let turnCount = 0;
+  let totalTokens = 0;
+  let lastContextTokens = 0;
+  let truncationRetries = 0;
+
+  // One streamed model call, wrapped in transient-error retry. Pulled out so the fallback
+  // and post-compaction paths can re-issue it without duplicating the request shape.
+  const streamOnce = (model: string) => retryTransient(async () => {
+    const stream = getClient().messages.stream({
+      model,
+      max_tokens: 8192,
+      system: cachedSystem(effectiveSystem),
+      messages: withMessageCache(messages),
+      tools: CACHED_TOOLS,
+      ...(supportsThinking(model) ? { thinking: { type: 'adaptive' as const } } : {}),
+    }, { signal });
+    stream.on('text', callbacks.onText);
+    return stream.finalMessage();
+  });
+
+  const stopNote = (text: string) => {
+    callbacks.onText(`\n${text}`);
+    messages.push({ role: 'assistant', content: text });
+  };
 
   while (true) {
     if (signal?.aborted) throw new AgentAbortedError();
 
-    const response = await retryOn429(async () => {
-      const stream = getClient().messages.stream({
-        model: effectiveModel,
-        max_tokens: 8192,
-        system: cachedSystem(effectiveSystem),
-        messages: withMessageCache(messages),
-        tools: CACHED_TOOLS,
-        ...(useThinking ? { thinking: { type: 'adaptive' as const } } : {}),
-      }, { signal });
-      stream.on('text', callbacks.onText);
-      return stream.finalMessage();
-    });
+    // Governors: stop cleanly (never throw) when a single request runs away. The turn cap is
+    // a backstop against a tool loop; maxTokens is opt-in cost protection. Both are checked
+    // here — between completed turns — so the conversation never ends on a dangling tool_use.
+    if (maxTokens && totalTokens >= maxTokens) {
+      stopNote(`[Stopped: reached the ${maxTokens.toLocaleString()}-token budget for this request. Ask me to continue if that was expected.]`);
+      break;
+    }
+    if (turnCount >= maxTurns) {
+      stopNote(`[Stopped: reached the ${maxTurns}-turn limit for this request. Ask me to continue if that was expected.]`);
+      break;
+    }
+    turnCount++;
 
-    callbacks.onUsage?.(extractUsage(response.usage), effectiveModel);
+    // Proactive compaction: if the last prompt was large, summarize the middle of the
+    // conversation before the next call so we stay clear of the context window.
+    if (COMPACT_ENABLED && lastContextTokens > COMPACT_THRESHOLD) {
+      const compacted = await compactMessages(messages, callbacks, signal);
+      if (compacted) {
+        messages.length = 0;
+        messages.push(...compacted);
+        lastContextTokens = 0;
+      }
+    }
 
-    // Surface thinking blocks before tools execute so the UI can show the model's
-    // reasoning alongside the tool it's about to run. Fires once per thinking block;
-    // adaptive mode may produce zero, one, or several thinking blocks per turn.
+    let response: Anthropic.Message;
+    try {
+      response = await streamOnce(effectiveModel);
+    } catch (err) {
+      if (err instanceof AgentAbortedError) throw err;
+      if (COMPACT_ENABLED && isContextOverflow(err)) {
+        // Reactive compaction: the prompt overflowed the window — compact and retry once.
+        const compacted = await compactMessages(messages, callbacks, signal);
+        if (!compacted) throw err;
+        messages.length = 0;
+        messages.push(...compacted);
+        lastContextTokens = 0;
+        response = await streamOnce(effectiveModel);
+      } else if (isRetriableError(err) && effectiveModel !== FALLBACK_MODEL) {
+        // Primary model exhausted its retries — drop to the fallback for the rest of the run.
+        effectiveModel = FALLBACK_MODEL;
+        callbacks.onModelRoute?.(effectiveModel, 'fallback');
+        response = await streamOnce(effectiveModel);
+      } else {
+        throw err;
+      }
+    }
+
+    const turnUsage = extractUsage(response.usage);
+    callbacks.onUsage?.(turnUsage, effectiveModel);
+    totalTokens += turnUsage.inputTokens + turnUsage.outputTokens;
+    // Size of the prompt we just sent ≈ current context size — the trigger for the next
+    // proactive compaction check.
+    lastContextTokens = turnUsage.inputTokens + turnUsage.cacheReadTokens + turnUsage.cacheWriteTokens;
+
+    // Surface thinking blocks before tools execute so the UI can show the model's reasoning
+    // alongside the tool it's about to run. Adaptive mode may emit zero, one, or several.
     if (callbacks.onThinking) {
       for (const block of response.content) {
         if (block.type === 'thinking') {
@@ -488,17 +629,30 @@ export async function runAgent(
       }
     }
 
-    // Preserve ALL content blocks — including thinking blocks with their signatures —
-    // so the model can continue its reasoning chain across turns. Stripping thinking
-    // blocks here would break interleaved reasoning continuity.
+    // Preserve ALL content blocks — including thinking blocks with their signatures — so the
+    // model can continue its reasoning chain across turns.
     messages.push({ role: 'assistant', content: response.content });
-
-    if (response.stop_reason !== 'tool_use') break;
-    if (signal?.aborted) throw new AgentAbortedError();
 
     const toolBlocks = response.content.filter(
       (b): b is Anthropic.ToolUseBlock => b.type === 'tool_use',
     );
+
+    if (toolBlocks.length === 0) {
+      // No tool calls. A max_tokens stop means the text answer was cut off at the 8192 cap —
+      // nudge the model to resume rather than returning a half-written response. Capped so a
+      // pathological turn can't loop forever. Any other stop reason ends the run normally.
+      if (response.stop_reason === 'max_tokens' && truncationRetries < MAX_TRUNCATION_RETRIES) {
+        truncationRetries++;
+        messages.push({
+          role: 'user',
+          content: 'Your previous response was cut off at the output token limit. Continue exactly where you left off; do not repeat what you already wrote.',
+        });
+        continue;
+      }
+      break;
+    }
+
+    if (signal?.aborted) throw new AgentAbortedError();
 
     let toolResults: Array<{ type: 'tool_result'; tool_use_id: string; content: string }>;
 
@@ -528,12 +682,10 @@ export async function runAgent(
         toolResults.push(await executeToolBlock(block, callbacks, signal));
       }
     } else {
-      // Concurrent execution — original behaviour, unchanged.
-      // All tool calls in a single turn run in parallel; agent calls are throttled
-      // by the semaphore to stay within the 30K input-tokens/minute rate limit.
-      toolResults = await Promise.all(
-        toolBlocks.map(block => executeToolBlock(block, callbacks, signal)),
-      );
+      // Concurrent execution under the concurrency-safety policy: read-only tools (and
+      // sub-agents) overlap; mutating tools (write_file, run_dbt_command, bash, model_state)
+      // get exclusive access so two mutations in one turn can't race. Order is preserved.
+      toolResults = await runToolBatch(toolBlocks, callbacks, signal);
     }
 
     messages.push({ role: 'user', content: toolResults });
