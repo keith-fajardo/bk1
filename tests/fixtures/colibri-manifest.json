@@ -1,0 +1,50 @@
+{
+  "metadata": { "adapter_type": "postgres", "dbt_version": "1.9.0" },
+  "nodes": {
+    "source.proj.raw.orders": {
+      "id": "source.proj.raw.orders", "name": "orders", "fullName": "source.proj.raw.orders",
+      "nodeType": "source",
+      "columns": { "id": { "columnName": "id" }, "amount": { "columnName": "amount" }, "status": { "columnName": "status" } }
+    },
+    "model.proj.stg_orders": {
+      "id": "model.proj.stg_orders", "name": "stg_orders", "fullName": "model.proj.stg_orders",
+      "nodeType": "model",
+      "columns": {
+        "order_id": { "columnName": "order_id", "lineageType": "passthrough" },
+        "amount": { "columnName": "amount", "lineageType": "passthrough" },
+        "status": { "columnName": "status", "lineageType": "passthrough" }
+      }
+    },
+    "model.proj.int_orders": {
+      "id": "model.proj.int_orders", "name": "int_orders", "fullName": "model.proj.int_orders",
+      "nodeType": "model",
+      "columns": {
+        "order_id": { "columnName": "order_id", "lineageType": "passthrough" },
+        "amount": { "columnName": "amount", "lineageType": "passthrough" },
+        "amount_usd": { "columnName": "amount_usd", "lineageType": "transformation" }
+      }
+    },
+    "model.proj.dim_orders": {
+      "id": "model.proj.dim_orders", "name": "dim_orders", "fullName": "model.proj.dim_orders",
+      "nodeType": "model",
+      "columns": {
+        "order_id": { "columnName": "order_id", "lineageType": "passthrough" },
+        "revenue": { "columnName": "revenue", "lineageType": "transformation" }
+      }
+    }
+  },
+  "lineage": {
+    "edges": [
+      { "id": 1, "source": "source.proj.raw.orders", "sourceColumn": "id", "target": "model.proj.stg_orders", "targetColumn": "order_id" },
+      { "id": 2, "source": "source.proj.raw.orders", "sourceColumn": "amount", "target": "model.proj.stg_orders", "targetColumn": "amount" },
+      { "id": 3, "source": "source.proj.raw.orders", "sourceColumn": "status", "target": "model.proj.stg_orders", "targetColumn": "status" },
+      { "id": 4, "source": "model.proj.stg_orders", "sourceColumn": "order_id", "target": "model.proj.int_orders", "targetColumn": "order_id" },
+      { "id": 5, "source": "model.proj.stg_orders", "sourceColumn": "amount", "target": "model.proj.int_orders", "targetColumn": "amount" },
+      { "id": 6, "source": "model.proj.stg_orders", "sourceColumn": "amount", "target": "model.proj.int_orders", "targetColumn": "amount_usd" },
+      { "id": 7, "source": "model.proj.stg_orders", "sourceColumn": "status", "target": "model.proj.int_orders", "targetColumn": "", "edgeType": "filter" },
+      { "id": 8, "source": "model.proj.int_orders", "sourceColumn": "order_id", "target": "model.proj.dim_orders", "targetColumn": "order_id" },
+      { "id": 9, "source": "model.proj.int_orders", "sourceColumn": "amount_usd", "target": "model.proj.dim_orders", "targetColumn": "revenue" },
+      { "id": 10, "source": "model.proj.int_orders", "sourceColumn": "amount", "target": "model.proj.dim_orders", "targetColumn": "revenue" }
+    ]
+  }
+}

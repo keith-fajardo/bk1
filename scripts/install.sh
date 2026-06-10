@@ -87,6 +87,16 @@ step "Installing JS dependencies"
 cd "$REPO_ROOT"
 bun install --silent
 
+# ── Optional: column-lineage sidecar ─────────────────────────────────────────
+# bk1-colibri (dbt-colibri frozen via PyInstaller) powers catalog-aware column
+# lineage in /impact. Optional — without it, /impact uses the built-in tracer.
+# Not built here (needs Python + a ~minute PyInstaller run); build on demand.
+if [[ ! -x "${SKILL_DIR}/bk1-colibri" ]]; then
+  step "Column-lineage sidecar (optional)"
+  info "bk1-colibri not installed — /impact will use the built-in tracer."
+  info "To enable catalog-aware column lineage: bun run build:colibri (needs Python 3.9+)"
+fi
+
 step "Done"
 info "Start the TUI:  bun src/app.tsx"
 info "Run tests:       bun test"

@@ -316,6 +316,15 @@ If the column selector is present but direction is "upstream", tell the user "co
 
 ## Step 2 — Call query_manifest
 
+If a column was parsed (column-level lineage requested), FIRST make sure dbt-colibri's prerequisite is present — column lineage prefers the catalog-aware colibri graph, which needs target/catalog.json:
+- Run exactly one bash call: test -f target/catalog.json && echo present || echo missing
+- If it prints "missing": ask the user EXACTLY this and then STOP — do not call any tool until they reply:
+  "Column-level lineage uses dbt-colibri, which needs target/catalog.json. That file is produced by \`dbt docs generate\`, which queries your warehouse. Want me to run \`dbt docs generate\` now? (If not, I'll use the built-in v1 tracer instead.)"
+  - If they say yes / go ahead: call run_dbt_command with command="dbt docs generate", then continue. If that command fails, tell the user the error and continue (the tool will fall back to the tracer).
+  - If they say no: continue without it.
+- If it prints "present": continue (do NOT ask — colibri will reuse or regenerate from the existing catalog).
+If NO column was parsed, skip this whole check — colibri is not involved in model-only impact.
+
 Single call: query_manifest with query="impact", model=<parsed model>, direction=<parsed direction>, and column=<parsed column if any>.
 
 If the result says "not found in manifest", stop.
@@ -356,6 +365,7 @@ If the response has direction="downstream" or "both" and downstream is empty, th
 ## Step 4 — Column lineage (only if column was set and result has column field)
 
   Column lineage — <column.name>
+  Lineage engine: <column.source> (colibri = catalog-aware full-graph via dbt-colibri; tracer = built-in v1). If column.note is set, print it on its own line (it says what colibri did, or why it fell back to the tracer — e.g. "run \`dbt docs generate\` to enable colibri").
   Render this section using column.taint (Record<model, [cols]>) and column.trace_status (Record<model, {status, reason?, partialReasons?}>).
 
   Sort descendants by depth. For each descendant in downstream:
@@ -369,7 +379,7 @@ If the response has direction="downstream" or "both" and downstream is empty, th
     Models where trace failed: <list with reasons>
     Models with partial trace: <count>
 
-  Important footnote: v1 lineage handles named columns, CTE aliases, qualified JOINs, cast/coalesce, and UNION ALL. Window functions, aggregations with GROUP BY, complex CASE, and select * over raw tables surface as "partial" — re-read the model's compiled SQL manually for those.
+  Important footnote (ONLY when column.source === "tracer"): v1 lineage handles named columns, CTE aliases, qualified JOINs, cast/coalesce, and UNION ALL. Window functions, aggregations with GROUP BY, complex CASE, and select * over raw tables surface as "partial" — re-read the model's compiled SQL manually for those. When column.source === "colibri" these limits do not apply (SQLGlot + catalog expand select * and handle window/aggregation/CASE), so omit this footnote.
 
 ## Step 5 — Non-ref references
 

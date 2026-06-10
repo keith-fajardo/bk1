@@ -11,8 +11,10 @@ name: Release
 # pushing to main — NOT by hand-tagging. Ordinary pushes that don't change the
 # version no-op at the gate, so the 3-platform matrix never spins up.
 #
-# Tarball layout: bk1, bk1-review, bk1-lint, kimball/kimball.db at the root. bk1
-# resolves its sidecars sibling-of-binary at runtime (see src/bk1-home.ts).
+# Tarball layout: bk1, bk1-review, bk1-lint, kimball/kimball.db at the root, plus
+# bk1-colibri (column-lineage sidecar) on native-arch legs only — PyInstaller can't
+# cross-compile, so darwin-x64 ships without it and falls back to the built-in tracer.
+# bk1 resolves its sidecars sibling-of-binary at runtime (see src/bk1-home.ts).
 
 on:
   push:
@@ -90,6 +92,24 @@ jobs:
         working-directory: sidecars/lint
         run: cargo build --release --target ${{ matrix.rust_target }} --quiet
 
+      - name: Set up Python (colibri sidecar)
+        # PyInstaller produces a host-arch binary and cannot cross-compile, so the colibri
+        # sidecar is built only on legs whose runner arch matches the target: darwin-arm64
+        # (macos-14 = arm64) and linux-x64 (ubuntu = x64). The cross-compiled darwin-x64 leg
+        # skips it and falls back to bk1's built-in tracer (src/colibri.ts resolves gracefully).
+        if: matrix.platform != 'darwin-x64'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Build bk1-colibri
+        # continue-on-error: colibri is an OPTIONAL augmentation with a built-in tracer
+        # fallback, so a PyInstaller hiccup must never block the core bk1 release. If this
+        # fails, the conditional staging step below just omits bk1-colibri from the tarball.
+        if: matrix.platform != 'darwin-x64'
+        continue-on-error: true
+        run: bash sidecars/colibri/build.sh
+
       - name: Compile bk1 binary
         # --define process.env.DEV='"false"': inlines DEV as the literal string
         # "false" so bun dead-code-eliminates the guarded `if (process.env.DEV
@@ -116,6 +136,12 @@ jobs:
           cp sidecars/lint/target/${{ matrix.rust_target }}/release/bk1-lint "$STAGE/bk1-lint"
           cp skills_data/kimball/kimball.db "$STAGE/kimball/kimball.db"
           chmod +x "$STAGE/bk1" "$STAGE/bk1-review" "$STAGE/bk1-lint"
+          # Optional colibri sidecar — present only on native-arch legs (see build step).
+          if [[ -f sidecars/colibri/dist/bk1-colibri ]]; then
+            cp sidecars/colibri/dist/bk1-colibri "$STAGE/bk1-colibri"
+            cp sidecars/colibri/THIRD_PARTY_NOTICES.txt "$STAGE/bk1-colibri.LICENSE.txt"
+            chmod +x "$STAGE/bk1-colibri"
+          fi
           tar -czf "${STAGE}.tar.gz" -C "$STAGE" .
           shasum -a 256 "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256"
           echo "STAGE=$STAGE" >> "$GITHUB_ENV"

@@ -21,6 +21,7 @@ and the Rust rule set in [sidecars/lint/src/checks.rs](sidecars/lint/src/checks.
 - State: `bun:sqlite` (per-project DB at `<dbt_project>/target/bk1_state.db`)
 - Sidecar binaries: source under [sidecars/](sidecars/), installed under `~/.bk1/`.
   - `bk1-lint` — Rust (Cargo), source in [sidecars/lint/](sidecars/lint/), installed to `~/.bk1/bk1-lint` (alongside the bundled kimball SQLite index at `~/.bk1/kimball/kimball.db`).
+  - `bk1-colibri` — dbt-colibri (Python+SQLGlot) frozen via PyInstaller, source/build in [sidecars/colibri/](sidecars/colibri/), installed to `~/.bk1/bk1-colibri`. Optional column-lineage engine for `/impact` (see "Column lineage" under Impact-aware editing). Built only on native-arch release legs (PyInstaller can't cross-compile); when absent, `/impact` falls back to the built-in tracer.
 - Tests: `bun test`
 
 Prefer Bun APIs (`Bun.spawn`, `Bun.Glob`, `Bun.file`) over Node equivalents when both work.
@@ -37,6 +38,7 @@ src/
   system-prompt.ts  Static system prompt for the main agent
 sidecars/
   lint/             Rust mechanical linter — emits violations.json
+  colibri/          dbt-colibri PyInstaller build (bk1-colibri) — column lineage
 vscode-ext/         Optional VS Code companion extension — streams the active file
                     path + selection to ~/.bk1/ide-context.json, which
                     src/ide-context.ts reads and injects as a <system-reminder>
@@ -148,6 +150,23 @@ record/drain SQLite round-trip and `postCompileColumnTaint`'s manifest glue are 
 yet covered by a test (no dbt fixture project in-repo). Exposures still aren't in either report
 (manifest exposure shape unverified — no compiled manifest present to check against).
 
+**Column lineage engine (colibri + tracer).** Column taint has two engines, picked per call
+([src/colibri.ts](src/colibri.ts)). The default is the built-in `node-sql-parser` tracer in
+[src/lineage.ts](src/lineage.ts) (`propagateColumnTaint`) — always available, no extra deps, but
+v1-scoped (bails on `select *`, window funcs, aggregations, multi-col `CASE`). When the dbt-colibri
+graph (`target/colibri/colibri-manifest.json`) is present and fresh, bk1 prefers it: `buildColibriGraph`
+parses colibri's column-to-column edge list, `propagateColumnTaintViaColibri` BFS-walks it, returning
+the **same `PropagationOutput` shape** so call sites are drop-in. colibri is catalog-aware (SQLGlot +
+`catalog.json`) so it handles the cases the tracer can't. Two call sites: `postCompileColumnTaint`
+consumes the graph only if already fresh (`colibriGraphIfFresh`); **`/impact <model>.<column>` generates
+it on demand** (`ensureColibriGraph` → spawns the `bk1-colibri` sidecar when missing/stale, via
+`resolveColibriCommand`'s priority chain: sidecar → `BK1_COLIBRI_BIN` → PATH `colibri` → `uvx`). colibri
+needs `catalog.json` (a `dbt docs generate` warehouse round-trip), so the `/impact` skill asks the user
+before running it; generation always falls back to the tracer with a `note`, and telemetry is forced off
+(`--disable-telemetry` + `DO_NOT_TRACK=1`). The taint engine used is surfaced as `column.source`
+(`colibri` | `tracer`) in the impact result. Graph/BFS pieces are unit-tested against a real colibri
+fixture ([tests/colibri.test.ts](tests/colibri.test.ts)).
+
 ### Response shape contract
 The lint_run response field names are pinned by `LINT_RESPONSE_VIOLATIONS_FIELDS` in
 [src/state.ts](src/state.ts). [tests/skill-contract.test.ts](tests/skill-contract.test.ts)
@@ -211,7 +230,9 @@ resolution is split between user data and bundled assets.
 
 **Standalone** — user runs `scripts/install.sh` (or `bun run build:all`). bk1
 binary lands in `~/.local/bin/bk1`, sidecars and bundled DB in `~/.bk1/`,
-user data also in `~/.bk1/`. Single directory for everything.
+user data also in `~/.bk1/`. Single directory for everything. The `bk1-colibri`
+sidecar is optional and not built by `install.sh` (needs Python + a PyInstaller
+run) — `bun run build:colibri` installs it to `~/.bk1/bk1-colibri`.
 
 **VS Code extension** — extension auto-downloads the platform-matched release
 tarball to `<extension-globalStorage>/bk1/<version>/` on first activation

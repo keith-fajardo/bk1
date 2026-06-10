@@ -1,0 +1,4 @@
+# Pinned runtime for the bk1-colibri sidecar. dbt-colibri pulls sqlglot[c]
+# (the Rust-accelerated tokenizer) transitively. Bump deliberately — the
+# colibri-manifest.json edge/node shape is the contract src/colibri.ts parses.
+dbt-colibri==0.3.6

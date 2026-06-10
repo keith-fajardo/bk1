@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, writeFileSync, readFileSync, statSync } from 'fs
 import { resolve, dirname } from 'path';
 import { syncManifestState, getLintQueue, getModelStatus, markModelLinted, fetchContent, resetModelState, lintRun, recordColumnChanges, drainColumnChanges, type Projection, type PendingColumnChanges } from './state';
 import { propagateColumnTaint, pickDialect, diffColumns, type ModelTraceStatus } from './lineage';
+import { colibriGraphIfFresh, ensureColibriGraph, propagateColumnTaintViaColibri } from './colibri';
 import { kimballQuery, type KimballQueryInput } from './kimball';
 import { getProjectDir } from './project-dir';
 import { homedir } from 'os';
@@ -290,6 +291,7 @@ function postCompileColumnTaint(parts: string[]): string | null {
 
   const drained = drainColumnChanges(touched);
   const dialect = pickDialect(detectDialect());
+  const colibriGraph = colibriGraphIfFresh();
   const blocks: string[] = [];
 
   for (const [model, changes] of Object.entries(drained)) {
@@ -304,7 +306,8 @@ function postCompileColumnTaint(parts: string[]): string | null {
     });
 
     for (const col of cols) {
-      const { taint } = propagateColumnTaint({ targetModel: model, targetColumn: col, modelsInOrder, dialect });
+      const { taint } = (colibriGraph && propagateColumnTaintViaColibri(colibriGraph, model, col))
+        || propagateColumnTaint({ targetModel: model, targetColumn: col, modelsInOrder, dialect });
       const hits = Object.entries(taint)
         .filter(([m]) => m !== model)
         .map(([m, taintedCols]) => `${m} (${taintedCols.join(', ')})`);
@@ -315,7 +318,8 @@ function postCompileColumnTaint(parts: string[]): string | null {
     }
   }
 
-  return blocks.length ? `Column-level impact:\n${blocks.join('\n')}` : null;
+  const header = colibriGraph ? 'Column-level impact (via colibri lineage graph)' : 'Column-level impact';
+  return blocks.length ? `${header}:\n${blocks.join('\n')}` : null;
 }
 
 // Large-file guard: stops the agent from accidentally slurping multi-megabyte JSON
@@ -691,6 +695,8 @@ export interface ImpactResult {
     name: string;
     taint: Record<string, string[]>;             // model name → tainted column names
     trace_status: Record<string, ModelTraceStatus>; // per-descendant trace status
+    source: 'colibri' | 'tracer';                // which lineage engine produced the taint
+    note?: string;                               // what colibri did, or why we fell back
   };
 }
 
@@ -826,12 +832,12 @@ function detectDialect(): string | null {
 
 // Filesystem wrapper for the impact query. Optionally augments the graph with
 // column-level lineage by reading each descendant's compiled SQL and running the tracer.
-function queryImpact(
+async function queryImpact(
   manifest: ManifestShape,
   model: string,
   direction: ImpactDirection,
   column: string | undefined,
-): string {
+): Promise<string> {
   const result = queryImpactData(manifest, model, direction);
   if (typeof result === 'string') return result;
 
@@ -842,19 +848,23 @@ function queryImpact(
       const sql = existsSync(compiledFull) ? readFileSync(compiledFull, 'utf-8') : null;
       return { name: n.name, compiledSql: sql };
     });
-    const { taint, perModelStatus } = propagateColumnTaint({
-      targetModel: result.model.name,
-      targetColumn: column,
-      modelsInOrder,
-      dialect,
-    });
-    result.column = { name: column, taint, trace_status: perModelStatus };
+    // /impact generates the colibri lineage graph on demand (missing/stale → spawn the
+    // sidecar), then prefers it; any failure degrades to the built-in tracer with a note.
+    const { graph, note } = await ensureColibriGraph();
+    const { taint, perModelStatus } =
+      (graph && propagateColumnTaintViaColibri(graph, result.model.name, column))
+      || propagateColumnTaint({ targetModel: result.model.name, targetColumn: column, modelsInOrder, dialect });
+    result.column = {
+      name: column, taint, trace_status: perModelStatus,
+      source: graph ? 'colibri' : 'tracer',
+      ...(note ? { note } : {}),
+    };
   }
 
   return JSON.stringify(result, null, 2);
 }
 
-function queryManifest(query: string, model?: string, direction?: ImpactDirection, column?: string): string {
+async function queryManifest(query: string, model?: string, direction?: ImpactDirection, column?: string): Promise<string> {
   const manifestPath = resolve(getProjectDir(), 'target/manifest.json');
   if (!existsSync(manifestPath)) {
     return 'target/manifest.json not found. Run dbt compile or dbt parse first.';
@@ -862,7 +872,7 @@ function queryManifest(query: string, model?: string, direction?: ImpactDirectio
   const manifest = JSON.parse(readFileSync(manifestPath, 'utf-8')) as ManifestShape;
   if (query === 'impact') {
     if (!model) return 'Provide a model name for the "impact" query.';
-    return queryImpact(manifest, model, direction ?? 'downstream', column);
+    return await queryImpact(manifest, model, direction ?? 'downstream', column);
   }
   return queryManifestData(manifest, query, model);
 }
@@ -898,7 +908,7 @@ export async function executeTool(
       case 'query_run_results':  return queryRunResults(input.query as string, input.model as string | undefined);
       case 'list_files':       return await listFiles(input.pattern as string);
       case 'bash':             return await runBash(input.command as string);
-      case 'query_manifest':   return queryManifest(
+      case 'query_manifest':   return await queryManifest(
         input.query as string,
         input.model as string | undefined,
         input.direction as ImpactDirection | undefined,

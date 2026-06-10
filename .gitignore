@@ -10,6 +10,13 @@ skills_data/kimball/kimball.db-journal
 lint/target/
 target/
 
+# colibri sidecar build artifacts (PyInstaller) — the binary ships via the
+# release tarball, never git.
+sidecars/colibri/.venv/
+sidecars/colibri/build/
+sidecars/colibri/dist/
+sidecars/colibri/*.spec
+
 # JS deps
 node_modules/
 
