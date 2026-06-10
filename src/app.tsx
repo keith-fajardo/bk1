@@ -58,6 +58,26 @@ function emitChatEvent(event: Record<string, unknown>): void {
   try { appendFileSync(CHAT_EVENTS_FILE, JSON.stringify(event) + '\n'); } catch {}
 }
 
+// Tool inputs/results and thinking blocks can be large (whole-file reads,
+// write_file bodies, lint dumps). Cap what we push to the webview channel — the
+// full output stays in the engine; the chat view shows a preview it can expand.
+const CHAT_IO_MAX = 2000;
+function truncateForChat(s: string): string {
+  return s.length > CHAT_IO_MAX ? `${s.slice(0, CHAT_IO_MAX)}\n… (+${s.length - CHAT_IO_MAX} more chars)` : s;
+}
+// One-line summary for the step header (mirrors what the tool acts on).
+function describeToolInput(input: Record<string, unknown>): string {
+  for (const k of ['path', 'command', 'query', 'model_name', 'name', 'action', 'select']) {
+    const v = input[k];
+    if (typeof v === 'string' && v) return v.length > 140 ? `${v.slice(0, 140)}…` : v;
+  }
+  const keys = Object.keys(input);
+  return keys.length ? keys.join(', ') : '';
+}
+function formatToolInput(input: Record<string, unknown>): string {
+  try { return truncateForChat(JSON.stringify(input, null, 2)); } catch { return ''; }
+}
+
 // ---------------------------------------------------------------------------
 // Prompt input stream — the VS Code extension APPENDS one JSON line per prompt
 // to ~/.bk1/prompt-input.jsonl; bk1 watches the dir and feeds each into submit().
@@ -3280,10 +3300,13 @@ function App({ onLogout }: { onLogout: () => void }) {
             setLiveText(fullText);
             emitChatEvent({ type: 'text', chunk, ts: Date.now() });
           },
+          onThinking: (text) => {
+            emitChatEvent({ type: 'thinking', text: truncateForChat(text), ts: Date.now() });
+          },
           onToolStart: (name, input) => {
             setActiveTool(name);
             toolLog.push({ name });
-            emitChatEvent({ type: 'tool_start', name, ts: Date.now() });
+            emitChatEvent({ type: 'tool_start', name, desc: describeToolInput(input), input: formatToolInput(input), ts: Date.now() });
 
             if (name.startsWith('Semantic:')) {
               const label = name.slice('Semantic: '.length);
@@ -3401,6 +3424,7 @@ function App({ onLogout }: { onLogout: () => void }) {
           },
           onToolEnd: (name, result) => {
             setActiveTool('');
+            emitChatEvent({ type: 'tool_end', name, result: truncateForChat(result), ts: Date.now() });
             if (toolLog.length > 0) toolLog[toolLog.length - 1]!.result = result.substring(0, 300);
             if (name.startsWith('Semantic:')) {
               const label = name.slice('Semantic: '.length);
