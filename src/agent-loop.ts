@@ -23,6 +23,15 @@ export function isConcurrencySafe(name: string): boolean {
   return CONCURRENCY_SAFE_TOOLS.has(name);
 }
 
+// The `agent` tool's prompt comes straight from model output, which can be truncated or
+// malformed — e.g. when a response spawns several large sub-agent calls and the last one is
+// cut off at the output-token cap mid-JSON, its `prompt` arrives undefined. Validate before
+// spawning a sub-agent: an undefined prompt used to crash the whole turn (undefined.content
+// .map deep in the cache layer).
+export function validSubAgentPrompt(prompt: unknown): prompt is string {
+  return typeof prompt === 'string' && prompt.trim() !== '';
+}
+
 // Groups tool blocks for execution while preserving order: a maximal run of consecutive
 // concurrency-safe blocks becomes one group (run together); each unsafe block is its own
 // group (runs alone). Generic over { name } so it is testable with plain objects.

@@ -9,7 +9,25 @@ import {
   segmentTurns,
   planCompaction,
   renderForSummary,
+  validSubAgentPrompt,
 } from '../src/agent-loop';
+
+// Regression: a truncated/malformed `agent` tool call (no prompt) used to crash the whole
+// turn — runSubAgent(undefined) → withMessageCache → undefined.content.map. lint-deep hit
+// this when a multi-sub-agent response exceeded the output-token cap.
+describe('validSubAgentPrompt', () => {
+  test('accepts a non-empty string prompt', () => {
+    expect(validSubAgentPrompt('review stg_orders for rule A')).toBe(true);
+  });
+  test('rejects undefined / empty / whitespace / non-string', () => {
+    expect(validSubAgentPrompt(undefined)).toBe(false);
+    expect(validSubAgentPrompt(null)).toBe(false);
+    expect(validSubAgentPrompt('')).toBe(false);
+    expect(validSubAgentPrompt('   ')).toBe(false);
+    expect(validSubAgentPrompt(42)).toBe(false);
+    expect(validSubAgentPrompt({})).toBe(false);
+  });
+});
 
 // ─── Tool concurrency policy ──────────────────────────────────────────────────
 describe('isConcurrencySafe', () => {

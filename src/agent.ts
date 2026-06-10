@@ -11,6 +11,7 @@ import {
   isContextOverflow,
   planCompaction,
   renderForSummary,
+  validSubAgentPrompt,
 } from './agent-loop';
 
 // Sub-agents don't get the agent tool — prevents accidental recursion
@@ -44,6 +45,10 @@ function withMessageCache(messages: Anthropic.MessageParam[]): Anthropic.Message
 
   const msg = messages[lastUserIdx]!;
   const content = msg.content;
+  // Defense in depth: never crash on a malformed message. Null/undefined/non-array content
+  // would throw on content.map below; leave such a message untouched. The real fix is
+  // upstream (executeToolBlock validates agent prompts before a sub-agent is spawned).
+  if (typeof content !== 'string' && !Array.isArray(content)) return messages;
   let newContent: Anthropic.MessageParam['content'];
   if (typeof content === 'string') {
     newContent = [{ type: 'text', text: content, cache_control: { type: 'ephemeral' } }];
@@ -440,11 +445,16 @@ async function executeToolBlock(
   let result: string;
   if (block.name === 'agent') {
     const subAgentLabel = (input.description as string | undefined) ?? 'sub-agent';
-    const { text, usage } = await throttleSubAgents(() =>
-      runSubAgent(input.prompt as string, signal),
-    );
-    callbacks.onUsage?.(usage, SUB_AGENT_MODEL, subAgentLabel);
-    result = text;
+    const prompt = input.prompt;
+    if (!validSubAgentPrompt(prompt)) {
+      // Truncated/malformed agent call (no prompt) — hand back a recoverable result instead
+      // of crashing the turn. The model can re-issue the call or do the work inline.
+      result = '[agent tool was called without a "prompt" string — likely a truncated tool call. Re-issue it with a complete prompt, or do the work directly.]';
+    } else {
+      const { text, usage } = await throttleSubAgents(() => runSubAgent(prompt, signal));
+      callbacks.onUsage?.(usage, SUB_AGENT_MODEL, subAgentLabel);
+      result = text;
+    }
   } else {
     result = await executeTool(block.name, input);
   }
