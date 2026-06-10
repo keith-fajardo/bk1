@@ -1,8 +1,8 @@
-import { useState, useRef, useCallback, useMemo, useEffect } from 'react';
+import { useState, useRef, useCallback, useMemo, useEffect, type RefObject, type ReactNode } from 'react';
 import { existsSync, mkdirSync, writeFileSync, appendFileSync, statSync, openSync, readSync, closeSync, watch } from 'fs';
 import { homedir } from 'os';
 import { spawnSync } from 'node:child_process';
-import { render, Box, Text, Static, useInput, measureElement, type DOMElement } from 'ink';
+import { render, Box, Text, useInput, measureElement, type DOMElement } from 'ink';
 import Spinner from 'ink-spinner';
 import type Anthropic from '@anthropic-ai/sdk';
 import { runAgent, AgentAbortedError, resetAnthropicClient, rebuildSystemPrompt, summarizePrompt, type TokenUsage } from './agent';
@@ -28,7 +28,8 @@ import {
   FOODS, addCoins, addXp, levelInfo, petColorHex, PET_COLOR_NAMES, DEFAULT_PET_COLOR,
   type PetState,
 } from './pet';
-import { disableMouseTracking, parseMouseEvents, enableModifyOtherKeys, disableModifyOtherKeys, enableKittyKeyboard, disableKittyKeyboard, isNewlineKey, normalizeKittyKeys } from './mouse';
+import { enableMouseTracking, disableMouseTracking, parseMouseEvents, enableModifyOtherKeys, disableModifyOtherKeys, enableKittyKeyboard, disableKittyKeyboard, isNewlineKey, normalizeKittyKeys, enterAltScreen, leaveAltScreen, clearAltScreen } from './mouse';
+import { type TranscriptItem, estimateMessageHeight, computeMaxScroll, windowStartIndex } from './transcript';
 import { GAMES } from './games';
 
 // Multiplayer games live inside the playroom modal (not in GAMES), but should
@@ -47,6 +48,18 @@ const MULTIPLAYER_GAME_IDS = new Set<string>(MULTIPLAYER_GAMES.map(g => g.id));
 import { registerCoinEventHandler, emitCoinEvent, COIN_REWARDS, type CoinEvent } from './coin-events';
 import { PlayroomLobby, type LobbyMode } from './playroom/room';
 import { PetSpriteLine, PET_SPRITE_SENTINEL } from './playroom/pet-sprite-line';
+
+// ---------------------------------------------------------------------------
+// Alt-screen fullscreen rendering. bk1 renders inside the terminal's alternate
+// screen buffer (like vim/htop) so window resizes can't ghost the live frame —
+// terminals don't reflow the alt buffer the way they reflow main-screen scrollback.
+// ALT_SCREEN gates the enter/leave/clear writes: disabled for non-TTY (piped/CI)
+// and via BK1_ALT_SCREEN=0 (a one-key rollback to legacy main-screen rendering).
+// inkInstance is captured from render() so the resize handler and /clear can reset
+// Ink's line counter via instance.clear().
+// ---------------------------------------------------------------------------
+const ALT_SCREEN = process.env.BK1_ALT_SCREEN !== '0' && process.stdout.isTTY === true;
+let inkInstance: ReturnType<typeof render> | null = null;
 
 // ---------------------------------------------------------------------------
 // Chat event stream — written to ~/.bk1/chat-events.jsonl so the VS Code
@@ -585,12 +598,8 @@ function nextMode(m: Mode): Mode {
   return MODE_ORDER[(MODE_ORDER.indexOf(m) + 1) % MODE_ORDER.length]!;
 }
 
-function InputBar({ input, cursorPos, isRunning, mode, modelLabel, maskInput, terminalMode, collapsed }: {
+function InputBar({ input, cursorPos, isRunning, mode, modelLabel, maskInput, terminalMode }: {
   input: string; cursorPos: number; isRunning: boolean; mode: Mode; modelLabel: string; maskInput?: boolean; terminalMode?: boolean;
-  // While the window is actively resizing the caller passes collapsed so we
-  // render a single borderless row — a multi-row bordered box would wrap-desync
-  // mid-resize and strand orphan rows (see the resize-safety note below).
-  collapsed?: boolean;
 }) {
   const theme = MODE_THEME[mode];
   const termAccent = '#7DD3FC';
@@ -624,30 +633,13 @@ function InputBar({ input, cursorPos, isRunning, mode, modelLabel, maskInput, te
   // status line below it (the key hints stay in the HintBar). The border color
   // follows the mode/state accent so it reinforces PROMPT vs TERM vs running.
   //
-  // RESIZE SAFETY: the box width is capped to `columns - 5` (the same margin
-  // HRule uses) so the border NEVER reaches full terminal width. A full-width
-  // border wraps to an extra physical row on shrink while Ink counts it as one
-  // logical line, stranding an orphan row — the exact resize-ghosting failure
-  // mode this codebase fights. The caller already collapses to a borderless
-  // frame while actively resizing (see the `resizing` branch in App), so this
-  // multi-row box is only mounted once the window has settled.
+  // The box width is capped to `columns - 5` (the same margin HRule uses) so the
+  // border never reaches the terminal edge — a small safety margin against
+  // off-by-one wrapping. (In alt-screen mode the terminal doesn't reflow the buffer
+  // on resize, so the old wrap-ghosting failure this guarded against can't occur, but
+  // the inset still looks cleaner.)
   const lines = displayWithCursor.split('\n');
   const last = lines.length - 1;
-
-  // Collapsed (resizing) form: a single borderless row. We show the first line
-  // plus an ellipsis if multi-line, so the live frame stays exactly one row and
-  // can't wrap or ghost while the terminal reflows. The cursor block is already
-  // embedded in `lines` via displayWithCursor.
-  if (collapsed) {
-    const oneLine = lines.length > 1 ? `${lines[0]} …` : lines[0];
-    return (
-      <Box gap={1}>
-        <Text color={badgeColor} bold>{badgeLabel}</Text>
-        <Text color={accent}>{promptChar}</Text>
-        <Text color={text}>{oneLine}</Text>
-      </Box>
-    );
-  }
 
   const cols = process.stdout.columns ?? 80;
   // InputBar owns its own paddingX={2} (like the old inline form) so it aligns
@@ -711,12 +703,6 @@ const SNORE_FRAMES: ReadonlyArray<readonly [string, string, string]> = [
   ['Z', ' ', ' '],
   [' ', ' ', ' '],
 ];
-
-// Single-element items array for the conversation-view header <Static>. Declared
-// at module scope so the reference is stable across renders — Ink keys Static
-// items by index, so a fresh `['header']` literal each render would technically
-// still work, but a stable constant is cheaper and clearer about intent.
-const HEADER_ITEMS: string[] = ['header'];
 
 // Local greeting template — when the user opens with a plain "hi" / "what can you
 // do?" we short-circuit the LLM and reply with this static capability summary.
@@ -1283,6 +1269,92 @@ function RichMessage({ text }: { text: string }) {
   );
 }
 
+// ─── Alt-screen transcript ──────────────────────────────────────────────────
+//
+// In alt-screen mode the conversation no longer relies on the terminal's native
+// scrollback (the alt buffer has none). These render the committed messages inside
+// a fixed-height, app-scrolled window. TranscriptMessage is the per-message JSX
+// lifted verbatim out of the old <Static items={messages}> block so colors, the
+// user bubble, and markdown tables all render identically. HeaderBlock is the old
+// single-item header <Static>. Heights are estimated for windowing in
+// src/transcript.ts — keep the two in sync if this JSX changes.
+
+const HEADER_LINES = 11; // paddingTop(1) + 6 wordmark + marginTop(1) + 3 intro rows
+
+// The header pseudo-item (wordmark) is always items[0]; messages follow. Used by the
+// transcript windowing + scroll-clamp math (heights from src/transcript.ts).
+function messagesToItems(messages: Message[]): TranscriptItem[] {
+  const items: TranscriptItem[] = [{ kind: 'header', lines: HEADER_LINES }];
+  for (const m of messages) {
+    items.push({ kind: 'message', role: m.role, content: m.content, info: m.info, hasTokens: !!m.tokens });
+  }
+  return items;
+}
+
+function HeaderBlock({ modelLabel, projectDir }: { modelLabel: string; projectDir: string }) {
+  return (
+    <Box flexDirection="column" paddingX={2} paddingTop={1} paddingBottom={0}>
+      {WORDMARK.map((line, i) => (
+        <WordmarkLine key={i} line={line} color="#B9FECF" />
+      ))}
+      <Box marginTop={1} flexDirection="column">
+        <Box gap={1}>
+          <Text bold color="#C0FAD2">bk1</Text>
+          <Text color="#5A8060">v{BK1_VERSION}</Text>
+        </Box>
+        <Text color="#5A8060"><Text color="#C0FAD2">{modelLabel}</Text> · dbt Coding Agent by Keith Fajardo @ Mangrove Digital</Text>
+        <Text color="#5A8060">{projectDir}</Text>
+      </Box>
+    </Box>
+  );
+}
+
+function TranscriptMessage({ msg, first }: { msg: Message; first: boolean }) {
+  return (
+    <Box flexDirection="column" marginBottom={1} paddingX={2} marginTop={first ? 1 : 0}>
+      {msg.role === 'user' ? (() => {
+        const cols = process.stdout.columns ?? 80;
+        const bubbleLines = msg.content.split('\n');
+        const boxWidth = Math.max(20, cols - 5);
+        return (
+          <Box borderStyle="round" borderColor="#6B5E8C" paddingX={1} width={boxWidth} flexDirection="column">
+            {bubbleLines.map((line, j) => (
+              <Text key={j} backgroundColor="#2E2940" color="#D8CFEF" wrap="wrap">{line || ' '}</Text>
+            ))}
+          </Box>
+        );
+      })() : msg.info ? (
+        <Text color="#5A8060">{msg.content}</Text>
+      ) : (
+        <>
+          <RichMessage text={msg.content} />
+          {msg.tokens && <TokenBadge tokens={msg.tokens} />}
+        </>
+      )}
+    </Box>
+  );
+}
+
+// Fixed-height, app-scrolled transcript window. Positioning is pure flexbox so the
+// common case (pinned to the bottom, watching output stream) is exact with no height
+// estimation: justifyContent flex-end bottom-aligns the messages, overflow hidden
+// clips older ones off the top. Scroll-up is a negative marginBottom equal to the
+// offset, which slides the content down so the bottom `scrollFromBottom` rows clip off
+// and that many older rows appear at the top — still no dependence on measured heights.
+function Transcript({ scrollFromBottom, innerRef, children }: {
+  scrollFromBottom: number;
+  innerRef: RefObject<DOMElement>;
+  children: ReactNode;
+}) {
+  return (
+    <Box ref={innerRef} flexGrow={1} flexShrink={1} minHeight={0} flexDirection="column" overflow="hidden" justifyContent="flex-end">
+      <Box flexDirection="column" flexShrink={0} marginBottom={-scrollFromBottom}>
+        {children}
+      </Box>
+    </Box>
+  );
+}
+
 interface SemanticAgent { label: string; done: boolean; }
 interface SemanticProgress { agents: SemanticAgent[]; }
 
@@ -1387,74 +1459,6 @@ function SemanticProgressBar({ progress }: { progress: SemanticProgress }) {
 // Uses its own useInput handler so none of the main App's input plumbing (cursor,
 // history, suggestions, etc.) is touched. Renders asterisks for the typed/pasted
 // key — the actual value is held only in component state, never logged.
-
-// ─── Conversation review mode (full-screen scrollable history) ──────────────
-//
-// Triggered by `/review` (or `/scroll`). Replaces the normal TUI with a single
-// scrollable list of every message in the session. Exists so users can read
-// back through long agent output (lint findings, analyses) without relying on
-// VS Code's terminal scrollback — which may be disabled, remapped, or eaten by
-// bk1's mouse-tracking mode. Scroll via ↑↓/PgUp/PgDn/Home/End. Esc returns to
-// the normal TUI.
-
-function ReviewMode({ messages, onExit }: { messages: Message[]; onExit: () => void }) {
-  // Flatten each message into individual terminal lines so we can window by
-  // line count (not message count). Long messages no longer count as a single
-  // PgDn step — you scroll past them one line at a time.
-  const lines = useMemo(() => {
-    const out: { kind: 'user' | 'assistant'; text: string }[] = [];
-    for (const msg of messages) {
-      const split = msg.content.split('\n');
-      if (msg.role === 'user') {
-        split.forEach((line, i) => {
-          out.push({ kind: 'user', text: i === 0 ? `> ${line}` : `  ${line}` });
-        });
-      } else {
-        for (const line of split) out.push({ kind: 'assistant', text: line });
-      }
-      out.push({ kind: 'assistant', text: '' });
-    }
-    return out;
-  }, [messages]);
-
-  const termRows = process.stdout.rows ?? 24;
-  // Reserve 1 row for header + 1 row for spacing + 1 row for hint footer.
-  const visibleHeight = Math.max(1, termRows - 4);
-  const maxOffset = Math.max(0, lines.length - visibleHeight);
-  // Start at the bottom of the conversation so the latest content is on screen.
-  const [offset, setOffset] = useState(maxOffset);
-
-  useInput((_input, key) => {
-    if (key.escape) { onExit(); return; }
-    if (key.upArrow)   setOffset(o => Math.max(0, o - 1));
-    if (key.downArrow) setOffset(o => Math.min(maxOffset, o + 1));
-    if (key.pageUp)    setOffset(o => Math.max(0, o - visibleHeight + 1));
-    if (key.pageDown)  setOffset(o => Math.min(maxOffset, o + visibleHeight - 1));
-  });
-
-  const visible = lines.slice(offset, offset + visibleHeight);
-  const last = Math.min(offset + visibleHeight, lines.length);
-
-  return (
-    <Box flexDirection="column">
-      <Box paddingX={2} gap={1}>
-        <Text bold color="#B9FECF">Conversation Review</Text>
-        <Text color="#5A8060">·</Text>
-        <Text color="#5A8060">lines {offset + 1}–{last} of {lines.length}</Text>
-      </Box>
-      <Box flexDirection="column" paddingX={2}>
-        {visible.map((entry, i) => (
-          entry.kind === 'user'
-            ? <Text key={i} color="#C0FAD2" wrap="wrap">{entry.text || ' '}</Text>
-            : <RichLine key={i} line={entry.text} />
-        ))}
-      </Box>
-      <Box paddingX={2} marginTop={1}>
-        <Text color="#3D6650">↑↓ scroll · PgUp/PgDn page · Esc exit</Text>
-      </Box>
-    </Box>
-  );
-}
 
 // ─── /usage tabbed panel ────────────────────────────────────────────────────
 //
@@ -2306,21 +2310,25 @@ function AppShell() {
     return false;
   });
 
-  // Mouse-tracking lifecycle. Enabled by default so the pet's eyes follow the cursor,
-  // but suspended while the pet is asleep — this doubles as the "let me scroll the
-  // terminal" escape hatch: putting the pet to sleep via `/pet sleep` releases the
-  // wheel + scrollbar back to the terminal for ~10 minutes (or until the next /pet
-  // interaction wakes the pet). Without this, xterm modes 1000/1003 swallow wheel
-  // events and the user can't scroll back through their conversation.
-  //
-  // The unconditional restore on unmount/exit still runs so the terminal never gets
-  // stranded in mouse mode after bk1 closes — printing garbage escape sequences in
-  // the next shell session would be very bad UX.
+  // Terminal-state restore on unmount/exit so bk1 never strands the terminal in mouse
+  // mode (garbage escape sequences in the next shell) and always leaves the alt screen
+  // (restoring whatever content was on screen before bk1 launched). restore is
+  // idempotent — the disable-* writes and ?1049l are all safe to repeat — so the
+  // Ctrl+C process.exit(0) path is covered transitively via the 'exit' handler below.
+  // A separate 'exit' handler prints the one-line goodbye AFTER the alt screen is left.
   useEffect(() => {
     const restore = () => {
       disableMouseTracking(process.stdout);
       disableModifyOtherKeys(process.stdout);
       disableKittyKeyboard(process.stdout);
+      if (ALT_SCREEN) leaveAltScreen(process.stdout);
+    };
+    // Printed on the restored main screen after the alt buffer is gone. Registered
+    // after `restore` so it runs second (Node fires 'exit' handlers in order). Guarded
+    // against a dead stdout (terminal-gone path) so it never throws on the way out.
+    const goodbye = () => {
+      if (process.stdout.writableEnded) return;
+      try { process.stdout.write('bk1 — session saved · run `bk1` to resume · /export for a log\n'); } catch {}
     };
     // Exit when the controlling terminal goes away. Under the VS Code extension
     // bk1 runs as the shell of a pty the extension owns; if the extension host
@@ -2337,6 +2345,7 @@ function AppShell() {
       if (err && (err.code === 'EIO' || err.code === 'EPIPE' || err.code === 'ENXIO' || err.code === 'EBADF')) die();
     };
     process.on('exit', restore);
+    process.on('exit', goodbye);
     process.on('SIGINT', die);
     process.on('SIGTERM', die);
     process.on('SIGHUP', die);
@@ -2346,6 +2355,7 @@ function AppShell() {
     return () => {
       restore();
       process.off('exit', restore);
+      process.off('exit', goodbye);
       process.off('SIGINT', die);
       process.off('SIGTERM', die);
       process.off('SIGHUP', die);
@@ -2494,58 +2504,92 @@ function App({ onLogout }: { onLogout: () => void }) {
   // instead of being forwarded to the agent. Used by `/lint-deep` (and any future
   // command that wants to gate an expensive LLM call on a local Y/N).
   const pendingConfirmActionRef = useRef<null | { onYes: () => void; onNo: () => void }>(null);
-  // Measured rendered height of the App's outer Box. Used by PetSpritePanel to map
-  // mouse-Y onto pet sprite coordinates correctly even when content doesn't fill the
-  // terminal (intro screen, short conversations).
+  // Measured rendered height of the App's outer frame. Drives PetSpritePanel's
+  // mouse-Y → sprite-coordinate mapping so the eyes track even on the short welcome
+  // screen where the footer isn't at the terminal bottom. In the conversation view
+  // the frame is height={terminalRows - 1}, so this measures to terminalRows - 1 and
+  // the pet anchor lands correctly at the frame bottom.
   const containerRef = useRef<DOMElement>(null);
   const [renderHeight, setRenderHeight] = useState(process.stdout.rows ?? 24);
-  // Reactive terminal-row count. Pet eye-tracking anchors to terminal_bottom - 5,
-  // so the calculation needs to follow window resizes. Ink doesn't expose a
-  // ready-made hook, so we listen to stdout's resize event ourselves.
+  // Reactive terminal-row count, kept in sync with window resizes.
   const [terminalRows, setTerminalRows] = useState(process.stdout.rows ?? 24);
-  // True while the window is actively being resized. The live frame collapses to a
-  // minimal height (input + one status line, no pet sprite / rules / hints) while
-  // this is set — see the resize handling note below.
-  const [resizing, setResizing] = useState(false);
+  // Forces a fresh render after a resize / Ctrl+L even when no other state changed
+  // (e.g. a width-only resize) so the wiped alt buffer gets repainted.
+  const [, setResizeNonce] = useState(0);
+  // App-owned transcript scroll (the alt buffer has no native scrollback). scrollFromBottom
+  // is rows scrolled up from the bottom — 0 = pinned to the newest line. viewportRows is
+  // the measured transcript-window height, used to clamp scrolling and size a PgUp/PgDn page.
+  const transcriptRef = useRef<DOMElement>(null);
+  const [scrollFromBottom, setScrollFromBottom] = useState(0);
+  const scrollFromBottomRef = useRef(0);
+  useEffect(() => { scrollFromBottomRef.current = scrollFromBottom; }, [scrollFromBottom]);
+  const [viewportRows, setViewportRows] = useState(0);
+  const viewportRowsRef = useRef(0);
+  useEffect(() => { viewportRowsRef.current = viewportRows; }, [viewportRows]);
+
   useEffect(() => {
-    // Resize ghosting fix, Claude-Code style. The root bug: bk1's live (repainted)
-    // frame is ~10 rows tall (pet sprite, footer, rules, hints, input). On resize the
-    // terminal reflows those rows into a different physical-row count, which desyncs
-    // Ink's log-update line tracking and leaves stale copies stacked in scrollback as
-    // ghosts. No amount of post-hoc clearing fixes it cleanly (logical vs physical
-    // line counts can't be resynced), and we must never wipe the <Static> history.
-    //
-    // The robust fix is to keep the live frame SMALL so it can't wrap-scroll and ghost.
-    // We can't permanently drop the pet sprite, so instead we collapse the live frame
-    // to a minimal height only WHILE resizing: set `resizing` on the first resize tick,
-    // clear it on a trailing debounce once the drag settles.
-    //
-    // We deliberately do NOT manually clear Ink's output here. Ink's clear() writes
-    // eraseLines(previousLineCount), and previousLineCount is a LOGICAL line count while
-    // the terminal reflows PHYSICAL rows — calling it mid-resize corrupts Ink's counter
-    // against the reflowed buffer and strands orphan rows (the stray HRule lines we saw).
-    // Letting Ink's own log() do the erase on each render keeps the counter self-consistent.
-    // The other half of the fix is that HRule never spans the full width (see HRule), so no
-    // live-frame row wraps to a second physical row — the divergence that makes the upward
-    // erase fall short.
-    let settleTimer: ReturnType<typeof setTimeout> | undefined;
+    // Resize handling, alt-screen style. Ink registers its OWN resize listener in its
+    // constructor (before this effect) and re-renders from a now-stale line count. We
+    // can't pre-empt it, so we let it run and then, AFTER it, wipe the alt buffer
+    // (\x1b[2J\x1b[H — safe: the alt buffer holds no scrollback to destroy), reset Ink's
+    // line counter via instance.clear(), and force a fresh render at the new size.
+    // Because terminals never reflow the alt buffer on resize, there is nothing to ghost
+    // — that is the entire point of the alt-screen migration. Same-dimension events
+    // (terminals often emit 2+) are deduped to avoid redundant wipes.
+    let last = { rows: process.stdout.rows ?? 24, cols: process.stdout.columns ?? 80 };
     const onResize = () => {
-      setTerminalRows(process.stdout.rows ?? 24);
-      setResizing(true);
-      if (settleTimer) clearTimeout(settleTimer);
-      settleTimer = setTimeout(() => setResizing(false), 300);
+      const rows = process.stdout.rows ?? 24;
+      const cols = process.stdout.columns ?? 80;
+      if (rows === last.rows && cols === last.cols) return;
+      last = { rows, cols };
+      if (ALT_SCREEN) clearAltScreen(process.stdout);
+      inkInstance?.clear();
+      setTerminalRows(rows);
+      setResizeNonce(n => n + 1);
     };
     process.stdout.on('resize', onResize);
-    return () => {
-      if (settleTimer) clearTimeout(settleTimer);
-      process.stdout.off('resize', onResize);
-    };
+    return () => { process.stdout.off('resize', onResize); };
   }, []);
+
+  // Measure the outer frame (pet anchor) and the transcript window (scroll clamp)
+  // after each render. Both are cheap reads of Yoga's computed height.
   useEffect(() => {
-    if (!containerRef.current) return;
-    const { height } = measureElement(containerRef.current);
-    if (height > 0) setRenderHeight(prev => (prev === height ? prev : height));
+    if (containerRef.current) {
+      const { height } = measureElement(containerRef.current);
+      if (height > 0) setRenderHeight(prev => (prev === height ? prev : height));
+    }
+    if (transcriptRef.current) {
+      const { height } = measureElement(transcriptRef.current);
+      if (height > 0) setViewportRows(prev => (prev === height ? prev : height));
+    }
   });
+
+  // Keep scroll position stable when new messages land while the user is scrolled up:
+  // grow scrollFromBottom by the height of the appended messages so the view doesn't
+  // jump. When pinned to the bottom (scrollFromBottom === 0) we stay pinned (auto-
+  // follow). Always clamp to the current maximum so shrinking content or a taller
+  // viewport can't leave us scrolled past the top.
+  const prevMsgLenRef = useRef(messages.length);
+  useEffect(() => {
+    const cols = process.stdout.columns ?? 80;
+    const items = messagesToItems(messages);
+    const maxScroll = computeMaxScroll(items, cols, viewportRows);
+    const prevLen = prevMsgLenRef.current;
+    prevMsgLenRef.current = messages.length;
+    setScrollFromBottom(prev => {
+      if (prev <= 0) return 0;
+      let next = prev;
+      if (messages.length > prevLen) {
+        for (let i = prevLen; i < messages.length; i++) {
+          next += estimateMessageHeight(
+            { kind: 'message', role: messages[i]!.role, content: messages[i]!.content, info: messages[i]!.info, hasTokens: !!messages[i]!.tokens },
+            cols,
+          );
+        }
+      }
+      return Math.min(next, maxScroll);
+    });
+  }, [messages, viewportRows]);
   // Refs so submit() (useCallback []) always reads the latest values
   const modelIdxRef = useRef(DEFAULT_MODEL_IDX);
   const modeRef = useRef<Mode>('plan');
@@ -2641,10 +2685,6 @@ function App({ onLogout }: { onLogout: () => void }) {
   const activeGameRef = useRef<string | null>(null);
   useEffect(() => { activeGameRef.current = activeGame; }, [activeGame]);
 
-  // Full-screen scrollable conversation view (triggered by /review or /scroll).
-  // Replaces the normal TUI with a keyboard-navigable history so users don't
-  // depend on VS Code's terminal scrollback to read back through long sessions.
-  const [reviewMode, setReviewMode] = useState(false);
   const [awaitingAdminKey, setAwaitingAdminKey] = useState(false);
   const awaitingAdminKeyRef = useRef(false);
   // When set to a non-null string, the render path swaps the conversation view
@@ -2687,28 +2727,14 @@ function App({ onLogout }: { onLogout: () => void }) {
     return () => clearInterval(id);
   }, []);
 
-  // Unified mouse-tracking lifecycle. Tracking is ON only while a pet mini-game
-  // is active (fetch needs to receive clicks). Otherwise OFF, so the terminal
-  // handles wheel/select natively — VS Code's terminal scrollback, native text
-  // selection, and wheel scroll keep working.
-  const mouseTrackingOnRef = useRef(false);
+  // Session-wide mouse tracking. In alt-screen mode the terminal's native scrollback
+  // is gone, so bk1 owns scrolling — which means it needs the wheel, which means mouse
+  // tracking is on for the whole session (not just during mini-games). This also makes
+  // the pet's eyes follow the cursor everywhere. The cost is that native click-drag
+  // text selection now needs Shift/Option-drag. restore() disables it on exit.
   useEffect(() => {
-    const want = activeGame !== null;
-    if (want === mouseTrackingOnRef.current) return;
-    if (want) {
-      void import('./mouse').then(m => {
-        m.enableMouseTracking(process.stdout);
-        mouseTrackingOnRef.current = true;
-      });
-    } else {
-      disableMouseTracking(process.stdout);
-      mouseTrackingOnRef.current = false;
-    }
-  }, [activeGame]);
-  // One-shot disable in case a previous bk1 session left the terminal in mouse mode.
-  useEffect(() => {
-    disableMouseTracking(process.stdout);
-    mouseTrackingOnRef.current = false;
+    enableMouseTracking(process.stdout);
+    return () => { disableMouseTracking(process.stdout); };
   }, []);
 
   // Opt+Enter / Shift+Enter → insert a newline into the prompt instead of
@@ -2758,28 +2784,40 @@ function App({ onLogout }: { onLogout: () => void }) {
     return () => { stdin.read = realRead; };
   }, []);
 
-  // Live mouse cursor position — drives the pet's eye-tracking. `null` means we haven't
-  // Mouse click → pet interaction. Mouse motion → eye tracking.
+  // Raw mouse handling off stdin (SGR escape sequences). Three jobs:
+  //   - motion / left-press updates petMousePos so the pet's eyes follow the cursor
+  //     (this is the write the PetSpritePanel reads at render time);
+  //   - the wheel scrolls the transcript (the alt buffer has no native scrollback);
+  //   - a left-press in the bottom rows (StatusFooter band) taps the pet → play().
   //
-  // Listen to raw stdin and parse xterm SGR mouse escape sequences. A left-press
-  // anywhere in the bottom rows (where StatusFooter lives) is treated as "the user
-  // tapped the pet" and routed to play() — boosts happiness, costs a little energy.
-  // Motion events update mouseCol so the pet's eyes follow the cursor.
-  //
-  // Why the bottom-rows heuristic and not pixel-accurate hit detection on the pet's
-  // actual columns? Ink doesn't expose component render coordinates, and the pet face
-  // shifts width with name + mood. A generous click target is more forgiving and the
-  // worst case is "user clicked the cost text and pet got happier" — harmless.
+  // The bottom-rows heuristic (not pixel-accurate pet hit-testing) is intentional: Ink
+  // doesn't expose component render coords and the pet face shifts width with name +
+  // mood, so a generous click target is more forgiving — worst case the user clicks the
+  // cost text and the pet gets happier, which is harmless.
+  const WHEEL_STEP = 3;
   useEffect(() => {
     const handler = (data: Buffer) => {
-      // While a mini-game is active it owns mouse input — its own handler parses
-      // the same stdin chunk. Bail out so a single click doesn't fire both "throw
-      // to fetch" AND "tap the StatusFooter pet" (which would credit happiness twice
-      // and re-render the bottom bar mid-game).
+      // While a mini-game is active it owns mouse input — its own handler parses the
+      // same stdin chunk. Bail so a click doesn't fire both the game and the pet tap.
       if (activeGameRef.current) return;
       const str = data.toString('utf8');
       const events = parseMouseEvents(str);
       for (const ev of events) {
+        // Eye tracking: remember the latest cursor cell for any motion or left-press.
+        if (ev.motion || (ev.press && ev.button === 'left')) {
+          petMousePos.col = ev.col;
+          petMousePos.row = ev.row;
+        }
+        // Wheel scrolls the transcript: up reveals older content, down returns to the
+        // newest. Clamp against the live content/viewport so you can't scroll past
+        // either end. Wheel events arrive as presses (button wheel-up/down).
+        if (ev.press && (ev.button === 'wheel-up' || ev.button === 'wheel-down')) {
+          const cols = process.stdout.columns ?? 80;
+          const maxScroll = computeMaxScroll(messagesToItems(messagesRef.current), cols, viewportRowsRef.current);
+          const delta = ev.button === 'wheel-up' ? WHEEL_STEP : -WHEEL_STEP;
+          setScrollFromBottom(s => Math.max(0, Math.min(maxScroll, s + delta)));
+          continue;
+        }
         if (!ev.press || ev.motion) continue;
         if (ev.button !== 'left') continue;
         const totalRows = process.stdout.rows ?? 24;
@@ -2971,7 +3009,14 @@ function App({ onLogout }: { onLogout: () => void }) {
       return;
     }
     if (raw === '/clear') {
-      process.stdout.write('\x1b[3J\x1b[H\x1b[2J');
+      // Reset conversation state (returns to the welcome screen) and scroll. No raw
+      // escape writes — in the alt buffer \x1b[3J is meaningless, and the repaint is
+      // handled by clearing the buffer + resetting Ink's line counter.
+      setMessages([]); messagesRef.current = [];
+      historyRef.current = [];
+      setScrollFromBottom(0);
+      if (ALT_SCREEN) clearAltScreen(process.stdout);
+      inkInstance?.clear();
       setInputAndCursor(''); setSuggestionIndex(-1);
       return;
     }
@@ -3048,11 +3093,12 @@ function App({ onLogout }: { onLogout: () => void }) {
       return;
     }
     if (raw === '/review' || raw === '/scroll') {
-      // Enter full-screen scrollable conversation view. The App's render path
-      // short-circuits to <ReviewMode/> while `reviewMode` is true; Esc inside
-      // ReviewMode calls onExit which flips it back to false.
+      // Jump the transcript to the top (oldest content). The transcript is now
+      // scrollable in place (wheel + PgUp/PgDn), so this is just a "scroll to top"
+      // convenience — the old separate full-screen ReviewMode is gone.
+      const cols = process.stdout.columns ?? 80;
+      setScrollFromBottom(computeMaxScroll(messagesToItems(messagesRef.current), cols, viewportRowsRef.current));
       setInputAndCursor(''); setSuggestionIndex(-1);
-      setReviewMode(true);
       return;
     }
     if (raw === '/history') {
@@ -3189,11 +3235,9 @@ function App({ onLogout }: { onLogout: () => void }) {
         }
       } else if (sub === 'sleep') {
         nextPet = petSleep(nextPet);
-        // Release the mouse synchronously, before the next render — otherwise the
-        // user has to wait for the polling effect to re-run before scroll/select
-        // works. Also update the ref so the effect's apply() doesn't re-enable.
-        disableMouseTracking(process.stdout);
-        mouseTrackingOnRef.current = false;
+        // Pure visual/state change. (Pre-alt-screen, sleeping released mouse tracking so
+        // the native wheel/scrollbar worked again; now scrolling is app-owned via the
+        // wheel session-wide, so mouse tracking stays on and sleep is cosmetic.)
         note = `${nextPet.name ?? 'Your pet'} fell asleep. Energy restored.`;
       } else if (sub === 'name') {
         if (!arg) {
@@ -3637,6 +3681,22 @@ function App({ onLogout }: { onLogout: () => void }) {
     // wheel scroll would put the pet to sleep and immediately wake it back up.
     if (inputChar && /\[<\d+;\d+;\d+[Mm]/.test(inputChar)) return;
 
+    // Transcript scrolling (alt buffer has no native scrollback). PgUp/PgDn page,
+    // Home jumps to the top (oldest), End returns to the bottom (newest). Handled
+    // before the wake-on-keypress hook below so paging doesn't wake the pet, and
+    // only in the conversation view (there's nothing to scroll on the welcome screen).
+    if (messages.length > 0 && !confirmPrompt) {
+      const cols = process.stdout.columns ?? 80;
+      const maxScroll = computeMaxScroll(messagesToItems(messages), cols, viewportRows);
+      const page = Math.max(1, viewportRows - 1);
+      const isHome = inputChar === '\x1b[H' || inputChar === '\x1b[1~';
+      const isEnd  = inputChar === '\x1b[F' || inputChar === '\x1b[4~';
+      if (key.pageUp)   { setScrollFromBottom(s => Math.min(maxScroll, s + page)); return; }
+      if (key.pageDown) { setScrollFromBottom(s => Math.max(0, s - page)); return; }
+      if (isHome)       { setScrollFromBottom(maxScroll); return; }
+      if (isEnd)        { setScrollFromBottom(0); return; }
+    }
+
     // Any real keypress while the pet is asleep wakes it up — the closest natural
     // substitute to "click the pet to wake it" we can offer without re-enabling
     // mouse capture (which would re-break drag-selection and the wheel). The
@@ -3656,14 +3716,12 @@ function App({ onLogout }: { onLogout: () => void }) {
     if (key.ctrl && inputChar === 'c') process.exit(0);
     // Ctrl+L force-redraws the UI — recovery hatch when the terminal's cursor gets
     // out of sync with Ink (e.g. after a stray escape sequence from Option+key in
-    // VS Code's xterm.js, or a window resize).
+    // VS Code's xterm.js). Wipe the alt buffer, reset Ink's line counter, and bump
+    // the nonce so the next render repaints from scratch.
     if (key.ctrl && inputChar === 'l') {
-      // Force a full redraw via Ink's own resize path: re-emitting 'resize' makes Ink
-      // recalculate layout and reprint (clearTerminal + fullStaticOutput + output when
-      // content is taller than the screen), so the conversation history is rewritten
-      // rather than left blanked. A bare \x1b[2J would clear the visible frame without
-      // telling Ink to repaint, leaving an empty screen until the next state change.
-      process.stdout.emit('resize');
+      if (ALT_SCREEN) clearAltScreen(process.stdout);
+      inkInstance?.clear();
+      setResizeNonce(n => n + 1);
       return;
     }
     // Ctrl+T: toggle terminal mode (shell-passthrough at the prompt).
@@ -4074,172 +4132,111 @@ function App({ onLogout }: { onLogout: () => void }) {
     );
   }
 
-  // Conversation view
+  // Conversation view (alt-screen). The frame is height={terminalRows - 1} so the
+  // total rendered height stays below terminalRows — Ink full-screen-clears (flicker)
+  // on every render once outputHeight >= stdout.rows. The transcript flexGrows to fill
+  // the space above the live region; the live region (streaming output, input, footer,
+  // hints) keeps its natural height pinned to the bottom.
+  const cols = process.stdout.columns ?? 80;
+  const items = messagesToItems(messages);
+  // Render only a trailing window of messages so Yoga doesn't re-lay-out the entire
+  // history every frame (the pet animates on timers). Cover the viewport + current
+  // scroll offset + a buffer; src/transcript.ts estimates the heights.
+  const startIdx = windowStartIndex(items, cols, viewportRows + scrollFromBottom + 12);
+  const windowNodes: ReactNode[] = [];
+  for (let r = startIdx; r < items.length; r++) {
+    if (r === 0) {
+      windowNodes.push(<HeaderBlock key="header" modelLabel={MODELS[modelIdx]!.label} projectDir={getProjectDir()} />);
+    } else {
+      windowNodes.push(<TranscriptMessage key={r} msg={messages[r - 1]!} first={r === 1} />);
+    }
+  }
+  // Bound the streaming text blocks so the live region can't outgrow the frame (which
+  // would push total height ≥ terminalRows and trigger Ink's full-screen clear). The
+  // fixed chrome (footer + input + hints + rules + spinner ≈ 14 rows) and a small
+  // transcript minimum are reserved; whatever's left caps the live stream.
+  const maxStreamLines = Math.max(3, terminalRows - 18);
+
   return (
-    <Box ref={containerRef} flexDirection="column">
-      {/* WORDMARK + intro block — pinned at the very top of scrollback via its own
-          single-item <Static>. Rendered exactly once when the conversation view
-          mounts so it never gets repainted on subsequent turns (and so it sits
-          above the messages Static below, instead of inside the dynamic frame
-          where it would otherwise appear *between* messages and the footer).
-          Note: the model label captured here is the one current when this block
-          first rendered; if the user later /model-switches, the live label is
-          still visible in the InputBar. */}
-      <Static items={HEADER_ITEMS}>
-        {() => (
-          <Box key="header" flexDirection="column" paddingX={2} paddingTop={1} paddingBottom={0}>
-            {WORDMARK.map((line, i) => (
-              <WordmarkLine key={i} line={line} color="#B9FECF" />
-            ))}
-            <Box marginTop={1} flexDirection="column">
-              <Box gap={1}>
-                <Text bold color="#C0FAD2">bk1</Text>
-                <Text color="#5A8060">v{BK1_VERSION}</Text>
-              </Box>
-              <Text color="#5A8060"><Text color="#C0FAD2">{MODELS[modelIdx]!.label}</Text> · dbt Coding Agent by Keith Fajardo @ Mangrove Digital</Text>
-              <Text color="#5A8060">{getProjectDir()}</Text>
-            </Box>
-          </Box>
-        )}
-      </Static>
-
-      {/* Past messages render through <Static>: each one is written to stdout exactly
-          once when it appears in the items array and never touched by subsequent Ink
-          renders. That's what makes drag-selection on assistant output actually stick —
-          without this, the snore animation / input-bar redraws were repainting the
-          message lines and wiping out the terminal's selection highlight. Padding has
-          to be set per-item because <Static> children don't inherit parent box props. */}
-      <Static items={messages}>
-        {(msg, i) => (
-          <Box key={i} flexDirection="column" marginBottom={1} paddingX={2} marginTop={i === 0 ? 1 : 0}>
-            {msg.role === 'user' ? (() => {
-              // Bordered bubble (distinct background) so the user can visually
-              // distinguish their own prompts from the agent's left-aligned plain
-              // output. Each newline-separated line renders as its own Text inside
-              // a column-direction Box. Ink's wrap="wrap" on a single Text element
-              // with embedded \n sometimes collapses the newlines when the
-              // parent Box has a fixed width — splitting + flexDirection=column
-              // sidesteps that path entirely.
-              //
-              // Width matches the input box (InputBar): cols-5, the same
-              // resize-safe margin HRule uses, so the prompt history and the live
-              // input box line up at one consistent width. Both sit inside a
-              // paddingX={2} wrapper, so cols-5 spans identically. (No longer
-              // right-aligned — at full width that's a no-op.) Lines longer than
-              // the box wrap inside it.
-              const cols = process.stdout.columns ?? 80;
-              const bubbleLines = msg.content.split('\n');
-              const boxWidth = Math.max(20, cols - 5);
-              return (
-                <Box borderStyle="round" borderColor="#6B5E8C" paddingX={1} width={boxWidth} flexDirection="column">
-                  {bubbleLines.map((line, j) => (
-                    <Text key={j} backgroundColor="#2E2940" color="#D8CFEF" wrap="wrap">{line || ' '}</Text>
-                  ))}
-                </Box>
-              );
-            })() : msg.info ? (
-              <Text color="#5A8060">{msg.content}</Text>
-            ) : (
-              <>
-                <RichMessage text={msg.content} />
-                {msg.tokens && <TokenBadge tokens={msg.tokens} />}
-              </>
-            )}
-          </Box>
-        )}
-      </Static>
-
-      {/* While the window is being resized, collapse the live frame to two rows
-          (input + compact status). A tall live frame is what ghosts on resize: the
-          terminal reflows its rows and Ink's line tracking desyncs. Two rows can't
-          wrap-scroll, so there's nothing to ghost. The full frame (pet sprite, rules,
-          hints, live-stream) repaints once `resizing` clears on settle. */}
-      {resizing ? (
+    <Box ref={containerRef} flexDirection="column" height={terminalRows - 1}>
+      <Transcript scrollFromBottom={scrollFromBottom} innerRef={transcriptRef}>
+        {windowNodes}
+      </Transcript>
+      <Box flexDirection="column">
         <Box flexDirection="column" paddingX={2}>
-          <InputBar input={input} cursorPos={cursorPos} isRunning={isRunning} mode={mode} modelLabel={MODELS[modelIdx]!.label} maskInput={awaitingAdminKey} terminalMode={terminalMode} collapsed />
-          <Text color="#5A8060">resizing…</Text>
-        </Box>
-      ) : (
-        <>
-          <Box flexDirection="column" paddingX={2}>
-            {isRunning && (
-              <Box flexDirection="column" marginBottom={1}>
-                <Box gap={1}>
-                  <Text color="#5A8060">{liveExpanded ? '-' : '+'}</Text>
-                  <Text color="#B9FECF"><Spinner type="sand" /></Text>
-                  <GlowText text="mangroooooving..." />
-                  {activeTool && (
-                    <Text color="#5A8060">· {activeTool}</Text>
-                  )}
-                </Box>
-                {lintProgress && lintProgress.phase !== 'semantic' && <LintProgressBar progress={lintProgress} />}
-                {semanticProgress && semanticProgress.agents.some(a => !a.done) && (
-                  <SemanticProgressBar progress={semanticProgress} />
-                )}
-                {liveTokens && <TokenBadge tokens={liveTokens} dim />}
-                {!liveExpanded && liveText && (
-                  <Box paddingLeft={4}>
-                    <Text color="#3D6650">
-                      {(liveText.trim().split('\n').slice(-1)[0] ?? '').slice(0, 120)}
-                    </Text>
-                  </Box>
-                )}
-                {liveExpanded && liveText && (
-                  <Box flexDirection="column" paddingLeft={3}>
-                    <Text wrap="wrap" color="#7AB890">{liveText.trimEnd()}</Text>
-                  </Box>
+          {isRunning && (
+            <Box flexDirection="column" marginBottom={1}>
+              <Box gap={1}>
+                <Text color="#5A8060">{liveExpanded ? '-' : '+'}</Text>
+                <Text color="#B9FECF"><Spinner type="sand" /></Text>
+                <GlowText text="mangroooooving..." />
+                {activeTool && (
+                  <Text color="#5A8060">· {activeTool}</Text>
                 )}
               </Box>
-            )}
-            {liveShellCmd && (
-              <Box flexDirection="column" marginBottom={1}>
-                <Box gap={1}>
-                  <Text color="#7DD3FC">$</Text>
-                  <Text color="#BAE6FD" bold>{liveShellCmd}</Text>
-                  <Text color="#5A8060"><Spinner type="sand" /></Text>
-                  <Text color="#3D6650">Esc to abort</Text>
+              {lintProgress && lintProgress.phase !== 'semantic' && <LintProgressBar progress={lintProgress} />}
+              {semanticProgress && semanticProgress.agents.some(a => !a.done) && (
+                <SemanticProgressBar progress={semanticProgress} />
+              )}
+              {liveTokens && <TokenBadge tokens={liveTokens} dim />}
+              {!liveExpanded && liveText && (
+                <Box paddingLeft={4}>
+                  <Text color="#3D6650">
+                    {(liveText.trim().split('\n').slice(-1)[0] ?? '').slice(0, 120)}
+                  </Text>
                 </Box>
-                {liveShellText && (
-                  <Box flexDirection="column" paddingLeft={2}>
-                    <Text wrap="wrap" color="#7AB890">
-                      {liveShellText.trimEnd().split('\n').slice(-12).join('\n')}
-                    </Text>
-                  </Box>
-                )}
-              </Box>
-            )}
-          </Box>
-
-          {!confirmPrompt && (isModelPicker
-            ? <ModelPicker currentIdx={modelIdx} />
-            : isProjectPicker
-              ? <ProjectPicker recents={projectRecents} currentIdx={projectIdx} typed={projectTyped} current={getProjectDir()} />
-            : isPetPlayroomPicker
-              ? <PlayroomPicker currentIdx={petPlayroomIdx} />
-              : isPetPlayPicker
-                ? <GamePicker currentIdx={petPlayIdx} />
-                : isPetFeedPicker
-                  ? <FoodPicker currentIdx={petFeedIdx} balance={pet.coins} />
-                  : <Suggestions suggestions={suggestions} selectedIndex={suggestionIndex} input={input} />
+              )}
+              {liveExpanded && liveText && (
+                <Box flexDirection="column" paddingLeft={3}>
+                  <Text wrap="wrap" color="#7AB890">{liveText.trimEnd().split('\n').slice(-maxStreamLines).join('\n')}</Text>
+                </Box>
+              )}
+            </Box>
           )}
-          <HRule />
-          {!confirmPrompt && <IdeContextBar ctx={ideCtx} />}
-          {confirmPrompt
-            ? <ConfirmBar question={confirmPrompt} selectedIdx={confirmSelected} />
-            : <InputBar input={input} cursorPos={cursorPos} isRunning={isRunning} mode={mode} modelLabel={MODELS[modelIdx]!.label} maskInput={awaitingAdminKey} terminalMode={terminalMode} />
-          }
-          {/* Eye-tracking anchor: `terminalRows - 5`. Once a conversation has enough
-              Static scrollback to push the dynamic frame down, the cursor lands at the
-              terminal bottom and this is exact. For short conversations on tall terminals
-              it can be a bit off (eye is higher than the anchor), but that's the
-              least-bad option given we can't measure absolute position with Static
-              content present. terminalRows itself follows window resizes via the
-              stdout.on('resize') listener at the top of App. */}
-          <StatusFooter sessionUsd={sessionUsd} pet={pet} renderHeight={terminalRows} coinToast={coinToast} />
-          <HRule />
-          <HintBar isRunning={isRunning} terminalMode={terminalMode} />
-        </>
-      )}
+          {liveShellCmd && (
+            <Box flexDirection="column" marginBottom={1}>
+              <Box gap={1}>
+                <Text color="#7DD3FC">$</Text>
+                <Text color="#BAE6FD" bold>{liveShellCmd}</Text>
+                <Text color="#5A8060"><Spinner type="sand" /></Text>
+                <Text color="#3D6650">Esc to abort</Text>
+              </Box>
+              {liveShellText && (
+                <Box flexDirection="column" paddingLeft={2}>
+                  <Text wrap="wrap" color="#7AB890">
+                    {liveShellText.trimEnd().split('\n').slice(-Math.min(12, maxStreamLines)).join('\n')}
+                  </Text>
+                </Box>
+              )}
+            </Box>
+          )}
+        </Box>
+
+        {!confirmPrompt && (isModelPicker
+          ? <ModelPicker currentIdx={modelIdx} />
+          : isProjectPicker
+            ? <ProjectPicker recents={projectRecents} currentIdx={projectIdx} typed={projectTyped} current={getProjectDir()} />
+          : isPetPlayroomPicker
+            ? <PlayroomPicker currentIdx={petPlayroomIdx} />
+            : isPetPlayPicker
+              ? <GamePicker currentIdx={petPlayIdx} />
+              : isPetFeedPicker
+                ? <FoodPicker currentIdx={petFeedIdx} balance={pet.coins} />
+                : <Suggestions suggestions={suggestions} selectedIndex={suggestionIndex} input={input} />
+        )}
+        <HRule />
+        {!confirmPrompt && <IdeContextBar ctx={ideCtx} />}
+        {confirmPrompt
+          ? <ConfirmBar question={confirmPrompt} selectedIdx={confirmSelected} />
+          : <InputBar input={input} cursorPos={cursorPos} isRunning={isRunning} mode={mode} modelLabel={MODELS[modelIdx]!.label} maskInput={awaitingAdminKey} terminalMode={terminalMode} />
+        }
+        {/* Eye-tracking anchor uses the measured frame height (renderHeight). With the
+            frame pinned to height terminalRows-1, the footer sits at the frame bottom
+            and the pet eye lands at renderHeight - 5 (≈ terminalRows - 6). */}
+        <StatusFooter sessionUsd={sessionUsd} pet={pet} renderHeight={renderHeight} coinToast={coinToast} />
+        <HRule />
+        <HintBar isRunning={isRunning} terminalMode={terminalMode} />
+      </Box>
     </Box>
   );
 }
@@ -4257,7 +4254,16 @@ process.on('uncaughtException', (err: NodeJS.ErrnoException) => {
   if (terminalGone || code === 'EIO' || code === 'EPIPE' || code === 'ENXIO' || code === 'EBADF') {
     process.exit(0);
   }
+  // Genuine logic error, terminal still live: leave the alt screen first so the stack
+  // trace prints on the restored main screen instead of the about-to-be-discarded alt
+  // buffer. (The 'exit' handler also runs leaveAltScreen, but the throw must surface on
+  // the real screen.)
+  if (ALT_SCREEN) leaveAltScreen(process.stdout);
   throw err;
 });
 
-render(<AppShell />);
+// Enter the alternate screen buffer before the first render so the login screen, the
+// welcome view, and the conversation all paint inside it. Captured instance gives the
+// resize handler / Ctrl+L / clear access to Ink's line-counter reset (instance.clear()).
+if (ALT_SCREEN) enterAltScreen(process.stdout);
+inkInstance = render(<AppShell />);

@@ -86,6 +86,30 @@ export function disableMouseTracking(out: NodeJS.WriteStream): void {
   out.write('\x1b[?1006l\x1b[?1015l\x1b[?1005l\x1b[?1003l\x1b[?1002l\x1b[?1000l');
 }
 
+// Alternate screen buffer (DEC private mode 1049). Entering switches the terminal
+// to a fresh, scrollback-less buffer (like vim/htop/less); leaving restores the
+// exact content that was on screen before — bk1's UI vanishes cleanly on exit.
+//
+// This is what fixes resize ghosting: terminals do NOT reflow the alt buffer on
+// resize the way they reflow main-screen scrollback, so Ink's logical line count
+// never desyncs from physical rows. It also means clearing the alt buffer is free
+// of consequence — the "never clear the screen" constraint was about not destroying
+// the user's main-screen scrollback, which the alt buffer doesn't have.
+export function enterAltScreen(out: NodeJS.WriteStream): void {
+  out.write('\x1b[?1049h');
+}
+
+export function leaveAltScreen(out: NodeJS.WriteStream): void {
+  out.write('\x1b[?1049l');
+}
+
+// Wipe the alt buffer and home the cursor. Used by the resize handler (after
+// Ink's own resize pass) and by /clear and Ctrl+L. Safe in the alt buffer; would
+// be destructive on the main screen (so callers must only use it under alt-screen).
+export function clearAltScreen(out: NodeJS.WriteStream): void {
+  out.write('\x1b[2J\x1b[H');
+}
+
 // xterm "modifyOtherKeys" mode 2 — makes the terminal report Shift+Enter,
 // Ctrl+Enter, etc. as distinct CSI escape sequences instead of collapsing them
 // to bare \r (which is indistinguishable from a plain Enter). Used to detect
