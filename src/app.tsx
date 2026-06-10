@@ -525,7 +525,7 @@ function HintBar({ isRunning, terminalMode }: { isRunning: boolean; terminalMode
       {isRunning
         ? <Text color="#3D6650">t  toggle output   Esc  stop agent   Ctrl+C  exit</Text>
         : terminalMode
-          ? <Text color="#7DD3FC">TERMINAL MODE — input runs as shell   ? prefix  ask agent   Ctrl+T  back to prompt   Ctrl+C exit</Text>
+          ? <Text color={TERM_ACCENT}>TERMINAL MODE — input runs as shell   ? prefix  ask agent   Ctrl+T  back to prompt   Ctrl+C exit</Text>
           : <Text color="#B9FECF">PROMPT MODE — input sent to agent   ! prefix  run shell   Opt+Enter  newline   Tab switch mode   /term  terminal mode   /clear  redraw   Ctrl+C exit</Text>
       }
     </Box>
@@ -594,6 +594,12 @@ const MODE_THEME: Record<Mode, { badge: string; accent: string; text: string; la
   auto:  { badge: '#7DD3FC', accent: '#7DD3FC', text: '#BAE6FD', label: 'AUTO' },
 };
 
+// Terminal/shell-escape accent. A bright "shining" violet, deliberately distinct from every
+// MODE_THEME accent (plan=amber, build=green, auto=cyan) so terminal mode can't be mistaken
+// for AUTO — they used to share #7DD3FC. Used by both the prompt box (InputBar) and its hint
+// line (HintBar) so the whole terminal-mode surface reads purple.
+const TERM_ACCENT = '#C084FC';
+
 function nextMode(m: Mode): Mode {
   return MODE_ORDER[(MODE_ORDER.indexOf(m) + 1) % MODE_ORDER.length]!;
 }
@@ -602,7 +608,7 @@ function InputBar({ input, cursorPos, isRunning, mode, modelLabel, maskInput, te
   input: string; cursorPos: number; isRunning: boolean; mode: Mode; modelLabel: string; maskInput?: boolean; terminalMode?: boolean;
 }) {
   const theme = MODE_THEME[mode];
-  const termAccent = '#7DD3FC';
+  const termAccent = TERM_ACCENT;
   // Typing `!` at the start of the input is the inline shell-escape — that
   // line will run as a bash command on submit, even outside terminal mode.
   // Surface that with the same cyan styling the persistent terminal mode
@@ -2727,15 +2733,17 @@ function App({ onLogout }: { onLogout: () => void }) {
     return () => clearInterval(id);
   }, []);
 
-  // Session-wide mouse tracking. In alt-screen mode the terminal's native scrollback
-  // is gone, so bk1 owns scrolling — which means it needs the wheel, which means mouse
-  // tracking is on for the whole session (not just during mini-games). This also makes
-  // the pet's eyes follow the cursor everywhere. The cost is that native click-drag
-  // text selection now needs Shift/Option-drag. restore() disables it on exit.
+  // Mouse tracking is scoped to mini-games only. Turning it on session-wide (for wheel
+  // scroll + the pet's eye-tracking) suppresses native click-drag text selection in most
+  // terminals — and selecting transcript text matters more than the wheel, which still
+  // works via PgUp/PgDn/Home/End. Games like fetch need click input, so tracking is enabled
+  // only while one is active and disabled the moment it exits. BK1_MOUSE=1 forces it on for
+  // the whole session (wheel + eye-tracking back, selection needs Option-drag again).
   useEffect(() => {
+    if (!activeGame && process.env.BK1_MOUSE !== '1') return;
     enableMouseTracking(process.stdout);
     return () => { disableMouseTracking(process.stdout); };
-  }, []);
+  }, [activeGame]);
 
   // Opt+Enter / Shift+Enter → insert a newline into the prompt instead of
   // submitting. Handled by re-wrapping stdin.emit (layered on top of AppShell's
@@ -3235,9 +3243,9 @@ function App({ onLogout }: { onLogout: () => void }) {
         }
       } else if (sub === 'sleep') {
         nextPet = petSleep(nextPet);
-        // Pure visual/state change. (Pre-alt-screen, sleeping released mouse tracking so
-        // the native wheel/scrollbar worked again; now scrolling is app-owned via the
-        // wheel session-wide, so mouse tracking stays on and sleep is cosmetic.)
+        // Pure visual/state change — sleep is cosmetic. (It used to release mouse tracking
+        // so native selection/scroll came back; tracking is now off in normal view by
+        // default, so sleep no longer needs to touch the mouse.)
         note = `${nextPet.name ?? 'Your pet'} fell asleep. Energy restored.`;
       } else if (sub === 'name') {
         if (!arg) {
@@ -3698,11 +3706,9 @@ function App({ onLogout }: { onLogout: () => void }) {
     }
 
     // Any real keypress while the pet is asleep wakes it up — the closest natural
-    // substitute to "click the pet to wake it" we can offer without re-enabling
-    // mouse capture (which would re-break drag-selection and the wheel). The
-    // wake happens before any other key handling so e.g. Esc/Ctrl+C still do
-    // their job, but the pet is awake on the next render and mouse tracking
-    // resumes for eye-following.
+    // substitute to "click the pet to wake it" now that mouse tracking is off in
+    // normal view (a click can't be detected). The wake happens before any other key
+    // handling so e.g. Esc/Ctrl+C still do their job; the pet is awake on the next render.
     if (isSleeping(petRef.current)) {
       const woke = wakePet(petRef.current);
       petRef.current = woke;
@@ -4196,7 +4202,7 @@ function App({ onLogout }: { onLogout: () => void }) {
           {liveShellCmd && (
             <Box flexDirection="column" marginBottom={1}>
               <Box gap={1}>
-                <Text color="#7DD3FC">$</Text>
+                <Text color={TERM_ACCENT}>$</Text>
                 <Text color="#BAE6FD" bold>{liveShellCmd}</Text>
                 <Text color="#5A8060"><Spinner type="sand" /></Text>
                 <Text color="#3D6650">Esc to abort</Text>
