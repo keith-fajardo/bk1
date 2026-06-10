@@ -188,6 +188,11 @@ export class Bk1ChatPanel {
       case 'openTerminal':
         void vscode.commands.executeCommand('bk1.open');
         break;
+      // Play / Play Room launch a TUI game in the (hidden) engine terminal —
+      // reveal it so the user can see and play.
+      case 'showTerminal':
+        void vscode.commands.executeCommand('bk1.show');
+        break;
     }
   }
 
@@ -235,18 +240,11 @@ export class Bk1ChatPanel {
 </head>
 <body>
 <main class="app-shell">
-  <header class="agent-header">
+  <header class="panel-header">
+    <canvas id="motchi-hero" class="motchi-canvas motchi-hero" width="45" height="15" title="Motchi"></canvas>
     <div class="agent-title">bk1 · dbt agent</div>
     <div class="ver">v${version}</div>
   </header>
-
-  <section class="hero">
-    <canvas id="motchi-hero" class="motchi-canvas motchi-hero" width="45" height="15" title="Motchi"></canvas>
-    <div class="speech-bubble">
-      <div>Hey there! I'm Motchi 🦀</div>
-      <div>Your dbt companion. Ask me anything about your project!</div>
-    </div>
-  </section>
 
   <nav class="tabs" aria-label="bk1 tabs">
     <button id="chatTabButton" class="tab active" data-tab="chat">CHAT</button>
@@ -256,111 +254,122 @@ export class Bk1ChatPanel {
   <section id="chatView" class="tab-panel active">
     <div id="chatHistory" class="chat-history"></div>
 
-    <div id="term-hint" hidden>bk1 terminal not running — <a id="open-link">open it</a></div>
+    <div id="term-hint" hidden>bk1 engine not running — <a id="open-link">start it</a></div>
 
-    <div id="suggestions"></div>
-    <form id="promptForm" class="prompt-box">
-      <div class="input-row">
-        <textarea id="promptInput" rows="2" placeholder="Message bk1…" spellcheck="false"></textarea>
-        <button id="sendButton" class="send-button" type="submit" title="Send (Enter)">➤</button>
-      </div>
-      <div id="chip-list"></div>
-      <div class="prompt-footer">
-        <div class="footer-icons">
-          <button type="button" id="attach-btn" class="footer-icon" title="Attach file or image">📎</button>
-          <select id="model-select" title="Active model">
-            <option value="claude-haiku-4-5-20251001">Haiku 4.5</option>
-            <option value="claude-sonnet-4-6" selected>Sonnet 4.6</option>
-            <option value="claude-opus-4-8">Opus 4.8</option>
-          </select>
-          <label id="thinking-label"><input type="checkbox" id="thinking-chk"> thinking</label>
+    <div class="composer-wrap">
+      <div id="suggestions"></div>
+      <form id="promptForm" class="prompt-box">
+        <div class="input-row">
+          <textarea id="promptInput" rows="1" placeholder="Message bk1…" spellcheck="false"></textarea>
+          <button id="sendButton" class="send-button" type="submit" title="Send (Enter)">➤</button>
         </div>
-        <div class="footer-hint">↵ send · ⇧↵ newline</div>
-      </div>
-      <input type="file" id="file-input" multiple
-        accept=".sql,.yml,.yaml,.md,.txt,.json,.py,.csv,.png,.jpg,.jpeg,.gif,.webp">
-    </form>
+        <div id="chip-list"></div>
+        <div class="prompt-footer">
+          <div class="footer-icons">
+            <button type="button" id="attach-btn" class="footer-icon" title="Attach file or image">📎</button>
+            <select id="model-select" title="Active model">
+              <option value="claude-haiku-4-5-20251001">Haiku 4.5</option>
+              <option value="claude-sonnet-4-6" selected>Sonnet 4.6</option>
+              <option value="claude-opus-4-8">Opus 4.8</option>
+            </select>
+            <label id="thinking-label"><input type="checkbox" id="thinking-chk"><span class="switch"></span> thinking</label>
+          </div>
+          <div class="footer-hint">↵ send · ⇧↵ newline</div>
+        </div>
+        <input type="file" id="file-input" multiple
+          accept=".sql,.yml,.yaml,.md,.txt,.json,.py,.csv,.png,.jpg,.jpeg,.gif,.webp">
+      </form>
+    </div>
   </section>
 
   <section id="petView" class="tab-panel">
-    <section class="pet-card">
-      <div class="pet-header">
-        <div>
-          <span class="pet-name" id="pet-name">Motchi</span>
-          <button class="edit-name-button" id="rename-btn" type="button" title="Rename">✎</button>
-        </div>
-        <div id="pet-level">Level 1</div>
-      </div>
-
-      <div id="rename-row" hidden>
-        <input id="rename-input" maxlength="24" placeholder="New name…">
-        <button id="rename-ok" type="button" title="Rename">✓</button>
-      </div>
-
-      <div class="xp-row">
-        <div class="xp-bar"><div class="xp-fill" id="xp-fill"></div></div>
-        <span id="xp-label">0 / 50 XP</span>
-      </div>
-
-      <div class="pet-room">
-        <div class="window-art">
-          <div class="hill one"></div>
-          <div class="hill two"></div>
-        </div>
-        <div class="wall-art"></div>
-        <div class="shelf-art"></div>
-        <div class="motchi-stage-wrap">
-          <canvas id="motchi-stage" class="motchi-canvas motchi-stage" width="126" height="42" title="Click to check on Motchi"></canvas>
-        </div>
-      </div>
-
-      <div class="stat-list">
-        <div class="stat-row">
-          <span>🙂 Mood</span>
-          <strong id="stat-mood">—</strong>
-        </div>
-        <div class="stat-row">
-          <span>🍙 Fullness</span>
-          <div class="metric">
-            <div class="metric-track"><div class="metric-fill fullness" id="fill-fullness"></div></div>
-            <span id="val-fullness">—</span>
+    <div class="pet-scroll">
+      <div class="pet-col">
+        <section class="pet-card">
+          <div class="pet-header">
+            <div>
+              <span class="pet-name" id="pet-name">Motchi</span>
+              <button class="edit-name-button" id="rename-btn" type="button" title="Rename">✎</button>
+            </div>
+            <div id="pet-level">Level 1</div>
           </div>
-        </div>
-        <div class="stat-row">
-          <span>⚡ Energy</span>
-          <div class="metric">
-            <div class="metric-track"><div class="metric-fill energy" id="fill-energy"></div></div>
-            <span id="val-energy">—</span>
-          </div>
-        </div>
-        <div class="stat-row">
-          <span>💛 Happiness</span>
-          <div class="metric">
-            <div class="metric-track"><div class="metric-fill happiness" id="fill-happiness"></div></div>
-            <span id="val-happiness">—</span>
-          </div>
-        </div>
-        <div class="stat-row">
-          <span>🪙 Coins</span>
-          <strong id="stat-coins">—</strong>
-        </div>
-      </div>
-    </section>
 
-    <section class="next-level-card">
-      <div class="next-level-header">
-        <strong>Next Level</strong>
-        <span id="next-xp">— XP to go</span>
-      </div>
-      <div class="next-progress"><div id="next-fill"></div></div>
-    </section>
+          <div id="rename-row" hidden>
+            <input id="rename-input" maxlength="24" placeholder="New name…">
+            <button id="rename-ok" type="button" title="Rename">✓</button>
+          </div>
 
-    <footer class="pet-actions">
-      <button type="button" class="action-item" data-cmd="/pet feed snack" data-cost="5">🍪<span>Snack · 5</span></button>
-      <button type="button" class="action-item" data-cmd="/pet feed meal" data-cost="15">🍱<span>Meal · 15</span></button>
-      <button type="button" class="action-item" data-cmd="/pet feed feast" data-cost="35">🍗<span>Feast · 35</span></button>
-      <button type="button" class="action-item" data-cmd="/pet sleep" data-cost="0">😴<span>Sleep</span></button>
-    </footer>
+          <div class="xp-row">
+            <div class="xp-bar"><div class="xp-fill" id="xp-fill"></div></div>
+            <span id="xp-label">0 / 50 XP</span>
+          </div>
+
+          <div class="pet-room">
+            <div class="window-art">
+              <div class="hill one"></div>
+              <div class="hill two"></div>
+            </div>
+            <div class="wall-art"></div>
+            <div class="shelf-art"></div>
+            <div class="motchi-stage-wrap">
+              <canvas id="motchi-stage" class="motchi-canvas motchi-stage" width="126" height="42" title="Click to check on Motchi"></canvas>
+            </div>
+          </div>
+
+          <div class="stat-list">
+            <div class="stat-row">
+              <span>🙂 Mood</span>
+              <strong id="stat-mood">—</strong>
+            </div>
+            <div class="stat-row">
+              <span>🍙 Fullness</span>
+              <div class="metric">
+                <div class="metric-track"><div class="metric-fill fullness" id="fill-fullness"></div></div>
+                <span id="val-fullness">—</span>
+              </div>
+            </div>
+            <div class="stat-row">
+              <span>⚡ Energy</span>
+              <div class="metric">
+                <div class="metric-track"><div class="metric-fill energy" id="fill-energy"></div></div>
+                <span id="val-energy">—</span>
+              </div>
+            </div>
+            <div class="stat-row">
+              <span>💛 Happiness</span>
+              <div class="metric">
+                <div class="metric-track"><div class="metric-fill happiness" id="fill-happiness"></div></div>
+                <span id="val-happiness">—</span>
+              </div>
+            </div>
+            <div class="stat-row">
+              <span>🪙 Coins</span>
+              <strong id="stat-coins">—</strong>
+            </div>
+          </div>
+        </section>
+
+        <section class="next-level-card">
+          <div class="next-level-header">
+            <strong>Next Level</strong>
+            <span id="next-xp">— XP to go</span>
+          </div>
+          <div class="next-progress"><div id="next-fill"></div></div>
+        </section>
+
+        <footer class="pet-actions">
+          <button type="button" class="action-item" id="feed-btn" data-feed="1" title="Feed Motchi">🍴<span>Feed</span></button>
+          <button type="button" class="action-item" data-cmd="/pet sleep" data-cost="0">😴<span>Sleep</span></button>
+          <button type="button" class="action-item" data-cmd="/pet play fetch" data-cost="0" data-term="1">🎾<span>Play</span></button>
+          <button type="button" class="action-item" data-cmd="/pet playroom" data-cost="0" data-term="1">🎮<span>Play Room</span></button>
+          <div class="feed-pop" id="feed-pop">
+            <button type="button" data-cmd="/pet feed snack" data-cost="5">🍪 Snack <span class="cost">5</span></button>
+            <button type="button" data-cmd="/pet feed meal" data-cost="15">🍱 Meal <span class="cost">15</span></button>
+            <button type="button" data-cmd="/pet feed feast" data-cost="35">🍗 Feast <span class="cost">35</span></button>
+          </div>
+        </footer>
+      </div>
+    </div>
   </section>
 </main>
 <script nonce="${nonce}" src="${jsUri}"></script>

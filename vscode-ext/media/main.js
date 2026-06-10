@@ -69,9 +69,9 @@
 
   // Conversation rendering state for the in-flight turn
   let assistantBody = null; // .assistant-body container of the streaming card
-  let assistantText = '';
-  let textEl        = null; // the .msg-text <p> inside assistantBody
-  let activeToolPill = null;
+  let curTextEl     = null; // current streaming .msg-text <p> (null after a step)
+  let curThinkEl    = null; // current .thinking line being accumulated
+  let activeStep    = null; // last tool .step awaiting its OUT result
 
   // Slash suggestions
   const CMDS = [
@@ -384,8 +384,10 @@
     const meta = document.createElement('div');
     meta.className = 'message-meta';
     const l = document.createElement('span');
+    l.className = 'who';
     l.textContent = metaLabel;
     const t = document.createElement('span');
+    t.className = 'time';
     t.textContent = getCurrentTime();
     meta.appendChild(l);
     meta.appendChild(t);
@@ -393,31 +395,30 @@
     return article;
   }
 
+  function resetAssistantTurn() {
+    assistantBody = null;
+    curTextEl = null;
+    curThinkEl = null;
+    activeStep = null;
+  }
+
   function startTurn(userText) {
-    const card = makeCard('user-message', 'Your Prompt');
+    const card = makeCard('user-message', 'You');
     const content = document.createElement('div');
     content.className = 'message-content row';
-    const icon = document.createElement('div');
-    icon.className = 'user-icon';
-    icon.textContent = '👤';
     const p = document.createElement('p');
     p.className = 'msg-text';
     p.textContent = userText || '…';
-    content.appendChild(icon);
     content.appendChild(p);
     card.appendChild(content);
     chatHistory.appendChild(card);
     scroll();
-
-    assistantBody = null;
-    assistantText = '';
-    textEl = null;
-    activeToolPill = null;
+    resetAssistantTurn();
   }
 
   function ensureAssistantCard() {
     if (assistantBody) return;
-    const card = makeCard('assistant-message', "Motchi's Response");
+    const card = makeCard('assistant-message', 'Motchi');
     const content = document.createElement('div');
     content.className = 'message-content assistant-layout';
 
@@ -434,41 +435,137 @@
     content.appendChild(assistantBody);
     card.appendChild(content);
     chatHistory.appendChild(card);
-
-    textEl = document.createElement('p');
-    textEl.className = 'msg-text';
-    const cur = document.createElement('span');
-    cur.className = 'cursor-blink';
-    textEl.appendChild(cur);
-    assistantBody.appendChild(textEl);
     scroll();
   }
 
+  function dropCaret() {
+    if (curTextEl) {
+      const cur = curTextEl.querySelector('.cursor-blink');
+      if (cur) cur.remove();
+    }
+  }
+
+  // Streaming assistant prose. A new <p> starts after any step (thinking/tool)
+  // interrupts the text, so prose and steps interleave in arrival order.
   function appendText(chunk) {
     ensureAssistantCard();
-    assistantText += chunk;
-    const cur = textEl.querySelector('.cursor-blink');
-    if (cur) cur.remove();
-    textEl.textContent = assistantText;
-    const newCur = document.createElement('span');
-    newCur.className = 'cursor-blink';
-    textEl.appendChild(newCur);
+    curThinkEl = null;
+    if (!curTextEl) {
+      curTextEl = document.createElement('p');
+      curTextEl.className = 'msg-text';
+      curTextEl._t = '';
+      assistantBody.appendChild(curTextEl);
+    }
+    curTextEl._t += chunk;
+    curTextEl.textContent = curTextEl._t;
+    const cur = document.createElement('span');
+    cur.className = 'cursor-blink';
+    curTextEl.appendChild(cur);
     scroll();
   }
 
-  function addToolPill(name) {
+  // Extended-thinking block — accumulates while contiguous.
+  function addThinking(text) {
     ensureAssistantCard();
-    if (activeToolPill) { activeToolPill.classList.remove('running'); activeToolPill.classList.add('done'); }
-    const pill = document.createElement('div');
-    pill.className = 'tool-pill running';
-    pill.textContent = '⟳ ' + name.replace(/^Semantic:\s*/i, '');
-    assistantBody.appendChild(pill);
-    activeToolPill = pill;
+    dropCaret();
+    curTextEl = null;
+    if (!curThinkEl) {
+      const step = document.createElement('div');
+      step.className = 'step';
+      const dot = document.createElement('div');
+      dot.className = 'dot think';
+      const main = document.createElement('div');
+      main.className = 'step-main';
+      const line = document.createElement('div');
+      line.className = 'thinking';
+      line._t = '';
+      main.appendChild(line);
+      step.appendChild(dot);
+      step.appendChild(main);
+      assistantBody.appendChild(step);
+      curThinkEl = line;
+    }
+    curThinkEl._t += text;
+    const tok = Math.max(1, Math.round(curThinkEl._t.length / 4));
+    const label = tok >= 1000 ? (tok / 1000).toFixed(1) + 'k' : String(tok);
+    curThinkEl.innerHTML = '';
+    curThinkEl.appendChild(document.createTextNode('Thinking '));
+    const t = document.createElement('span');
+    t.className = 'tok';
+    t.textContent = '· ' + label + ' tokens';
+    curThinkEl.appendChild(t);
+    scroll();
+  }
+
+  function ioLine(tag, text) {
+    const line = document.createElement('div');
+    line.className = 'line';
+    const t = document.createElement('span');
+    t.className = 'tag';
+    t.textContent = tag;
+    const c = document.createElement('span');
+    c.className = 'code';
+    c.textContent = text;
+    line.appendChild(t);
+    line.appendChild(c);
+    return line;
+  }
+
+  // A tool call as a Claude-style step: header (tool + desc) + collapsible IN/OUT.
+  function addToolStart(name, desc, input) {
+    ensureAssistantCard();
+    dropCaret();
+    curTextEl = null;
+    curThinkEl = null;
+
+    const step = document.createElement('div');
+    step.className = 'step';
+    const dot = document.createElement('div');
+    dot.className = 'dot run';
+    const main = document.createElement('div');
+    main.className = 'step-main';
+
+    const head = document.createElement('div');
+    head.className = 'step-head';
+    const tool = document.createElement('span');
+    tool.className = 'tool';
+    tool.textContent = String(name || '').replace(/^Semantic:\s*/i, '');
+    const d = document.createElement('span');
+    d.className = 'desc';
+    d.textContent = desc || '';
+    const chev = document.createElement('span');
+    chev.className = 'chev';
+    chev.textContent = '▾';
+    head.appendChild(tool);
+    head.appendChild(d);
+    head.appendChild(chev);
+    head.addEventListener('click', () => step.classList.toggle('collapsed'));
+
+    const io = document.createElement('div');
+    io.className = 'io';
+    if (input) io.appendChild(ioLine('IN', input));
+
+    main.appendChild(head);
+    main.appendChild(io);
+    step.appendChild(dot);
+    step.appendChild(main);
+    assistantBody.appendChild(step);
+    activeStep = { step, io, dot };
+    scroll();
+  }
+
+  function addToolEnd(result) {
+    if (!activeStep) return;
+    activeStep.dot.classList.remove('run');
+    if (result) activeStep.io.appendChild(ioLine('OUT', result));
+    activeStep = null;
     scroll();
   }
 
   function addNote(text, cls) {
     ensureAssistantCard();
+    dropCaret();
+    curTextEl = null;
     const d = document.createElement('div');
     d.className = cls;
     d.textContent = text;
@@ -487,15 +584,9 @@
   }
 
   function finishTurn() {
-    if (textEl) {
-      const cur = textEl.querySelector('.cursor-blink');
-      if (cur) cur.remove();
-    }
-    if (activeToolPill) { activeToolPill.classList.remove('running'); activeToolPill.classList.add('done'); }
-    assistantBody = null;
-    assistantText = '';
-    textEl = null;
-    activeToolPill = null;
+    dropCaret();
+    if (activeStep) { activeStep.dot.classList.remove('run'); activeStep = null; }
+    resetAssistantTurn();
     // A turn that ended without bk1 echoing its user event (cancel, error,
     // terminal death) must not leave the dedup armed — it would swallow the
     // next turn's user card.
@@ -522,8 +613,14 @@
           case 'text':
             appendText(e.chunk);
             break;
+          case 'thinking':
+            addThinking(e.text || '');
+            break;
           case 'tool_start':
-            addToolPill(e.name);
+            addToolStart(e.name, e.desc, e.input);
+            break;
+          case 'tool_end':
+            addToolEnd(e.result);
             break;
           case 'done':
             if (e.error) addNote('✕ ' + e.error, 'tool-pill error');
@@ -620,18 +717,46 @@
     updateActionState();
   }
 
+  const feedPop  = document.getElementById('feed-pop');
+  const feedBtn  = document.getElementById('feed-btn');
+  const feedItems = Array.from(document.querySelectorAll('#feed-pop button'));
+
+  function closeFeedPop() { if (feedPop) feedPop.classList.remove('open'); }
+
   function updateActionState() {
     for (const btn of actionBtns) {
       const cost = Number(btn.dataset.cost || 0);
       const broke = lastPet ? lastPet.coins < cost : false;
       btn.disabled = responding || broke;
-      btn.title = broke ? 'Not enough coins' : '';
+      if (!btn.dataset.feed) btn.title = broke ? 'Not enough coins' : '';
+    }
+    for (const btn of feedItems) {
+      const cost = Number(btn.dataset.cost || 0);
+      btn.disabled = responding || (lastPet ? lastPet.coins < cost : false);
     }
   }
 
   for (const btn of actionBtns) {
-    btn.addEventListener('click', () => submitCommand(btn.dataset.cmd));
+    btn.addEventListener('click', () => {
+      // Feed opens a portion popover (Snack / Meal / Feast).
+      if (btn.dataset.feed) { if (feedPop) feedPop.classList.toggle('open'); return; }
+      closeFeedPop();
+      // Play / Play Room run a TUI game — reveal the hidden engine terminal.
+      if (btn.dataset.term) vscode.postMessage({ type: 'showTerminal' });
+      submitCommand(btn.dataset.cmd);
+    });
   }
+
+  for (const btn of feedItems) {
+    btn.addEventListener('click', () => { closeFeedPop(); submitCommand(btn.dataset.cmd); });
+  }
+
+  document.addEventListener('click', (e) => {
+    if (feedPop && feedPop.classList.contains('open') &&
+        !feedPop.contains(e.target) && feedBtn && !feedBtn.contains(e.target)) {
+      closeFeedPop();
+    }
+  });
 
   // Rename: ✎ toggles an inline input; ✓ or Enter submits /pet name <name>.
   renameBtn.addEventListener('click', () => {
